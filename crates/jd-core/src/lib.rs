@@ -2,6 +2,7 @@
 //! No egui dependency — fully testable headless.
 
 pub mod rng;
+pub mod time;
 
 #[cfg(test)]
 mod tests {
