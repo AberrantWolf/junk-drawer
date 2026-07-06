@@ -17,7 +17,7 @@ These apply to **every** work package; each WP's requirements implicitly include
 - **The UI thread never blocks** — no filesystem, no locks held across frames, no thread joins. All waiting happens on channels; long operations get a labeled progress modal. A frozen frame or unlabeled spinner is a bug by definition.
 - **All vault mutations go through the vault worker** (one background thread, serial execution). `jd-app` never writes a note file directly.
 - **Saves are atomic:** temp file in the same directory, fsync, rename over the original.
-- **Round-trip law:** parse → serialize is byte-identical for any file not deliberately changed. Unknown frontmatter keys, unknown markdown constructs, CRLF, BOM — all preserved.
+- **Round-trip law:** parse → serialize is byte-identical for any file not deliberately changed. Unknown frontmatter keys, unknown markdown constructs, CRLF — all preserved. One sanctioned normalization (decision §6.9): a leading UTF-8 BOM is tolerated on parse and dropped on save.
 - **Guidance voice (spec §11):** every user-facing string states the practice, names the action, assumes competence. No questions, offers, praise, or exclamation marks. Copy strings in the spec are verbatim requirements.
 - **Accessibility is a requirement, not a v2 promise:** every widget lands in the AccessKit tree with deliberate semantics; no information or action exists only in spatial/visual form; reduced motion honored.
 - **Performance budgets are failing tests** (WP1d ships them): cold scan of 20k synthetic notes < 1 s · incremental reindex of one file < 5 ms · palette query < 10 ms.
