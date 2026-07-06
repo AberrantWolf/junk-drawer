@@ -36,6 +36,10 @@ pub fn trash_note(vault: &Vault, meta: &NoteMeta) -> Result<(), IoError> {
         display
     );
     let side_path = dir.join(format!("{}.meta", meta.id));
+    // If this sidecar write fails after the rename above, the note's bytes are
+    // safe in trash/ but invisible to list_trash (which reads .meta files).
+    // Data is never lost on partial failure; orphaned .md files are manually
+    // recoverable and harmless.
     std::fs::write(&side_path, sidecar).map_err(IoError::wrap("record trash entry", &side_path))
 }
 
@@ -88,6 +92,8 @@ pub fn restore(vault: &Vault, id: NoteId) -> Result<PathBuf, IoError> {
     let dst_abs = filename_for(stem, id, &vault.abs(orig_dir));
     let src = dir.join(format!("{id}.md"));
     std::fs::rename(&src, &dst_abs).map_err(IoError::wrap("restore from trash", &src))?;
+    // Best-effort: a stale .meta (if this remove fails) lists a ghost entry,
+    // but the restored note itself is already safe at its destination.
     let _ = std::fs::remove_file(&side_path);
     Ok(vault.rel(&dst_abs).unwrap_or(orig_rel))
 }
@@ -97,9 +103,9 @@ pub fn purge_older_than(vault: &Vault, days: Option<u32>) -> Result<usize, IoErr
     let Some(days) = days else { return Ok(0) };
     let cutoff = Timestamp(Timestamp::now().0 - i64::from(days) * 86_400_000);
     let mut purged = 0;
+    let dir = trash_dir(vault);
     for entry in list_trash(vault) {
         if entry.deleted <= cutoff {
-            let dir = trash_dir(vault);
             let _ = std::fs::remove_file(dir.join(format!("{}.md", entry.id)));
             let _ = std::fs::remove_file(dir.join(format!("{}.meta", entry.id)));
             purged += 1;
