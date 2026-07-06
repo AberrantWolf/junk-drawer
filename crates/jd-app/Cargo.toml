@@ -1,0 +1,8 @@
+[package]
+name = "jd-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+eframe = "0.35.0"
+jd-core = { path = "../jd-core" }
