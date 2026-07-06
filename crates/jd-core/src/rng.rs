@@ -80,4 +80,20 @@ mod tests {
         }
         assert!(seen.iter().all(|&s| s), "all 8 buckets hit over 10k draws");
     }
+
+    #[test]
+    fn golden_sequence_is_locked() {
+        // Pins the verified xorshift128+ output for seed 42. If this test
+        // breaks, the algorithm changed — fixed-seed test reproducibility
+        // across the codebase depends on it not changing.
+        let mut r = Xorshift128::new(42);
+        assert_eq!(
+            [r.next_u64(), r.next_u64(), r.next_u64()],
+            [
+                16629283624882167704,
+                12706997879443677767,
+                13388708669165669496
+            ]
+        );
+    }
 }
