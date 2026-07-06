@@ -33,7 +33,6 @@ impl KnownKey {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn name(&self) -> &'static str {
         match self {
             KnownKey::Id => "id",
@@ -263,6 +262,90 @@ impl FrontmatterDoc {
             })
             .collect()
     }
+
+    /// The dominant terminator for appended lines (borrow the closing marker's).
+    fn block_terminator(&self) -> &'static str {
+        match self.lines.last().map(|l| l.raw.ends_with("\r\n")) {
+            Some(true) => "\r\n",
+            _ => "\n",
+        }
+    }
+
+    /// Terminator of an existing line, defaulting to the block's.
+    fn terminator_of(raw: &str, fallback: &'static str) -> &'static str {
+        if raw.ends_with("\r\n") {
+            "\r\n"
+        } else if raw.ends_with('\n') {
+            "\n"
+        } else {
+            fallback
+        }
+    }
+
+    /// Rewrite key's line with `key: value`, or insert before the closing marker.
+    /// `value = None` removes the line. Continuation lines of that key are always removed.
+    fn set_raw(&mut self, key: KnownKey, value: Option<String>) {
+        assert!(
+            !self.lines.is_empty(),
+            "cannot set fields on an empty frontmatter block"
+        );
+        let fallback = self.block_terminator();
+        self.lines
+            .retain(|l| !matches!(l.role, LineRole::Continuation(k) if k == key));
+        let existing = self
+            .lines
+            .iter()
+            .position(|l| matches!(l.role, LineRole::Key(k) if k == key));
+        match (existing, value) {
+            (Some(i), Some(v)) => {
+                let term = Self::terminator_of(&self.lines[i].raw, fallback);
+                self.lines[i].raw = format!("{}: {}{}", key.name(), v, term);
+            }
+            (Some(i), None) => {
+                self.lines.remove(i);
+            }
+            (None, Some(v)) => {
+                let closing = self.lines.len() - 1; // the closing marker
+                self.lines.insert(
+                    closing,
+                    FmLine {
+                        raw: format!("{}: {}{}", key.name(), v, fallback),
+                        role: LineRole::Key(key),
+                    },
+                );
+            }
+            (None, None) => {}
+        }
+    }
+
+    pub fn set_status(&mut self, s: Status) {
+        self.set_raw(KnownKey::Status, Some(s.as_str().to_owned()));
+    }
+
+    pub fn set_kind(&mut self, k: Kind) {
+        let v = (k != Kind::Note).then(|| k.as_str().to_owned());
+        self.set_raw(KnownKey::Kind, v);
+    }
+
+    pub fn set_source(&mut self, src: Option<&str>) {
+        self.set_raw(
+            KnownKey::Source,
+            src.map(|s| format!("\"{}\"", s.replace('"', "'"))),
+        );
+    }
+
+    pub fn set_modified(&mut self, t: Timestamp) {
+        self.set_raw(KnownKey::Modified, Some(t.to_rfc3339()));
+    }
+
+    pub fn set_tags(&mut self, tags: &[Tag]) {
+        if tags.is_empty() {
+            self.set_raw(KnownKey::Tags, None);
+        } else {
+            let list = tags.iter().map(Tag::as_str).collect::<Vec<_>>().join(", ");
+            self.set_raw(KnownKey::Tags, Some(format!("[{list}]")));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -395,5 +478,92 @@ modified: 2026-07-03T10:22:00Z\n\
 status: fleeting\n\
 ---\n"
         );
+    }
+
+    const SETTER_BASE: &str = "---\n\
+id: 01J8ZQ4KF3T9M2X7C5VBNAE8RD\n\
+x-custom: keep me\n\
+status: fleeting\n\
+---\n";
+
+    #[test]
+    fn set_status_rewrites_only_its_line() {
+        let (mut fm, _) = FrontmatterDoc::parse(SETTER_BASE).unwrap();
+        fm.set_status(Status::Permanent);
+        assert_eq!(
+            fm.serialize(),
+            "---\n\
+id: 01J8ZQ4KF3T9M2X7C5VBNAE8RD\n\
+x-custom: keep me\n\
+status: permanent\n\
+---\n"
+        );
+    }
+
+    #[test]
+    fn set_preserves_crlf_terminator_of_the_line() {
+        let input = "---\r\nstatus: fleeting\r\n---\r\n";
+        let (mut fm, _) = FrontmatterDoc::parse(input).unwrap();
+        fm.set_status(Status::Permanent);
+        assert_eq!(fm.serialize(), "---\r\nstatus: permanent\r\n---\r\n");
+    }
+
+    #[test]
+    fn set_missing_key_appends_before_closing_marker() {
+        let (mut fm, _) = FrontmatterDoc::parse(SETTER_BASE).unwrap();
+        fm.set_source(Some("Ahrens (2017)"));
+        assert_eq!(
+            fm.serialize(),
+            "---\n\
+id: 01J8ZQ4KF3T9M2X7C5VBNAE8RD\n\
+x-custom: keep me\n\
+status: fleeting\n\
+source: \"Ahrens (2017)\"\n\
+---\n"
+        );
+    }
+
+    #[test]
+    fn set_kind_note_removes_the_line() {
+        let input = "---\nkind: literature\nstatus: fleeting\n---\n";
+        let (mut fm, _) = FrontmatterDoc::parse(input).unwrap();
+        fm.set_kind(Kind::Note);
+        assert_eq!(fm.serialize(), "---\nstatus: fleeting\n---\n");
+        // and setting a non-default kind on a doc without the line adds it
+        fm.set_kind(Kind::Structure);
+        assert_eq!(
+            fm.serialize(),
+            "---\nstatus: fleeting\nkind: structure\n---\n"
+        );
+    }
+
+    #[test]
+    fn set_source_none_removes() {
+        let input = "---\nsource: \"x\"\nstatus: fleeting\n---\n";
+        let (mut fm, _) = FrontmatterDoc::parse(input).unwrap();
+        fm.set_source(None);
+        assert_eq!(fm.serialize(), "---\nstatus: fleeting\n---\n");
+    }
+
+    #[test]
+    fn set_tags_replaces_block_list_with_inline() {
+        let input = "---\ntags:\n  - old-one\n  - old-two\nstatus: fleeting\n---\n";
+        let (mut fm, _) = FrontmatterDoc::parse(input).unwrap();
+        fm.set_tags(&[Tag::new("rust").unwrap(), Tag::new("egui").unwrap()]);
+        assert_eq!(
+            fm.serialize(),
+            "---\ntags: [rust, egui]\nstatus: fleeting\n---\n"
+        );
+    }
+
+    #[test]
+    fn set_modified_updates_timestamp() {
+        let (mut fm, _) = FrontmatterDoc::parse(SETTER_BASE).unwrap();
+        let t = crate::time::Timestamp::parse_rfc3339("2026-07-06T08:00:00Z").unwrap();
+        fm.set_modified(t);
+        assert_eq!(fm.modified(), Some(t));
+        assert!(fm.serialize().contains("modified: 2026-07-06T08:00:00Z\n"));
+        // untouched lines still verbatim
+        assert!(fm.serialize().contains("x-custom: keep me\n"));
     }
 }
