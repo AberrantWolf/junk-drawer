@@ -20,6 +20,12 @@ fn trash_dir(vault: &Vault) -> PathBuf {
     vault.abs(Path::new(".junkdrawer/trash"))
 }
 
+/// Move a note into the trash directory.
+///
+/// # Single-writer contract (spec §3)
+/// Must be called only from the vault worker thread (or single-threaded
+/// tests). WP1e wraps this in a `VaultCommand`; direct calls from app
+/// code race the worker's writes.
 pub fn trash_note(vault: &Vault, meta: &NoteMeta) -> Result<(), IoError> {
     let dir = trash_dir(vault);
     let src = vault.abs(&meta.rel_path);
@@ -78,6 +84,12 @@ pub fn list_trash(vault: &Vault) -> Vec<TrashEntry> {
     out
 }
 
+/// Restore a note from trash to its original directory.
+///
+/// # Single-writer contract (spec §3)
+/// Must be called only from the vault worker thread (or single-threaded
+/// tests). WP1e wraps this in a `VaultCommand`; direct calls from app
+/// code race the worker's writes.
 pub fn restore(vault: &Vault, id: NoteId) -> Result<PathBuf, IoError> {
     let dir = trash_dir(vault);
     let side_path = dir.join(format!("{id}.meta"));
@@ -98,7 +110,13 @@ pub fn restore(vault: &Vault, id: NoteId) -> Result<PathBuf, IoError> {
     Ok(vault.rel(&dst_abs).unwrap_or(orig_rel))
 }
 
-/// None = manual only (never purge). Returns how many notes were purged.
+/// Purge trash entries older than `days` days. `None` means manual-only (never purge).
+/// Returns how many notes were purged.
+///
+/// # Single-writer contract (spec §3)
+/// Must be called only from the vault worker thread (or single-threaded
+/// tests). WP1e wraps this in a `VaultCommand`; direct calls from app
+/// code race the worker's writes.
 pub fn purge_older_than(vault: &Vault, days: Option<u32>) -> Result<usize, IoError> {
     let Some(days) = days else { return Ok(0) };
     let cutoff = Timestamp(Timestamp::now().0 - i64::from(days) * 86_400_000);

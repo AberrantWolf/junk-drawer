@@ -347,15 +347,19 @@ fn handle_command(
             if let Some(&ledger_stat) = ledger.get(&rel_path) {
                 let current_stat = stat(&abs_path);
                 if current_stat != Some(ledger_stat) {
-                    // Conflict: write our content to a conflict copy
-                    let conflict_path = conflict_copy_path(&abs_path);
+                    // Build our content with synthesized frontmatter for the conflict copy.
+                    // Generate a new id for the conflict copy so it shows up as a distinct note.
+                    // The id is also threaded into conflict_copy_path so that same-minute
+                    // double conflicts get distinct id-suffixed names (spec §2: never clobber).
+                    let conflict_id = NoteId::generate(id_gen);
+
+                    // Conflict: write our content to a conflict copy.
+                    // Route through filename_for so same-minute double conflicts
+                    // get distinct id-suffixed names (spec §2: never clobber).
+                    let conflict_path = conflict_copy_path(&abs_path, conflict_id);
                     let conflict_rel = vault
                         .rel(&conflict_path)
                         .unwrap_or_else(|| conflict_path.clone());
-
-                    // Build our content with synthesized frontmatter for the conflict copy.
-                    // Generate a new id for the conflict copy so it shows up as a distinct note.
-                    let conflict_id = NoteId::generate(id_gen);
                     let now = Timestamp::now();
                     let status = index
                         .read()
@@ -635,8 +639,14 @@ fn extract_note_title(body: &str) -> String {
     "Untitled".to_owned()
 }
 
-/// Generate the conflict copy path: `<stem> (conflict YYYY-MM-DD HHMM).md`
-fn conflict_copy_path(abs_path: &Path) -> PathBuf {
+/// Generate the conflict copy path via `filename_for` so that two conflicts in
+/// the same minute get distinct names (spec §2: never silently clobber either side).
+///
+/// The conflict TITLE is `"<stem> (conflict YYYY-MM-DD HHMM)"`.  The first
+/// conflict in a given minute resolves to the plain `<title>.md`; a second one
+/// (or any collision) gets the `<title> (<short-id>).md` suffix from
+/// `filename_for`.
+fn conflict_copy_path(abs_path: &Path, conflict_id: NoteId) -> PathBuf {
     let now = Timestamp::now();
     // Format as YYYY-MM-DD HHMM from the rfc3339 string
     let rfc = now.to_rfc3339();
@@ -650,5 +660,6 @@ fn conflict_copy_path(abs_path: &Path) -> PathBuf {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("Untitled");
-    dir.join(format!("{stem} (conflict {conflict_tag}).md"))
+    let conflict_title = format!("{stem} (conflict {conflict_tag})");
+    filename_for(&conflict_title, conflict_id, dir)
 }

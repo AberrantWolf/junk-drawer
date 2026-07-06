@@ -263,6 +263,55 @@ fn concurrent_external_edit_diverts_to_conflict_copy() {
 }
 
 #[test]
+fn same_minute_double_conflict_keeps_both_copies() {
+    let t = TempDir::new();
+    let (h, _) = boot(&t);
+    drain_until(&h, |e| {
+        matches!(e, VaultEvent::ScanComplete { .. }).then_some(())
+    });
+    h.commands
+        .send(VaultCommand::Create {
+            seed: scrap("base\n"),
+            dest: Dest::Notes,
+        })
+        .unwrap();
+    let meta = drain_until(&h, |e| match e {
+        VaultEvent::Created { meta } => Some(meta.clone()),
+        _ => None,
+    });
+
+    let mut copies = Vec::new();
+    for round in 0..2 {
+        std::thread::sleep(Duration::from_millis(30));
+        std::fs::write(t.path().join(&meta.rel_path), format!("theirs {round}\n")).unwrap();
+        h.commands
+            .send(VaultCommand::SaveBody {
+                id: meta.id,
+                content: format!("ours {round}\n"),
+            })
+            .unwrap();
+        let copy = drain_until(&h, |e| match e {
+            VaultEvent::Conflict { id, conflict_copy } if *id == meta.id => {
+                Some(conflict_copy.clone())
+            }
+            _ => None,
+        });
+        copies.push(copy);
+    }
+    assert_ne!(
+        copies[0], copies[1],
+        "same-minute conflicts must not share a path"
+    );
+    for (round, copy) in copies.iter().enumerate() {
+        let content = std::fs::read_to_string(t.path().join(copy)).unwrap();
+        assert!(
+            content.contains(&format!("ours {round}")),
+            "copy {round} clobbered: {content}"
+        );
+    }
+}
+
+#[test]
 fn scan_progress_is_granular_on_boot() {
     let t = TempDir::new();
     {

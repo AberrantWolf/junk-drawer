@@ -14,10 +14,22 @@ fn buffer_path(vault: &Vault, id: NoteId) -> PathBuf {
         .join(format!("{id}.md"))
 }
 
+/// Persist an unsaved buffer to the recovery directory so a crash loses nothing.
+///
+/// # Single-writer contract (spec §3)
+/// Must be called only from the vault worker thread (or single-threaded
+/// tests). WP1e wraps this in a `VaultCommand`; direct calls from app
+/// code race the worker's writes.
 pub fn journal_buffer(vault: &Vault, id: NoteId, content: &str) -> Result<(), IoError> {
     atomic_save(&buffer_path(vault, id), content)
 }
 
+/// Remove the recovery buffer for a note after a successful save.
+///
+/// # Single-writer contract (spec §3)
+/// Must be called only from the vault worker thread (or single-threaded
+/// tests). WP1e wraps this in a `VaultCommand`; direct calls from app
+/// code race the worker's writes.
 pub fn clear_buffer(vault: &Vault, id: NoteId) {
     let _ = std::fs::remove_file(buffer_path(vault, id));
 }
