@@ -160,6 +160,7 @@ impl SearchIndex {
     /// One required group per query term: the exact term, or (for the last
     /// term when prefix_last) all terms sharing the prefix. Docs must satisfy
     /// every group AND every phrase, and none of the negated terms.
+    /// Phrase words score as individual term groups (plus the adjacency requirement) — deliberate v1 behavior.
     pub fn query(
         &self,
         q: &Query,
@@ -284,6 +285,129 @@ impl SearchIndex {
             });
         }
         anchors.is_some()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Snippet {
+    pub text: String,
+    /// Byte ranges within `text`.
+    pub highlights: Vec<std::ops::Range<usize>>,
+}
+
+/// Case-fold `body` and keep a byte map back to the original, so highlight
+/// ranges land on the ORIGINAL text (lowercasing can change byte lengths).
+fn folded_with_map(body: &str) -> (String, Vec<usize>) {
+    let mut folded = String::with_capacity(body.len());
+    let mut map = Vec::with_capacity(body.len() + 1);
+    for (orig_idx, ch) in body.char_indices() {
+        for low in ch.to_lowercase() {
+            for _ in 0..low.len_utf8() {
+                map.push(orig_idx);
+            }
+            folded.push(low);
+        }
+    }
+    map.push(body.len());
+    (folded, map)
+}
+
+fn snap_to_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i.min(s.len())
+}
+
+/// Pure snippet builder for the app layer (decision §6.10): best window of
+/// ~radius bytes each side of the first match, ellipses at cut edges,
+/// highlight ranges relative to the returned text.
+pub fn make_snippet(body: &str, terms: &[String], radius: usize) -> Snippet {
+    let (folded, map) = folded_with_map(body);
+    // All occurrences (in original-body byte ranges), first-match window.
+    let mut occurrences: Vec<std::ops::Range<usize>> = Vec::new();
+    for term in terms {
+        let term = term.to_lowercase();
+        if term.is_empty() {
+            continue;
+        }
+        let mut at = 0;
+        while let Some(found) = folded[at..].find(&term) {
+            let f_start = at + found;
+            let f_end = f_start + term.len();
+            occurrences.push(map[f_start]..map[f_end.min(map.len() - 1)]);
+            at = f_end;
+        }
+    }
+    occurrences.sort_by_key(|r| r.start);
+
+    let (win_start, win_end) = match occurrences.first() {
+        Some(first) => {
+            let start = snap_to_boundary(body, first.start.saturating_sub(radius));
+            let end = snap_to_boundary(body, (first.end + radius).min(body.len()));
+            (start, end)
+        }
+        None => (0, snap_to_boundary(body, (2 * radius).min(body.len()))),
+    };
+
+    let prefix = if win_start > 0 { "…" } else { "" };
+    let suffix = if win_end < body.len() { "…" } else { "" };
+    let text = format!("{prefix}{}{suffix}", &body[win_start..win_end]);
+    let offset = prefix.len();
+    let highlights = occurrences
+        .into_iter()
+        .filter(|r| r.start >= win_start && r.end <= win_end)
+        .map(|r| (r.start - win_start + offset)..(r.end - win_start + offset))
+        .collect();
+    Snippet { text, highlights }
+}
+
+impl SearchIndex {
+    /// Cosine similarity over tf-idf vectors, computed sparsely via postings.
+    /// For ghost fans and post-promotion suggestions (spec §6).
+    pub fn similar(&self, id: NoteId, k: usize) -> Vec<(NoteId, f32)> {
+        let Some(src_terms) = self.doc_terms.get(&id) else {
+            return Vec::new();
+        };
+        let weight = |tf: u32, df: usize| tf as f32 * self.idf(df);
+        let norm_of = |terms: &[(String, u32)]| -> f32 {
+            terms
+                .iter()
+                .map(|(t, tf)| {
+                    let df = self.terms.get(t).map_or(1, HashMap::len);
+                    let w = weight(*tf, df);
+                    w * w
+                })
+                .sum::<f32>()
+                .sqrt()
+        };
+        let src_norm = norm_of(src_terms);
+        if src_norm == 0.0 {
+            return Vec::new();
+        }
+        let mut dot: HashMap<NoteId, f32> = HashMap::new();
+        for (term, tf) in src_terms {
+            let Some(posts) = self.terms.get(term) else {
+                continue;
+            };
+            let df = posts.len();
+            let w_src = weight(*tf, df);
+            for (&other, positions) in posts {
+                if other != id {
+                    *dot.entry(other).or_default() += w_src * weight(positions.len() as u32, df);
+                }
+            }
+        }
+        let mut out: Vec<(NoteId, f32)> = dot
+            .into_iter()
+            .map(|(d, dp)| {
+                let n = norm_of(&self.doc_terms[&d]);
+                (d, if n == 0.0 { 0.0 } else { dp / (src_norm * n) })
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        out.truncate(k);
+        out
     }
 }
 
@@ -425,5 +549,70 @@ mod tests {
         let s = small_index();
         assert_eq!(s.query(&q("quick"), 2, None).len(), 2);
         assert_eq!(s.query(&q("quick"), 10, None).len(), 3);
+    }
+
+    #[test]
+    fn snippet_centers_on_match_and_highlights() {
+        let body = "aaaa ".repeat(30) + "the magic word appears here " + &"bbbb ".repeat(30);
+        let sn = make_snippet(&body, &["magic".to_owned()], 20);
+        assert!(sn.text.contains("magic"));
+        assert!(sn.text.len() <= 2 * 20 + "magic".len() + 2 * 3 + 8); // window + ellipses + slack
+        assert_eq!(sn.highlights.len(), 1);
+        let h = &sn.highlights[0];
+        assert_eq!(&sn.text[h.start..h.end], "magic");
+    }
+
+    #[test]
+    fn snippet_is_case_insensitive_and_multibyte_safe() {
+        let body = "prefix Ärger MAGIC suffix";
+        let sn = make_snippet(body, &["magic".to_owned()], 50);
+        let h = &sn.highlights[0];
+        assert_eq!(&sn.text[h.start..h.end], "MAGIC");
+    }
+
+    #[test]
+    fn snippet_with_no_match_takes_the_head() {
+        let sn = make_snippet(
+            "just some text with nothing special",
+            &["absent".to_owned()],
+            10,
+        );
+        assert!(sn.text.starts_with("just"));
+        assert!(sn.highlights.is_empty());
+    }
+
+    #[test]
+    fn similar_prefers_shared_vocabulary() {
+        let mut s = SearchIndex::new();
+        s.add_doc(
+            nid(1),
+            "zettelkasten method for permanent notes and knowledge",
+        );
+        s.add_doc(
+            nid(2),
+            "permanent notes are the zettelkasten heart of knowledge work",
+        );
+        s.add_doc(nid(3), "gardening tips for tomato plants in july");
+        let sim = s.similar(nid(1), 5);
+        assert_eq!(sim[0].0, nid(2));
+        assert!(sim[0].1 > 0.0);
+        assert!(
+            !sim.iter().any(|&(d, _)| d == nid(1)),
+            "never returns itself"
+        );
+        // doc 3 shares no vocabulary: either absent or scored below doc 2
+        if let Some(&(_, score3)) = sim.iter().find(|&&(d, _)| d == nid(3)) {
+            assert!(score3 < sim[0].1);
+        }
+    }
+
+    #[test]
+    fn similar_k_and_unknown_doc() {
+        let mut s = SearchIndex::new();
+        s.add_doc(nid(1), "alpha beta");
+        s.add_doc(nid(2), "alpha gamma");
+        s.add_doc(nid(3), "alpha delta");
+        assert_eq!(s.similar(nid(1), 1).len(), 1);
+        assert!(s.similar(nid(99), 5).is_empty());
     }
 }
