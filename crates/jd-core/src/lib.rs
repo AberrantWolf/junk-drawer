@@ -4,6 +4,7 @@
 pub mod doc;
 pub mod frontmatter;
 pub mod id;
+pub mod index;
 pub mod lexer;
 pub mod note;
 pub mod rng;
