@@ -253,6 +253,17 @@ mod tests {
     }
 
     #[test]
+    fn pre_epoch_fractional_millis_floor_to_earlier_second() {
+        // div_euclid, not truncating division: -500 ms is inside the second
+        // BEFORE the epoch. A truncating implementation renders 1970-01-01.
+        assert_eq!(Timestamp(-500).to_rfc3339(), "1969-12-31T23:59:59Z");
+        assert_eq!(
+            Timestamp::parse_rfc3339("1969-12-31T23:59:59.5Z").unwrap(),
+            Timestamp(-500)
+        );
+    }
+
+    #[test]
     fn lowercase_t_and_z_accepted() {
         assert_eq!(
             Timestamp::parse_rfc3339("1970-01-01t00:00:00z").unwrap(),
