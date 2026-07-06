@@ -7,6 +7,7 @@ pub mod io;
 pub mod recovery;
 pub mod scan;
 pub mod trash;
+pub mod watcher;
 
 use std::path::{Path, PathBuf};
 
