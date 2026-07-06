@@ -160,15 +160,88 @@ pub fn lex_line(
 /// Inline pass over `region`, emitting construct spans and `base`-styled gap
 /// runs. Task 1 stub: everything is a gap run; Tasks 2–3 add constructs.
 fn lex_inline(
-    _line: &str,
+    line: &str,
     region: Range<usize>,
     base: SpanStyle,
-    _resolve: &dyn Fn(&str) -> bool,
+    resolve: &dyn Fn(&str) -> bool,
     out: &mut Vec<StyledSpan>,
 ) {
-    if region.start < region.end {
-        out.push(span(region, base));
+    let mut pos = region.start;
+    let mut plain_start = region.start;
+    while pos < region.end {
+        if let Some((mut produced, end)) = match_construct(line, pos, region.end, resolve) {
+            if plain_start < pos {
+                out.push(span(plain_start..pos, base));
+            }
+            out.append(&mut produced);
+            pos = end;
+            plain_start = pos;
+        } else {
+            pos += line[pos..].chars().next().map_or(1, char::len_utf8);
+        }
     }
+    if plain_start < region.end {
+        out.push(span(plain_start..region.end, base));
+    }
+}
+
+/// Try to match a construct starting exactly at `pos` (constructs never cross
+/// `end`). Returns the spans it produces (two for [text](url), one otherwise)
+/// and the byte just past the construct. Order matters: code first (protects
+/// everything), then double-char delimiters before single.
+fn match_construct(
+    line: &str,
+    pos: usize,
+    end: usize,
+    _resolve: &dyn Fn(&str) -> bool,
+) -> Option<(Vec<StyledSpan>, usize)> {
+    let s = &line[pos..end];
+
+    // `inline code`
+    if let Some(rest) = s.strip_prefix('`') {
+        let close = rest.find('`')?;
+        if close == 0 {
+            return None; // `` empty
+        }
+        let e = pos + 1 + close + 1;
+        return Some((vec![span(pos..e, SpanStyle::InlineCode)], e));
+    }
+
+    // ~~strike~~
+    #[allow(clippy::collapsible_if)]
+    if let Some(rest) = s.strip_prefix("~~") {
+        if let Some(close) = rest.find("~~") {
+            if close > 0 {
+                let e = pos + 2 + close + 2;
+                return Some((vec![span(pos..e, SpanStyle::Strike)], e));
+            }
+        }
+        return None;
+    }
+
+    // *emphasis*: run of 1–3 stars with a matching same-length closer.
+    if s.starts_with('*') {
+        let run = s.bytes().take_while(|&b| b == b'*').count().min(3);
+        for n in (1..=run).rev() {
+            let delim = &"***"[..n];
+            let inner = &s[n..];
+            #[allow(clippy::collapsible_if)]
+            if let Some(close) = inner.find(delim) {
+                if close > 0 && !inner[..close].bytes().all(|b| b == b'*') {
+                    let style = match n {
+                        3 => SpanStyle::BoldItalic,
+                        2 => SpanStyle::Bold,
+                        _ => SpanStyle::Italic,
+                    };
+                    let e = pos + n + close + n;
+                    return Some((vec![span(pos..e, style)], e));
+                }
+            }
+        }
+        return None;
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -339,6 +412,82 @@ mod tests {
                 range: 0..line.len(),
                 style: SpanStyle::Text
             }]
+        );
+    }
+
+    #[test]
+    fn emphasis_spans_include_delimiters() {
+        check(
+            "a **bold** word",
+            &[
+                (0..2, SpanStyle::Text),
+                (2..10, SpanStyle::Bold),
+                (10..15, SpanStyle::Text),
+            ],
+        );
+        check("*it*", &[(0..4, SpanStyle::Italic)]);
+        check("***both***", &[(0..10, SpanStyle::BoldItalic)]);
+        check(
+            "~~gone~~ ok",
+            &[(0..8, SpanStyle::Strike), (8..11, SpanStyle::Text)],
+        );
+    }
+
+    #[test]
+    fn inline_code_protects_contents() {
+        check(
+            "x `**not bold**` y",
+            &[
+                (0..2, SpanStyle::Text),
+                (2..16, SpanStyle::InlineCode),
+                (16..18, SpanStyle::Text),
+            ],
+        );
+    }
+
+    #[test]
+    fn unterminated_constructs_are_text() {
+        check("`open backtick", &[(0..14, SpanStyle::Text)]);
+        check("**never closed", &[(0..14, SpanStyle::Text)]);
+        check("~~half", &[(0..6, SpanStyle::Text)]);
+    }
+
+    #[test]
+    fn empty_emphasis_is_text() {
+        check("**** and ``", &[(0..11, SpanStyle::Text)]);
+    }
+
+    #[test]
+    fn partial_star_run_degrades_gracefully() {
+        // "**a*" — no ** closer; the scanner advances and finds *a* as italic.
+        check(
+            "**a*",
+            &[(0..1, SpanStyle::Text), (1..4, SpanStyle::Italic)],
+        );
+    }
+
+    #[test]
+    fn emphasis_inside_quote_uses_quote_gaps() {
+        check(
+            "> see **this**",
+            &[
+                (0..2, SpanStyle::QuoteMarker),
+                (2..6, SpanStyle::Quote),
+                (6..14, SpanStyle::Bold),
+            ],
+        );
+    }
+
+    #[test]
+    fn multibyte_around_emphasis() {
+        let line = "é **b** é"; // é = 2 bytes; total 11 bytes
+        check(
+            line,
+            &[
+                (0..3, SpanStyle::Text),
+                (3..8, SpanStyle::Bold),
+                (8..11, SpanStyle::Text),
+            ],
         );
     }
 }
