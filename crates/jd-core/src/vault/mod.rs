@@ -4,7 +4,9 @@
 // submodules land one per task: io (T2), scan (T3), trash+recovery (T4), watcher (T5)
 
 pub mod io;
+pub mod recovery;
 pub mod scan;
+pub mod trash;
 
 use std::path::{Path, PathBuf};
 
