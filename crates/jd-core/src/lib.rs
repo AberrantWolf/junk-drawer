@@ -2,6 +2,7 @@
 //! No egui dependency — fully testable headless.
 
 pub mod id;
+pub mod note;
 pub mod rng;
 pub mod tag;
 pub mod time;
