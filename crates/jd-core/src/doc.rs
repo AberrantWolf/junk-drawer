@@ -18,7 +18,13 @@ pub struct NoteDoc {
 }
 
 impl NoteDoc {
+    /// Parse a note file into its frontmatter and body components.
+    ///
+    /// A leading UTF-8 BOM (`\u{FEFF}`) is tolerated and dropped — the one
+    /// sanctioned deviation from byte-identical round-trips; output is always
+    /// BOM-less UTF-8.
     pub fn parse(input: &str) -> NoteDoc {
+        let input = input.strip_prefix('\u{FEFF}').unwrap_or(input);
         match FrontmatterDoc::parse(input) {
             Ok((fm, consumed)) => NoteDoc {
                 fm,
@@ -317,6 +323,19 @@ mod tests {
         assert_eq!(word_count("hello, world!"), 2);
         assert_eq!(word_count("héllo wörld"), 2);
         assert_eq!(word_count("# heading and [[link text]]"), 4);
+    }
+
+    #[test]
+    fn utf8_bom_is_tolerated_and_dropped() {
+        let input = "\u{feff}---\nstatus: permanent\n---\n# Title\nBody.\n";
+        let doc = NoteDoc::parse(input);
+        // frontmatter behind the BOM is parsed…
+        assert_eq!(doc.fm.status(), Some(crate::note::Status::Permanent));
+        assert_eq!(extract_title(&doc.body).unwrap().0, "Title");
+        // …and serialize normalizes the BOM away, idempotently
+        let out = doc.serialize();
+        assert_eq!(out, &input[3..]);
+        assert_eq!(NoteDoc::parse(&out).serialize(), out);
     }
 
     #[test]

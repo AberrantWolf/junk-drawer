@@ -1,5 +1,6 @@
 //! The load-bearing invariant (spec §13): parse → serialize is byte-identical
-//! for everything not deliberately changed.
+//! for everything not deliberately changed. Exception: a leading UTF-8 BOM
+//! (`EF BB BF`) is dropped on serialize — the one sanctioned normalization.
 
 use jd_core::doc::NoteDoc;
 
@@ -17,10 +18,11 @@ fn golden_corpus_round_trips_byte_identical() {
         }
         let src = std::fs::read_to_string(&path).unwrap();
         let doc = NoteDoc::parse(&src);
+        let expected = src.strip_prefix('\u{feff}').unwrap_or(&src);
         assert_eq!(
             doc.serialize(),
-            src,
-            "byte-identity failed for {}",
+            expected,
+            "round-trip failed for {}",
             path.display()
         );
         checked += 1;
@@ -50,5 +52,14 @@ fn golden_corpus_extracts_sane_metadata() {
         doc.fm.status(),
         Some(jd_core::note::Status::Permanent),
         "first key wins"
+    );
+
+    // 05-bom.md has a leading UTF-8 BOM; frontmatter behind it must be parsed
+    let src = std::fs::read_to_string(golden_dir().join("05-bom.md")).unwrap();
+    let doc = NoteDoc::parse(&src);
+    assert_eq!(
+        doc.fm.status(),
+        Some(jd_core::note::Status::Fleeting),
+        "BOM-prefixed frontmatter must be visible after normalization"
     );
 }

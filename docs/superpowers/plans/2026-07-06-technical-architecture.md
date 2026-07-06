@@ -905,3 +905,4 @@ WP1b/WP1c parallelize after WP1a. WP5 needs only WP2's surfaces scaffolding + WP
 6. **Update check v1 = manual link-out + local weekly reminder** (no HTTP dependency); finalize at WP8 planning.
 7. **Guidance thresholds** (aging = 3 days, cluster = 10 cards, long card = 300 words, mostly-links = 60 %) are pinned constants — tune before WP6 ships, then freeze.
 8. **One vault per window = one process per vault**; “Open Vault” spawns a process, single-instance claim is per-vault (socket name hashes the vault path).
+9. **UTF-8 BOM (owner ruling, 2026-07-06):** a leading `EF BB BF` is tolerated on parse and dropped on save — the one sanctioned normalization of the round-trip law. Output files are always BOM-less UTF-8. Non-UTF-8 files fail `read_to_string` and quarantine at scan (WP1d).
