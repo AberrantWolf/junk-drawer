@@ -2,6 +2,7 @@
 //! No egui dependency — fully testable headless.
 
 pub mod doc;
+pub mod error;
 pub mod frontmatter;
 pub mod id;
 pub mod index;
@@ -10,6 +11,7 @@ pub mod note;
 pub mod rng;
 pub mod tag;
 pub mod time;
+pub mod vault;
 
 #[cfg(test)]
 mod tests {
