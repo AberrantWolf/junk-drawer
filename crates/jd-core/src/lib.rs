@@ -3,6 +3,7 @@
 
 pub mod id;
 pub mod rng;
+pub mod tag;
 pub mod time;
 
 #[cfg(test)]
