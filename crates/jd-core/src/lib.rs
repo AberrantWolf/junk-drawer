@@ -12,6 +12,7 @@ pub mod rng;
 pub mod tag;
 pub mod time;
 pub mod vault;
+pub mod worker;
 
 #[cfg(test)]
 mod tests {
