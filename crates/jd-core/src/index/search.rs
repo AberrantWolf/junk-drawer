@@ -226,6 +226,19 @@ impl SearchIndex {
         }
         candidates.retain(|id| q.phrases.iter().all(|p| self.phrase_matches(p, *id)));
 
+        // Pre-resolve each group's term → (&postings_map, df) once, outside the
+        // per-candidate loop.  This avoids one BTreeMap lookup per term per candidate.
+        type ResolvedTerm<'a> = (&'a String, &'a HashMap<NoteId, Vec<u32>>, usize);
+        let resolved_groups: Vec<Vec<ResolvedTerm<'_>>> = groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .filter_map(|term| self.terms.get(term).map(|posts| (term, posts, posts.len())))
+                    .collect()
+            })
+            .collect();
+
         // Score: per group, the best-scoring expansion counts.
         let mut hits: Vec<SearchHit> = candidates
             .into_iter()
@@ -233,11 +246,11 @@ impl SearchIndex {
                 let doc_len = self.doc_len[&id];
                 let mut score = 0.0;
                 let mut matched: Vec<String> = Vec::new();
-                for group in &groups {
+                for resolved in &resolved_groups {
                     let mut best: Option<(f32, &String)> = None;
-                    for term in group {
-                        if let Some(positions) = self.terms.get(term).and_then(|p| p.get(&id)) {
-                            let s = self.bm25(positions.len(), self.terms[term].len(), doc_len);
+                    for &(term, posts, df) in resolved {
+                        if let Some(positions) = posts.get(&id) {
+                            let s = self.bm25(positions.len(), df, doc_len);
                             if best.is_none_or(|(b, _)| s > b) {
                                 best = Some((s, term));
                             }

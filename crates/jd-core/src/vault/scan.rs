@@ -3,7 +3,6 @@
 //! (NoteDoc::parse is infallible).
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::doc::NoteDoc;
@@ -99,8 +98,6 @@ pub fn scan(
     let files = note_files(vault)?;
     let total = files.len();
     let done = &AtomicUsize::new(0);
-    let metas = &Mutex::new(Vec::with_capacity(total));
-    let quarantined = &Mutex::new(Vec::new());
 
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
     let chunk_size = files.len().div_ceil(workers).max(1);
@@ -108,25 +105,40 @@ pub fn scan(
     // Convert into chunks as owned vectors to avoid borrow issues
     let chunks: Vec<Vec<PathBuf>> = files.chunks(chunk_size).map(|c| c.to_vec()).collect();
 
+    let mut all_metas = Vec::with_capacity(total);
+    let mut all_quarantined: Vec<QuarantinedFile> = Vec::new();
+
     std::thread::scope(|s| {
-        for chunk in chunks {
-            s.spawn(move || {
-                for rel in chunk {
-                    match parse_note_file(vault, &rel) {
-                        Ok(pair) => metas.lock().unwrap().push(pair),
-                        Err(error) => quarantined.lock().unwrap().push(QuarantinedFile {
-                            rel_path: rel,
-                            error,
-                        }),
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                s.spawn(move || {
+                    let mut local_metas: Vec<(NoteMeta, String)> = Vec::new();
+                    let mut local_quarantined: Vec<QuarantinedFile> = Vec::new();
+                    for rel in chunk {
+                        match parse_note_file(vault, &rel) {
+                            Ok(pair) => local_metas.push(pair),
+                            Err(error) => local_quarantined.push(QuarantinedFile {
+                                rel_path: rel,
+                                error,
+                            }),
+                        }
+                        progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
                     }
-                    progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
-                }
-            });
+                    (local_metas, local_quarantined)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let (m, q) = handle.join().expect("scan worker panicked");
+            all_metas.extend(m);
+            all_quarantined.extend(q);
         }
     });
 
     Ok(ScanOutcome {
-        metas: metas.lock().unwrap().drain(..).collect(),
-        quarantined: quarantined.lock().unwrap().drain(..).collect(),
+        metas: all_metas,
+        quarantined: all_quarantined,
     })
 }
