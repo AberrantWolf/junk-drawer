@@ -765,6 +765,7 @@ WP1b/WP1c parallelize after WP1a. WP5 needs only WP2's surfaces scaffolding + WP
 - §2.10 + §2.12 (worker skeleton: thread, channels, wake callback, write-ledger, conflict rule).
 - Integration tests on temp dirs: atomic-save torture (simulated kill between temp-write and rename via injected failpoint closure — original always intact) · title collision suffixing · conflict-copy creation · trash lifecycle incl. retention purge · recovery journal survives simulated crash · watcher debounce coalescing · **editor-zoo**: rename-swap saves (vim-style), truncate-rewrite, create-then-rename — all normalize to correct index updates.
 - **Performance budget tests** (`#[test]`, CI): generate 20k synthetic notes (xorshift), cold `scan` < 1 s; single-file re-index < 5 ms; `query` < 10 ms. These are the tripwire that legally activates the spec §3 snapshot escape hatch — if one goes red and can't be optimized, the snapshot WP gets scheduled; never SQLite.
+- **Perf-harness hot spots flagged by the WP1c review** — measure these three explicitly: (a) `Index::query` with a large-membership tag filter (member-set clone per query tag), (b) `unwire`'s whole-tag-map scan during a full 20k rebuild (fix = per-note tag key list if it shows), (c) `similar()` on a high-degree note (norm recomputation per call; fix = cached norms).
 
 **Consumes:** WP1a types, WP1c `Index`.
 **Produces:** `Vault`, `scan`, `atomic_save`, `filename_for`, `VaultWatcher`, trash/recovery APIs, `start() → VaultHandle`, `VaultCommand`/`VaultEvent`.
@@ -801,6 +802,7 @@ WP1b/WP1c parallelize after WP1a. WP5 needs only WP2's surfaces scaffolding + WP
 - Card visual language: all four shapes × Paper/Plain × three line styles — **snapshot-tested** (that's 4×2 + 3 line variants; enumerate all legal combos). Shape is semantic and survives Plain; texture is Paper-only.
 - **Fonts bundled** (spec §12): Inter + JetBrains Mono embedded via `egui::FontDefinitions` in `theme.rs`, system-font fallback for uncovered scripts; ruled-line metrics computed from the bundled face.
 - Editor: dialect styling via `lex_line` line-cache; Enter list/quote continuation; Tab indent; `[[`/`#` autocompletes; URL-paste behaviors; **no smart quotes ever**; Esc closes-and-saves; autosave + recovery journaling; per-card text undo (word-granularity grouping, survives close/reopen within session).
+- **Layouter line-length guard (WP1b review finding):** `lex_line` is O(n²) on pathological single lines of unclosed delimiters (~seconds at 200k chars). The layouter must cap per-line lexing (lex the first ~8 KB of a line, style the rest as `Text`) — cheap, invisible for human-authored notes, and keeps the UI thread safe against adversarial pastes.
 - `Ctrl+N` → scrap at cursor + editor open (files into `inbox/` via `Create`).
 
 **Consumes:** WP1 everything.
