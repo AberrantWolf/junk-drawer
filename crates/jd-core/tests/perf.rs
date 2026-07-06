@@ -1,5 +1,12 @@
 //! Performance budgets (spec §13) — the tripwire that legally activates the
 //! §3 snapshot escape hatch. Release-mode only: debug runs skip via ignore.
+//!
+//! MEASUREMENT DISCIPLINE: these tests each build a 20k-file vault; run in
+//! parallel they corrupt each other's timings. Always run serially:
+//!   cargo test -p jd-core --release --test perf -- --test-threads=1
+//! Local numbers are also environment-sensitive (sandbox tax, Spotlight
+//! churn); CI's clean runners are the authoritative venue for the spec §13
+//! tripwire. Do not weaken these assertions based on a noisy local run.
 
 mod common;
 
