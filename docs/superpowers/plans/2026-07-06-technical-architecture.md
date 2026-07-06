@@ -785,6 +785,13 @@ WP1b/WP1c parallelize after WP1a. WP5 needs only WP2's surfaces scaffolding + WP
 **Consumes:** WP1a/1c/1d.
 **Produces:** `VaultOp`, `OpResult`, `Journal`, `SessionState`, `SessionOp`, `DeskId` — the API surface WP3 wires to keys.
 
+**Handoffs inherited from WP1d's reviews (address here, don't drop):**
+- Wrap `trash_note`/`restore`/`purge_older_than`/`journal_buffer`/`clear_buffer` in `VaultCommand`s — restores the single-writer invariant STRUCTURALLY (WP1d enforces it by documented contract only).
+- Refactor the worker's command set into the `Op { op: VaultOp, source }` shape pinned in §2.12.
+- Carry `created` forward from the prior index entry when an external edit loses frontmatter (WP1d preserves the id but resets `created` to fs mtime).
+- Add an `Index::replace_at_path`-style atomic swap for the watcher's path-reuse case (WP1d does remove+upsert under separate locks — transient absence for concurrent readers).
+- Setter behavior tests through the worker: `set_source` inner-quote escaping, `set_tags(&[])`, bare-scalar `tags:` form (WP1a review gaps).
+
 **Milestone gate:** M1 complete — the vault engine is fully exercised headless before a single pixel.
 
 ---
