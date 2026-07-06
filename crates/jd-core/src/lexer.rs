@@ -158,7 +158,9 @@ pub fn lex_line(
 }
 
 /// Inline pass over `region`, emitting construct spans and `base`-styled gap
-/// runs. Task 1 stub: everything is a gap run; Tasks 2–3 add constructs.
+/// runs. Scanning loop: iterate through characters; at each position, try
+/// match_construct. If it matches, emit any preceding gap, emit the construct
+/// spans, and jump past it. If no match, include the character in the gap run.
 fn lex_inline(
     line: &str,
     region: Range<usize>,
@@ -193,7 +195,7 @@ fn match_construct(
     line: &str,
     pos: usize,
     end: usize,
-    _resolve: &dyn Fn(&str) -> bool,
+    resolve: &dyn Fn(&str) -> bool,
 ) -> Option<(Vec<StyledSpan>, usize)> {
     let s = &line[pos..end];
 
@@ -205,6 +207,43 @@ fn match_construct(
         }
         let e = pos + 1 + close + 1;
         return Some((vec![span(pos..e, SpanStyle::InlineCode)], e));
+    }
+
+    // [[wikilink]] / [[target|display]] — before the md-link arm ('[[' vs '[').
+    if let Some(rest) = s.strip_prefix("[[") {
+        if let Some(close) = rest.find("]]") {
+            let inner = &rest[..close];
+            let target = inner.split_once('|').map_or(inner, |(t, _)| t).trim();
+            if !target.is_empty() {
+                let e = pos + 2 + close + 2;
+                let style = SpanStyle::WikiLink {
+                    resolved: resolve(target),
+                };
+                return Some((vec![span(pos..e, style)], e));
+            }
+        }
+        return None;
+    }
+
+    // [text](url) — two spans.
+    if s.starts_with('[') {
+        let text_close = s.find(']')?;
+        if text_close > 1
+            && s[text_close + 1..].starts_with('(')
+            && let Some(url_close) = s[text_close + 2..].find(')')
+            && url_close > 0
+        {
+            let text_end = pos + text_close + 1;
+            let e = text_end + 1 + url_close + 1;
+            return Some((
+                vec![
+                    span(pos..text_end, SpanStyle::MdLinkText),
+                    span(text_end..e, SpanStyle::MdLinkUrl),
+                ],
+                e,
+            ));
+        }
+        return None;
     }
 
     // ~~strike~~
@@ -236,6 +275,53 @@ fn match_construct(
                     let e = pos + n + close + n;
                     return Some((vec![span(pos..e, style)], e));
                 }
+            }
+        }
+        return None;
+    }
+
+    // #tag — same rule as doc.rs: prev char is line-start or whitespace,
+    // next char alphanumeric; run of [alnum - _].
+    if let Some(rest) = s.strip_prefix('#') {
+        let prev = line[..pos].chars().next_back();
+        let next_ok = rest.chars().next().is_some_and(char::is_alphanumeric);
+        if prev.is_none_or(char::is_whitespace) && next_ok {
+            let mut e = pos + 1;
+            for c in line[pos + 1..end].chars() {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    e += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            return Some((vec![span(pos..e, SpanStyle::Tag)], e));
+        }
+        return None;
+    }
+
+    // bare URL: http(s):// after start/whitespace/'('; runs to whitespace,
+    // trailing punctuation excluded.
+    if s.starts_with("http://") || s.starts_with("https://") {
+        let prev = line[..pos].chars().next_back();
+        if prev.is_none_or(|c| c.is_whitespace() || c == '(') {
+            let mut e = pos;
+            for c in line[pos..end].chars() {
+                if c.is_whitespace() {
+                    break;
+                }
+                e += c.len_utf8();
+            }
+            while e > pos {
+                let last = line[pos..e].chars().next_back().unwrap();
+                if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | ')') {
+                    e -= last.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if e > pos + "https://".len() || (s.starts_with("http://") && e > pos + "http://".len())
+            {
+                return Some((vec![span(pos..e, SpanStyle::Url)], e));
             }
         }
         return None;
@@ -487,6 +573,116 @@ mod tests {
                 (0..3, SpanStyle::Text),
                 (3..8, SpanStyle::Bold),
                 (8..11, SpanStyle::Text),
+            ],
+        );
+    }
+
+    fn resolve_known(t: &str) -> bool {
+        t == "Known"
+    }
+
+    #[test]
+    fn wikilinks_resolved_and_not() {
+        let (spans, _) = lex_line(
+            "see [[Known]] and [[Missing]]",
+            LineState::Normal,
+            &resolve_known,
+        );
+        let got: Vec<(std::ops::Range<usize>, SpanStyle)> =
+            spans.into_iter().map(|s| (s.range, s.style)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (0..4, SpanStyle::Text),
+                (4..13, SpanStyle::WikiLink { resolved: true }),
+                (13..18, SpanStyle::Text),
+                (18..29, SpanStyle::WikiLink { resolved: false }),
+            ]
+        );
+    }
+
+    #[test]
+    fn wikilink_pipe_resolves_target_only() {
+        let (spans, _) = lex_line("[[Known|shown text]]", LineState::Normal, &resolve_known);
+        assert_eq!(
+            spans,
+            vec![StyledSpan {
+                range: 0..20,
+                style: SpanStyle::WikiLink { resolved: true }
+            }]
+        );
+    }
+
+    #[test]
+    fn empty_wikilink_is_text() {
+        check("[[]] here", &[(0..9, SpanStyle::Text)]);
+    }
+
+    #[test]
+    fn md_link_is_two_spans() {
+        check(
+            "see [label](https://x.io) end",
+            &[
+                (0..4, SpanStyle::Text),
+                (4..11, SpanStyle::MdLinkText),
+                (11..25, SpanStyle::MdLinkUrl),
+                (25..29, SpanStyle::Text),
+            ],
+        );
+    }
+
+    #[test]
+    fn tags_follow_extractor_rules() {
+        check(
+            "uses #rust here",
+            &[
+                (0..5, SpanStyle::Text),
+                (5..10, SpanStyle::Tag),
+                (10..15, SpanStyle::Text),
+            ],
+        );
+        check(
+            "#start-tag x",
+            &[(0..10, SpanStyle::Tag), (10..12, SpanStyle::Text)],
+        );
+        // C# is not a tag; # followed by space is not a tag
+        check("C# is fine", &[(0..10, SpanStyle::Text)]);
+        check("a # b", &[(0..5, SpanStyle::Text)]);
+        // inside inline code: protected
+        check("`#code`", &[(0..7, SpanStyle::InlineCode)]);
+    }
+
+    #[test]
+    fn bare_urls() {
+        check(
+            "go https://ex.io/p now", // url = 15 bytes at offset 3
+            &[
+                (0..3, SpanStyle::Text),
+                (3..18, SpanStyle::Url),
+                (18..22, SpanStyle::Text),
+            ],
+        );
+        // trailing punctuation excluded
+        check(
+            "(see https://x.io).",
+            &[
+                (0..5, SpanStyle::Text),
+                (5..17, SpanStyle::Url),
+                (17..19, SpanStyle::Text),
+            ],
+        );
+        // mid-word is not a url
+        check("nothttps://x.io", &[(0..15, SpanStyle::Text)]);
+    }
+
+    #[test]
+    fn tag_in_quote_line() {
+        check(
+            "> note #idea",
+            &[
+                (0..2, SpanStyle::QuoteMarker),
+                (2..7, SpanStyle::Quote),
+                (7..12, SpanStyle::Tag),
             ],
         );
     }
