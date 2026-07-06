@@ -334,6 +334,10 @@ impl FrontmatterDoc {
         );
     }
 
+    pub fn set_id(&mut self, id: NoteId) {
+        self.set_raw(KnownKey::Id, Some(id.to_string()));
+    }
+
     pub fn set_modified(&mut self, t: Timestamp) {
         self.set_raw(KnownKey::Modified, Some(t.to_rfc3339()));
     }
@@ -553,6 +557,18 @@ source: \"Ahrens (2017)\"\n\
         assert_eq!(
             fm.serialize(),
             "---\ntags: [rust, egui]\nstatus: fleeting\n---\n"
+        );
+    }
+
+    #[test]
+    fn set_id_adds_or_rewrites_only_its_line() {
+        let (mut fm, _) =
+            FrontmatterDoc::parse("---\nx-custom: keep\nstatus: fleeting\n---\n").unwrap();
+        let id = crate::id::NoteId::parse("01J8ZQ4KF3T9M2X7C5VBNAE8RD").unwrap();
+        fm.set_id(id);
+        assert_eq!(
+            fm.serialize(),
+            "---\nx-custom: keep\nstatus: fleeting\nid: 01J8ZQ4KF3T9M2X7C5VBNAE8RD\n---\n"
         );
     }
 

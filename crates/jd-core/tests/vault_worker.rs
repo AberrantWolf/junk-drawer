@@ -263,6 +263,43 @@ fn concurrent_external_edit_diverts_to_conflict_copy() {
 }
 
 #[test]
+fn scan_progress_is_granular_on_boot() {
+    let t = TempDir::new();
+    {
+        let v = Vault::open(t.path()).unwrap();
+        for i in 0..130 {
+            std::fs::write(
+                v.root().join(format!("notes/n{i}.md")),
+                format!("note {i}\n"),
+            )
+            .unwrap();
+        }
+    }
+    let (h, _) = boot(&t);
+    let mut progress_events = 0;
+    let mut saw_final = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && !saw_final {
+        if let Ok(ev) = h.events.recv_timeout(std::time::Duration::from_millis(50)) {
+            match ev {
+                VaultEvent::ScanProgress { done, total } => {
+                    progress_events += 1;
+                    assert!(done <= total);
+                    if done == total { /* fine */ }
+                }
+                VaultEvent::ScanComplete { .. } => saw_final = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_final, "ScanComplete never arrived");
+    assert!(
+        progress_events >= 2,
+        "expected granular progress (130 files / 64), got {progress_events}"
+    );
+}
+
+#[test]
 fn shutdown_is_clean() {
     let t = TempDir::new();
     let (h, _) = boot(&t);

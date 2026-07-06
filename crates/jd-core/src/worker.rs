@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::SystemTime;
 
 use crate::doc::NoteDoc;
@@ -161,6 +161,7 @@ pub fn start(vault: Vault, wake: Box<dyn Fn() + Send + Sync>) -> Result<VaultHan
             let mut id_gen = IdGen::new();
             let mut ledger: WriteLedger = HashMap::new();
             let wake = std::sync::Arc::new(wake);
+            let event_tx_for_scan = Mutex::new(event_tx.clone());
             let emit = {
                 let wake = wake.clone();
                 move |ev: VaultEvent| {
@@ -169,14 +170,21 @@ pub fn start(vault: Vault, wake: Box<dyn Fn() + Send + Sync>) -> Result<VaultHan
                 }
             };
 
-            run_initial_scan(&vault, &worker_index, &emit);
+            run_initial_scan(&vault, &worker_index, &event_tx_for_scan, &*wake, &emit);
 
             while let Ok(msg) = msg_rx.recv() {
                 match msg {
                     WorkerMsg::Cmd(VaultCommand::Shutdown) => return,
-                    WorkerMsg::Cmd(cmd) => {
-                        handle_command(&vault, &worker_index, &mut id_gen, &mut ledger, &emit, cmd)
-                    }
+                    WorkerMsg::Cmd(cmd) => handle_command(
+                        &vault,
+                        &worker_index,
+                        &mut id_gen,
+                        &mut ledger,
+                        &event_tx_for_scan,
+                        &*wake,
+                        &emit,
+                        cmd,
+                    ),
                     WorkerMsg::Watch(ev) => {
                         handle_watch(&vault, &worker_index, &mut ledger, &emit, ev)
                     }
@@ -200,11 +208,27 @@ pub fn start(vault: Vault, wake: Box<dyn Fn() + Send + Sync>) -> Result<VaultHan
 
 /// Run the initial scan, emitting ScanProgress every 64 files and ScanComplete.
 /// Populates the index under a single write lock.
-fn run_initial_scan(vault: &Vault, index: &SharedIndex, emit: &impl Fn(VaultEvent)) {
-    // scan's progress callback fires from worker threads (must be Sync).
-    // We collect events and emit after: emit progress once at the end.
-    let outcome = match scan(vault, &|_done, _total| {
-        // Progress is emitted after the scan completes since emit is !Sync
+///
+/// `event_tx` is wrapped in a Mutex so the progress callback (called from
+/// parallel scan threads that require Sync) can send through it.  `wake` is
+/// called after each send so the UI repaints promptly.  `emit` handles the
+/// post-scan ScanComplete event (and any scan error) on the worker thread.
+fn run_initial_scan(
+    vault: &Vault,
+    index: &SharedIndex,
+    event_tx: &Mutex<mpsc::Sender<VaultEvent>>,
+    wake: &(dyn Fn() + Sync),
+    emit: &impl Fn(VaultEvent),
+) {
+    let outcome = match scan(vault, &|done, total| {
+        // Throttle: emit when done % 64 == 0 or at the very end.
+        if done % 64 == 0 || done == total {
+            let _ = event_tx
+                .lock()
+                .unwrap()
+                .send(VaultEvent::ScanProgress { done, total });
+            wake();
+        }
     }) {
         Ok(o) => o,
         Err(e) => {
@@ -215,13 +239,6 @@ fn run_initial_scan(vault: &Vault, index: &SharedIndex, emit: &impl Fn(VaultEven
             return;
         }
     };
-
-    // Emit scan progress (one shot at end — emit is not Sync so we can't call
-    // it from inside scan's parallel worker threads)
-    let total = outcome.metas.len() + outcome.quarantined.len();
-    if total > 0 {
-        emit(VaultEvent::ScanProgress { done: total, total });
-    }
 
     // Upsert all metas under a single write lock
     {
@@ -237,11 +254,14 @@ fn run_initial_scan(vault: &Vault, index: &SharedIndex, emit: &impl Fn(VaultEven
 }
 
 /// Handle a single VaultCommand (not Shutdown).
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     vault: &Vault,
     index: &SharedIndex,
     id_gen: &mut IdGen,
     ledger: &mut WriteLedger,
+    event_tx: &Mutex<mpsc::Sender<VaultEvent>>,
+    wake: &(dyn Fn() + Sync),
     emit: &impl Fn(VaultEvent),
     cmd: VaultCommand,
 ) {
@@ -351,6 +371,7 @@ fn handle_command(
                     };
                     let conflict_content = conflict_doc.serialize();
 
+                    // conflict copy not ledgered — we don't own this path going forward
                     if let Err(e) = atomic_save(&conflict_path, &conflict_content) {
                         emit(VaultEvent::Error {
                             context: "save conflict copy".into(),
@@ -393,16 +414,24 @@ fn handle_command(
                 }
             };
 
-            // If frontmatter is empty, synthesize with the note's current id (decision #1)
-            if doc.fm.id().is_none() && doc.fm.serialize().is_empty() {
-                let now = Timestamp::now();
-                let status = index
-                    .read()
-                    .unwrap()
-                    .get(id)
-                    .map(|m| m.status)
-                    .unwrap_or(Status::Fleeting);
-                doc.fm = FrontmatterDoc::synthesize(id, now, status);
+            // If frontmatter lacks an id, stamp it with the note's current index id
+            // (identity continuity, plan decision #1).
+            // - No frontmatter at all → synthesize a full block.
+            // - Frontmatter present but id missing/invalid → keep existing fields,
+            //   just inject the id line via set_id so unknown keys are preserved.
+            if doc.fm.id().is_none() {
+                if doc.fm.serialize().is_empty() {
+                    let now = Timestamp::now();
+                    let status = index
+                        .read()
+                        .unwrap()
+                        .get(id)
+                        .map(|m| m.status)
+                        .unwrap_or(Status::Fleeting);
+                    doc.fm = FrontmatterDoc::synthesize(id, now, status);
+                } else {
+                    doc.fm.set_id(id);
+                }
             }
 
             // Replace body, update modified
@@ -494,7 +523,7 @@ fn handle_command(
         VaultCommand::RescanAll => {
             // Clear the index
             *index.write().unwrap() = Index::new();
-            run_initial_scan(vault, index, emit);
+            run_initial_scan(vault, index, event_tx, wake, emit);
         }
 
         VaultCommand::Shutdown => {
