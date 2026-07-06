@@ -317,7 +317,13 @@ pub fn lex_line(line: &str, entry: LineState, resolve: &dyn Fn(&str) -> bool)
     -> (Vec<StyledSpan>, LineState);
 ```
 
-The dialect is exactly spec §5's list; anything else lexes as `Text`.
+The dialect is exactly spec §5's list; anything else lexes as `Text`. Pinned span
+semantics (decision §6.11): emphasis/strike/inline-code spans cover delimiters +
+content as ONE span, with no nested styling inside; `HeadingMarker` covers the
+hashes + following space and the heading rest is ONE `Heading(n)` span (no inline
+styling inside headings in v1 — links in headings are still indexed by doc.rs, just
+not interactive in the editor; revisit post-v1); quote lines inline-lex their rest
+with plain runs emitted as `Quote`; only fences carry state across lines.
 
 ### 2.9 `index/` — Index, search, fuzzy
 
@@ -356,11 +362,18 @@ impl Index {
 pub struct Query { /* terms (AND), phrases, tags, negated terms; last term prefix-matched */ }
 pub fn parse_query(input: &str) -> Query;     // the whole language: words, "phrases", #tag, -word
 
+/// NOTE (decision §6.10): hits carry matched terms, NOT a prebuilt snippet — bodies are
+/// not in the index (spec §3), and building snippets inside query() would force disk reads
+/// on the UI thread. The app loads bodies for visible rows via the worker and calls
+/// make_snippet.
 pub struct SearchHit {
     pub id: NoteId,
     pub score: f32,
-    pub snippet: Snippet,                     // best window ±~40 chars, with highlight ranges
+    pub matched_terms: Vec<String>,           // lowercased terms that hit, incl. prefix expansions
 }
+/// Pure snippet builder for the app layer: best window (~radius chars each side of the
+/// densest match cluster), with byte-range highlights of term occurrences.
+pub fn make_snippet(body: &str, terms: &[String], radius: usize) -> Snippet;
 pub struct Snippet { pub text: String, pub highlights: Vec<Range<usize>> }
 
 // fuzzy.rs — title stratum scorer (spec §7 tiers pinned as ranking-table tests)
@@ -906,3 +919,6 @@ WP1b/WP1c parallelize after WP1a. WP5 needs only WP2's surfaces scaffolding + WP
 7. **Guidance thresholds** (aging = 3 days, cluster = 10 cards, long card = 300 words, mostly-links = 60 %) are pinned constants — tune before WP6 ships, then freeze.
 8. **One vault per window = one process per vault**; “Open Vault” spawns a process, single-instance claim is per-vault (socket name hashes the vault path).
 9. **UTF-8 BOM (owner ruling, 2026-07-06):** a leading `EF BB BF` is tolerated on parse and dropped on save — the one sanctioned normalization of the round-trip law. Output files are always BOM-less UTF-8. Non-UTF-8 files fail `read_to_string` and quarantine at scan (WP1d).
+10. **SearchHit carries matched terms, not snippets** — snippets need bodies, bodies aren't in the index, and query() runs on the UI thread. `make_snippet(body, terms, radius)` is a pure helper the app calls after loading bodies via the worker (visible rows only).
+11. **Lexer span semantics** — emphasis spans include their delimiters, no nesting; heading rest is a single `Heading(n)` span (no inline styling in headings, v1); token positions in search postings are token indices (phrase adjacency), not byte offsets.
+12. **Title collisions in the index** — `titles` maps lowercased title → the most recently upserted note; duplicate titles are legal on disk (filename suffixing handles files), and links resolve to the latest holder.
