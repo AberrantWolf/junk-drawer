@@ -76,7 +76,7 @@ pub(crate) fn note_files(vault: &Vault) -> Result<Vec<PathBuf>, VaultError> {
 }
 
 /// Read + parse one note. Err(reason) means unreadable → quarantine.
-pub(crate) fn parse_note_file(vault: &Vault, rel: &Path) -> Result<(NoteMeta, String), String> {
+pub fn parse_note_file(vault: &Vault, rel: &Path) -> Result<(NoteMeta, String), String> {
     let abs = vault.abs(rel);
     let src = std::fs::read_to_string(&abs).map_err(|e| e.to_string())?;
     let fs_modified = abs
