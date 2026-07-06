@@ -3,6 +3,8 @@
 
 // submodules land one per task: io (T2), scan (T3), trash+recovery (T4), watcher (T5)
 
+pub mod io;
+
 use std::path::{Path, PathBuf};
 
 use crate::error::{IoError, VaultError};
