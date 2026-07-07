@@ -819,6 +819,12 @@ WP1b/WP1c parallelize after WP1a. WP5 needs only WP2's surfaces scaffolding + WP
 
 ### WP3 — The workflow: inbox, promotion, undo wiring  *(spec §6, §9, M3)*
 
+**Hardening list inherited from WP1e's final review (address or consciously defer here):**
+- Batch rollback failures are silently swallowed (`let _ =` on rollback inverses) — emit an `Error` event so a mixed-state vault is observable.
+- `RenameTitle` has no rollback for mid-referrer-loop failures (self already renamed, some referrers rewritten) — wrap its multi-file writes in Batch-style rollback discipline.
+- Body-derived filenames make some undo paths rel_path-unstable (untitled-note Batch case; RenameTitle-undo when the old name got re-claimed) — decide: accept-and-document, or carry paths in inverses.
+- Undo of Split leaves the split-off note in trash (consistent with Create-undo; document in undo UX copy).
+
 **Files:** `jd-app/src/surfaces/{inbox, trash}.rs`, `rail.rs`, promotion logic in `editor.rs`, journal wiring in `app.rs`, `menus.rs` (Edit-menu subset + Card context menu); kittest scenarios.
 
 **Requirements:**
