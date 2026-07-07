@@ -220,6 +220,8 @@ pub enum DeskEvent {
         desk: DeskId,
         cam: DeskCamera,
     },
+    /// Context-menu action on a card.
+    CardMenu(crate::menus::CardMenuEvent),
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +240,11 @@ pub struct DeskUiDeps<'a> {
     /// True while a delete-confirm modal is pending; suppresses all surface
     /// keyboard handling so the modal's Enter/Esc are the only consumers.
     pub confirm_pending: bool,
+    /// All desks (id + name) for the "Take to Desk ▸" submenu.
+    pub desks: &'a [(jd_core::session::DeskId, String)],
+    /// The current desk id — used to determine whether a card is "on a desk"
+    /// (so Put Away is enabled when desk surface is active).
+    pub current_desk_id: jd_core::session::DeskId,
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +310,30 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
                 id,
                 was_at,
             }));
+        }
+
+        // Shift+F10 → open card context menu at the focused card's rect.
+        // egui 0.35 cannot open a context_menu programmatically from keyboard
+        // input, so we use egui memory to set a flag that the card-render loop
+        // reads to open an anchored Popup instead.  This is equivalent to
+        // right-click context_menu but initiated via keyboard.
+        let shift_f10 = ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::F10,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.shift
+                )
+            })
+        });
+        if shift_f10 && state.focus.is_some() {
+            ui.memory_mut(|m| {
+                m.data.insert_temp(context_menu_open_id(), true);
+            });
         }
     }
 
@@ -562,9 +593,100 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
         if is_focused && !state.editor_open {
             resp.request_focus();
         }
+
+        // ── Card context menu ─────────────────────────────────────────────
+        // Build desk name list for "Take to Desk ▸" submenu.
+        let desk_refs: Vec<(jd_core::session::DeskId, &str)> = state
+            .desks
+            .iter()
+            .map(|(id, name)| (*id, name.as_str()))
+            .collect();
+
+        let menu_ctx = crate::menus::CardMenuCtx {
+            id: card.id,
+            status: if let Some(m) = meta_opt {
+                m.status
+            } else {
+                jd_core::note::Status::Fleeting
+            },
+            kind: if let Some(m) = meta_opt {
+                m.kind
+            } else {
+                jd_core::note::Kind::Note
+            },
+            title: if let Some(m) = meta_opt {
+                m.title.as_str()
+            } else {
+                ""
+            },
+            desks: &desk_refs,
+            on_desk: true, // card is on a desk surface
+        };
+
+        // Right-click context menu via Response::context_menu.
+        resp.context_menu(|ui| {
+            if let Some(ev) = crate::menus::card_menu_items(ui, &menu_ctx) {
+                events.push(DeskEvent::CardMenu(ev));
+                ui.close();
+            }
+        });
+
+        // Shift+F10 on the focused card → anchored Popup at card rect.
+        // egui 0.35 cannot programmatically open a context_menu from keyboard,
+        // so we use an anchored Popup as an equivalent.  The flag is stored in
+        // egui memory (context_menu_open_id) and consumed here for the focused card.
+        if is_focused {
+            let wants_open: bool =
+                ui.memory(|m| m.data.get_temp(context_menu_open_id()).unwrap_or(false));
+            if wants_open {
+                // Clear the flag so only one card opens the popup.
+                ui.memory_mut(|m| m.data.insert_temp(context_menu_open_id(), false));
+                ui.memory_mut(|m| m.data.insert_temp(card_popup_open_id(card.id), true));
+            }
+
+            let popup_open: bool = ui.memory(|m| {
+                m.data
+                    .get_temp(card_popup_open_id(card.id))
+                    .unwrap_or(false)
+            });
+
+            if popup_open {
+                let popup_id = egui::Id::new("card_context_popup").with(card.id);
+                egui::Popup::from_response(&resp)
+                    .id(popup_id)
+                    .open(true)
+                    .at_position(card_screen_rect.left_bottom())
+                    .show(|ui| {
+                        if let Some(ev) = crate::menus::card_menu_items(ui, &menu_ctx) {
+                            events.push(DeskEvent::CardMenu(ev));
+                            ui.memory_mut(|m| {
+                                m.data.insert_temp(card_popup_open_id(card.id), false);
+                            });
+                        }
+                        // Close on click outside (egui handles this via Popup's focus rules).
+                    });
+
+                // Check if popup should close (click outside or Esc).
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    ui.memory_mut(|m| {
+                        m.data.insert_temp(card_popup_open_id(card.id), false);
+                    });
+                }
+            }
+        }
     }
 
     events
+}
+
+/// egui memory key for the Shift+F10 "open context menu on focused card" flag.
+pub fn context_menu_open_id() -> egui::Id {
+    egui::Id::new("desk_card_context_menu_open")
+}
+
+/// egui memory key for a specific card's keyboard-popup open state.
+fn card_popup_open_id(id: NoteId) -> egui::Id {
+    egui::Id::new("desk_card_popup_open").with(id)
 }
 
 /// Pan viewport to reveal `id` if it is currently off-screen.

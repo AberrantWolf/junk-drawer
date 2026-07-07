@@ -141,6 +141,13 @@ pub struct UiState {
     /// Task 6: the journal entry stashed when a vault undo/redo is in flight.
     /// drain_events uses this to build the new entry (fresh inverse from OpDone).
     pub pending_undo_entry: Option<jd_core::journal::JournalEntry>,
+    /// Task 7: Set Source… modal pending for this note id.
+    /// When Some, renders a text-input modal for the user to type a source string.
+    pub pending_set_source: Option<(jd_core::id::NoteId, String)>,
+    /// Task 7: Copy Link text to write to the clipboard on the next frame
+    /// (Copy Link needs a `ui` context to call `ctx.copy_text`; we stash it here
+    /// from `apply_card_menu_event` and copy it in the render loop).
+    pub pending_copy_text: Option<String>,
 }
 
 impl Default for UiState {
@@ -162,6 +169,8 @@ impl Default for UiState {
             status_echo: None,
             pending_undo_redo: None,
             pending_undo_entry: None,
+            pending_set_source: None,
+            pending_copy_text: None,
         }
     }
 }

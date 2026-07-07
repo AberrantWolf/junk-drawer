@@ -3,6 +3,7 @@
 pub mod app;
 pub mod card;
 pub mod editor;
+pub mod menus;
 pub mod rail;
 pub mod state;
 pub mod surfaces;

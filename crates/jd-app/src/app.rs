@@ -15,6 +15,7 @@ use jd_core::session::{DeskId, SessionOp, SessionState, SurfaceId};
 use jd_core::vault::Vault;
 use jd_core::worker::{self, VaultCommand, VaultEvent, VaultHandle};
 
+use crate::menus::CardMenuEvent;
 use crate::rail::{RailEvent, RailUiDeps};
 use crate::state::{UiState, UndoRedoKind};
 use crate::surfaces::desk::{DeskEvent, DeskUiDeps, DragState, FaceMeta};
@@ -800,6 +801,15 @@ impl JdUi {
                         // staleness is acceptable.
                         self.last_panel_rect = Some(ui.max_rect());
 
+                        // Build desk list for the "Take to Desk ▸" submenu.
+                        let desk_list: Vec<(jd_core::session::DeskId, String)> = self
+                            .state
+                            .session
+                            .desks
+                            .iter()
+                            .map(|d| (d.id, d.name.clone()))
+                            .collect();
+
                         let mut deps = DeskUiDeps {
                             focus: &mut self.state.focus,
                             bodies: &mut self.state.bodies,
@@ -810,6 +820,8 @@ impl JdUi {
                             drag: &mut self.drag,
                             editor_open: self.state.editor.is_some(),
                             confirm_pending: self.state.pending_confirm.is_some(),
+                            desks: &desk_list,
+                            current_desk_id: desk_id,
                         };
                         let evts = crate::surfaces::desk::desk_ui(ui, &desk, &mut deps);
                         self.apply_desk_events(evts, desk.id, &face_metas);
@@ -974,12 +986,214 @@ impl JdUi {
             }
         }
 
+        // 4d. Set Source… modal (Task 7).
+        // Rendered when pending_set_source is Some; Enter commits, Esc cancels.
+        if let Some((source_id, ref mut source_buf)) = self.state.pending_set_source {
+            let mut submitted = false;
+            let mut cancelled = false;
+            let modal = egui::Modal::new(egui::Id::new("set_source_modal")).show(ui.ctx(), |ui| {
+                ui.set_width(400.0);
+                ui.heading("Set Source");
+                ui.add_space(8.0);
+                ui.label("Source URL or citation:");
+                let te = ui.text_edit_singleline(source_buf);
+                te.request_focus();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        submitted = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                    submitted = true;
+                }
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                    cancelled = true;
+                }
+            });
+            if modal.should_close() {
+                cancelled = true;
+            }
+            if submitted {
+                let source_text = source_buf.trim().to_owned();
+                let source_opt = if source_text.is_empty() {
+                    None
+                } else {
+                    Some(source_text)
+                };
+                let _ = self.vault.commands.send(VaultCommand::Op {
+                    op: VaultOp::SetSource {
+                        id: source_id,
+                        source: source_opt,
+                    },
+                    source: OpSource::User,
+                });
+                self.state.pending_set_source = None;
+            } else if cancelled {
+                self.state.pending_set_source = None;
+            }
+        }
+
+        // 4e. Clipboard copy (Task 7: Copy Link).
+        // pending_copy_text is set by apply_card_menu_event; we copy it here
+        // where we have a ui context.
+        if let Some(text) = self.state.pending_copy_text.take() {
+            ui.ctx().copy_text(text);
+        }
+
         // 5. Debounced saves: if session_dirty_at elapsed > 1s → save and clear.
         if let Some(dirty_at) = self.state.session_dirty_at
             && dirty_at.elapsed() > std::time::Duration::from_secs(1)
         {
             let _ = self.state.session.save(&self.vault_ref);
             self.state.session_dirty_at = None;
+        }
+    }
+
+    /// Apply a single `CardMenuEvent`.  Public so kitests can fire events directly.
+    pub fn apply_card_menu_event(&mut self, ev: CardMenuEvent, current_desk: Option<DeskId>) {
+        match ev {
+            CardMenuEvent::Promote(id) => {
+                // Same path as InboxEvent::Promote (Ctrl+Enter from inbox).
+                self.open_card_editor_with_promotion(id, true);
+            }
+
+            CardMenuEvent::Toss(id) => {
+                // Status-routed: fleeting → immediate Toss, permanent → confirm modal.
+                let is_fleeting = {
+                    let idx = self.vault.index.read().unwrap();
+                    idx.get(id)
+                        .map(|m| m.status == jd_core::note::Status::Fleeting)
+                        .unwrap_or(false)
+                };
+                if is_fleeting {
+                    let _ = self.vault.commands.send(VaultCommand::Op {
+                        op: VaultOp::Toss { id },
+                        source: OpSource::User,
+                    });
+                } else {
+                    self.state.pending_confirm = Some(id);
+                }
+            }
+
+            CardMenuEvent::TakeToDesk { id, desk } => {
+                // Move card from current desk (or inbox) to target desk.
+                // This reuses the CardDroppedOnDesk path: PutAway from source + Place on target.
+                if let Some(source_desk) = current_desk {
+                    let was_at = self
+                        .state
+                        .session
+                        .desks
+                        .iter()
+                        .find(|d| d.id == source_desk)
+                        .and_then(|d| d.cards.iter().find(|c| c.id == id))
+                        .map(|c| c.pos)
+                        .unwrap_or_default();
+
+                    use crate::rail::RailEvent;
+                    self.apply_rail_event(RailEvent::CardDroppedOnDesk {
+                        target_desk: desk,
+                        id,
+                        source_desk,
+                        was_at,
+                    });
+                } else {
+                    // Card is in inbox (no current desk) — just place on target desk.
+                    let pos = self
+                        .state
+                        .session
+                        .desks
+                        .iter()
+                        .find(|d| d.id == desk)
+                        .map(|d| d.viewport.center)
+                        .unwrap_or_default();
+                    self.place_card(desk, id, pos);
+                }
+            }
+
+            CardMenuEvent::PutAway(id) => {
+                // Put card away from the current desk.
+                if let Some(desk_id) = current_desk {
+                    let was_at = self
+                        .state
+                        .session
+                        .desks
+                        .iter()
+                        .find(|d| d.id == desk_id)
+                        .and_then(|d| d.cards.iter().find(|c| c.id == id))
+                        .map(|c| c.pos)
+                        .unwrap_or_default();
+                    self.apply_session(
+                        jd_core::session::SessionOp::PutAway {
+                            desk: desk_id,
+                            id,
+                            was_at,
+                        },
+                        Some("Put card away"),
+                    );
+                }
+            }
+
+            CardMenuEvent::SetSource(id) => {
+                // Open the Set Source… modal.  Pre-populate with the current source if any.
+                let current_source = {
+                    let idx = self.vault.index.read().unwrap();
+                    idx.get(id)
+                        .and_then(|m| m.source.clone())
+                        .unwrap_or_default()
+                };
+                self.state.pending_set_source = Some((id, current_source));
+            }
+
+            CardMenuEvent::MakeDivider(id) => {
+                let _ = self.vault.commands.send(VaultCommand::Op {
+                    op: VaultOp::SetKind {
+                        id,
+                        kind: jd_core::note::Kind::Structure,
+                    },
+                    source: OpSource::User,
+                });
+            }
+
+            CardMenuEvent::Demote(id) => {
+                let _ = self.vault.commands.send(VaultCommand::Op {
+                    op: VaultOp::Demote { id },
+                    source: OpSource::User,
+                });
+            }
+
+            CardMenuEvent::CopyLink(id) => {
+                // Copy [[title]] to clipboard.  Title is non-empty (enablement gate).
+                let title = {
+                    let idx = self.vault.index.read().unwrap();
+                    idx.get(id)
+                        .and_then(|m| m.title.clone())
+                        .unwrap_or_default()
+                };
+                if !title.is_empty() {
+                    // ctx.copy_text is only available from a ui context; we store
+                    // the text in the pending_copy field and copy it in the next
+                    // render frame via ui.ctx().copy_text.
+                    self.state.pending_copy_text = Some(format!("[[{title}]]"));
+                }
+            }
+
+            CardMenuEvent::RevealInFileManager(id) => {
+                // Look up the absolute path, then spawn the platform reveal command.
+                let abs_path: Option<std::path::PathBuf> = {
+                    let idx = self.vault.index.read().unwrap();
+                    idx.get(id).map(|m| self.vault_ref.root().join(&m.rel_path))
+                };
+                if let Some(path) = abs_path {
+                    let result = reveal_in_file_manager(&path);
+                    if let Err(e) = result {
+                        self.state.last_error = Some(format!("Reveal: {e}"));
+                    }
+                }
+            }
         }
     }
 
@@ -1066,6 +1280,10 @@ impl JdUi {
                     }
                     // Not journaled — just mark dirty for debounced save.
                     self.state.session_dirty_at = Some(std::time::Instant::now());
+                }
+                DeskEvent::CardMenu(ev) => {
+                    let current_desk = Some(_desk_id);
+                    self.apply_card_menu_event(ev, current_desk);
                 }
             }
         }
@@ -1367,6 +1585,37 @@ impl Drop for JdUi {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Launch the platform file manager to reveal `path`.
+/// macOS: `open -R <path>`; Windows: `explorer /select,<path>`;
+/// Linux/other: `xdg-open <parent-dir>`.
+/// Spawns and detaches (non-blocking).  Returns `Err` if spawn fails.
+fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let parent = path.parent().unwrap_or(path);
+        std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
 
 /// If a vault undo/redo op fails, clear the in-flight guard and restore the
 /// stashed entry to the stack it came from so the user can retry. Without this
