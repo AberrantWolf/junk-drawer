@@ -354,12 +354,21 @@ impl SearchIndex {
             anchors = Some(match anchors {
                 None => positions.clone(),
                 Some(prev) => {
-                    let set: HashSet<u32> = positions.iter().copied().collect();
-                    let next: Vec<u32> = prev
-                        .iter()
-                        .filter(|&&p| set.contains(&(p + 1)))
-                        .map(|&p| p + 1)
-                        .collect();
+                    // Both `prev` and `positions` are ascending-sorted (tokens
+                    // are appended in document order by `add_doc`).  Walk them
+                    // with two pointers — no allocations.
+                    let mut next: Vec<u32> = Vec::new();
+                    let mut j = 0usize;
+                    for &anchor in &prev {
+                        let target = anchor + 1;
+                        // Advance j until positions[j] >= target.
+                        while j < positions.len() && positions[j] < target {
+                            j += 1;
+                        }
+                        if j < positions.len() && positions[j] == target {
+                            next.push(target);
+                        }
+                    }
                     if next.is_empty() {
                         return false;
                     }
@@ -615,6 +624,17 @@ mod tests {
         assert_eq!(s.query(&q("\"brown fox\""), 10, None).len(), 1);
         assert_eq!(s.query(&q("\"fox brown\""), 10, None).len(), 0);
         assert_eq!(s.query(&q("\"quick berries\""), 10, None)[0].id, nid(3));
+    }
+
+    #[test]
+    fn phrase_adjacency_two_pointer_edges() {
+        let mut s = SearchIndex::new();
+        // "a b a b a" — 'a' at 0,2,4; 'b' at 1,3
+        s.add_doc(nid(1), "a b a b a");
+        assert_eq!(s.query(&q("\"a b\""), 10, None).len(), 1);
+        assert_eq!(s.query(&q("\"b a\""), 10, None).len(), 1);
+        assert_eq!(s.query(&q("\"a a\""), 10, None).len(), 0);
+        assert_eq!(s.query(&q("\"a b a\""), 10, None).len(), 1);
     }
 
     #[test]
