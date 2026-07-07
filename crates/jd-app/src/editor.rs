@@ -183,6 +183,11 @@ pub struct EditorState {
     /// Batch([SaveBody{content: "# line1\nrest"}, Promote{id}]).
     /// Set by Enter-at-end-of-single-line (fleeting only) or Ctrl+Enter.
     pub pending_promotion: bool,
+    /// Split requested via Ctrl+Shift+Enter or the Edit menu's "Split Card".
+    /// When set, `editor_ui` dispatches the Batch([SaveBody, Split]) this frame
+    /// and returns `SplitAndClose` (treated as `CloseAndSave` in app.rs — the
+    /// actual save is the SaveBody inside the Batch).
+    pub split_requested: bool,
 }
 
 impl EditorState {
@@ -214,6 +219,7 @@ impl EditorState {
             prev_cursor: None,
             is_fleeting,
             pending_promotion,
+            split_requested: false,
         }
     }
 }
@@ -488,6 +494,12 @@ pub struct EditorDeps<'a> {
 pub enum EditorEvent {
     KeepOpen,
     CloseAndSave,
+    /// Ctrl+Shift+Enter: close the editor; app.rs dispatches
+    /// Batch([SaveBody{buffer}, Split{id, at_byte}]) with the cursor byte
+    /// provided here. The batch is journaled as "Split card/scrap '<title>'".
+    SplitAndClose {
+        at_byte: usize,
+    },
 }
 
 /// Convert a char index to a byte offset in `s`.
@@ -512,6 +524,21 @@ pub fn editor_ui(
     let resolve_fn = |title: &str| index_guard.resolve_title(title).is_some();
 
     let mut close_requested = false;
+
+    // Ctrl+Shift+Enter: Split card at cursor position (Task 8).
+    // Must be checked BEFORE the Ctrl+Enter check so the modifiers are read
+    // while they are still in the event queue (consume order matters in egui 0.35).
+    let ctrl_shift_enter = ui.input_mut(|i| {
+        i.consume_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::Enter,
+        )
+    });
+    // Also check split_requested (set by Edit menu "Split Card" action).
+    let split_requested = ctrl_shift_enter || ed.split_requested;
+    if split_requested {
+        ed.split_requested = false; // consume
+    }
 
     // Check Ctrl+Enter before showing the Modal so we consume the key even
     // when egui's own TextEdit would otherwise handle Enter.
@@ -875,6 +902,19 @@ pub fn editor_ui(
         });
         ed.dirty = false;
         // Keep last_edit so the next edit cycle anchors correctly.
+    }
+
+    // Task 8: Split requested — compute byte offset from last-frame cursor and close.
+    // The cursor byte comes from prev_cursor (captured before the TextEdit ran),
+    // which is current because the buffer cannot change between frames.
+    // If split_requested and we have a cursor position, emit SplitAndClose.
+    // Fallback: if no cursor is available (editor just opened), treat as CloseAndSave.
+    if split_requested {
+        let at_byte = ed
+            .prev_cursor
+            .map(|cr| char_idx_to_byte(&ed.buffer, cr.primary.index.0))
+            .unwrap_or(ed.buffer.len());
+        return EditorEvent::SplitAndClose { at_byte };
     }
 
     if close_requested {

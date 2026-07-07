@@ -15,8 +15,8 @@ use jd_core::session::{DeskId, SessionOp, SessionState, SurfaceId};
 use jd_core::vault::Vault;
 use jd_core::worker::{self, VaultCommand, VaultEvent, VaultHandle};
 
-use crate::menus::CardMenuEvent;
-use crate::rail::{RailEvent, RailUiDeps};
+use crate::menus::{CardMenuEvent, EditMenuAction, EditMenuCtx, edit_menu_bar};
+use crate::rail::{RailDropTarget, RailEvent, RailUiDeps};
 use crate::state::{UiState, UndoRedoKind};
 use crate::surfaces::desk::{DeskEvent, DeskUiDeps, DragState, FaceMeta};
 use crate::surfaces::inbox::{InboxEvent, InboxUiDeps};
@@ -60,6 +60,11 @@ pub struct JdUi {
     /// closure each frame, one frame before it is used by reveal() in FocusChanged.
     /// None until the first frame has rendered.
     last_panel_rect: Option<egui::Rect>,
+    /// Rail row rects from the previous frame: (screen rect, drop target).
+    /// Populated by rail_ui each frame via RailUiDeps::row_hits; consumed by
+    /// desk_ui's drag-release path to decide CardDroppedOnInbox / CardDroppedOnDesk.
+    /// Public so kitests can inspect or seed it directly.
+    pub rail_row_hits: Vec<(egui::Rect, RailDropTarget)>,
 }
 
 impl JdUi {
@@ -89,6 +94,7 @@ impl JdUi {
             line_cache: crate::editor::LineCache::default(),
             drag: None,
             last_panel_rect: None,
+            rail_row_hits: Vec::new(),
         })
     }
 
@@ -244,9 +250,99 @@ impl JdUi {
                         }
                     }
 
+                    // Clean desk sessions: remove any placed card whose note is no longer
+                    // in the index (moved to trash by Delete/Toss, or purged).
+                    // This covers the Split-undo case: the undo Batch([SaveBody, Delete])
+                    // moves the split-off to trash; the split-off's placement must be
+                    // evicted from the desk immediately after the op completes.
+                    // We scan all desk card ids against the current index — O(n*m) but
+                    // n (desk cards) and m (op executions) are both small in practice.
+                    {
+                        let idx = self.vault.index.read().unwrap();
+                        let mut any_removed = false;
+                        for desk in &mut self.state.session.desks {
+                            let before = desk.cards.len();
+                            desk.cards.retain(|c| idx.get(c.id).is_some());
+                            if desk.cards.len() != before {
+                                any_removed = true;
+                            }
+                        }
+                        drop(idx);
+                        if any_removed {
+                            self.state.session_dirty_at = Some(std::time::Instant::now());
+                        }
+                    }
+
                     // Ctrl+N pending_create: if a Create just finished while
                     // pending_create is set, place the new card and open editor.
                     self.handle_pending_create(&result);
+
+                    // Task 8: pending_split — if a Split Batch just finished
+                    // (source==User, result.created non-empty), place the
+                    // original card (if not already on desk) and the split-off
+                    // card side-by-side.  Placement uses apply_session(None) so
+                    // it is NOT journaled — the Split undo trashes the split-off
+                    // and the SaveBody inverse restores the original body, so
+                    // the placement rides the op itself.
+                    if source == OpSource::User
+                        && let Some(orig_id) = self.state.pending_split
+                        && !result.created.is_empty()
+                    {
+                        self.state.pending_split = None;
+                        let split_off_id = result.created[0];
+                        // Find the current desk.
+                        if let Some(SurfaceId::Desk(desk_id)) = self.state.session.current_surface {
+                            // Determine the original card's position on this desk.
+                            let orig_pos = self
+                                .state
+                                .session
+                                .desks
+                                .iter()
+                                .find(|d| d.id == desk_id)
+                                .and_then(|d| d.cards.iter().find(|c| c.id == orig_id))
+                                .map(|c| c.pos);
+                            // If the original is not on the desk, place it at the
+                            // viewport center first.
+                            let orig_pos = if let Some(p) = orig_pos {
+                                p
+                            } else {
+                                let center = self
+                                    .state
+                                    .session
+                                    .desks
+                                    .iter()
+                                    .find(|d| d.id == desk_id)
+                                    .map(|d| d.viewport.center)
+                                    .unwrap_or_default();
+                                // Place original (not journaled — rides the Split op).
+                                self.state.session.apply(&SessionOp::Place {
+                                    desk: desk_id,
+                                    id: orig_id,
+                                    pos: center,
+                                });
+                                self.state.session_dirty_at = Some(std::time::Instant::now());
+                                center
+                            };
+                            // Place the split-off card at original_pos + (card_width + gap, 0).
+                            // Use 300.0 (IndexCard width) + 24 gap as the offset constant.
+                            // (The actual card size may differ if the split-off is a Scrap,
+                            // but we use the host card's nominal width for a clean layout.)
+                            let split_off_pos = CoreVec2 {
+                                x: orig_pos.x + 300.0 + 24.0,
+                                y: orig_pos.y,
+                            };
+                            self.state.session.apply(&SessionOp::Place {
+                                desk: desk_id,
+                                id: split_off_id,
+                                pos: split_off_pos,
+                            });
+                            self.state.session_dirty_at = Some(std::time::Instant::now());
+                        }
+                    } else if source == OpSource::User && self.state.pending_split.is_some() {
+                        // Split Batch completed but created is empty (shouldn't happen
+                        // for a successful split — clear guard to avoid stale state).
+                        self.state.pending_split = None;
+                    }
 
                     // Push to journal only for user-originated ops.
                     if source == OpSource::User
@@ -679,6 +775,46 @@ impl JdUi {
         }
 
         // ------------------------------------------------------------------
+        // Edit menu bar (top panel) — must be added before Bottom/SidePanels
+        // and CentralPanel so egui allocates its space correctly.
+        // Actions: Undo/Redo delegate to execute_undo/execute_redo.
+        //          SplitCard: only enabled when editor is open; sets
+        //          editor.split_requested so editor.rs dispatches the Batch on
+        //          the same frame (the editor handles Ctrl+Shift+Enter directly
+        //          via its pre-TextEdit hook; the menu action fires through the
+        //          same EditorEvent::SplitRequested path — see editor.rs).
+        // ------------------------------------------------------------------
+        let edit_menu_action = egui::Panel::top("edit_menu_bar")
+            .exact_size(24.0)
+            .show(ui, |ui| {
+                let ctx = EditMenuCtx {
+                    journal: &self.state.journal,
+                    editor_open: self.state.editor.is_some(),
+                };
+                edit_menu_bar(ui, &ctx)
+            })
+            .inner;
+        match edit_menu_action {
+            Some(EditMenuAction::Undo) => {
+                if self.state.editor.is_none() && self.state.pending_confirm.is_none() {
+                    self.execute_undo();
+                }
+            }
+            Some(EditMenuAction::Redo) => {
+                if self.state.editor.is_none() && self.state.pending_confirm.is_none() {
+                    self.execute_redo();
+                }
+            }
+            Some(EditMenuAction::SplitCard) => {
+                // Signal the editor to execute a split on this frame.
+                if let Some(ed) = &mut self.state.editor {
+                    ed.split_requested = true;
+                }
+            }
+            None => {}
+        }
+
+        // ------------------------------------------------------------------
         // Status line (bottom) — must be added before SidePanel and CentralPanel.
         // ------------------------------------------------------------------
         let fit_clicked = egui::Panel::bottom("status_line")
@@ -722,6 +858,7 @@ impl JdUi {
                     session: &self.state.session,
                     inbox_count,
                     id_gen: &mut self.id_gen,
+                    row_hits: &mut self.rail_row_hits,
                 };
                 crate::rail::rail_ui(ui, &mut deps)
             })
@@ -822,6 +959,7 @@ impl JdUi {
                             confirm_pending: self.state.pending_confirm.is_some(),
                             desks: &desk_list,
                             current_desk_id: desk_id,
+                            rail_row_hits: &self.rail_row_hits,
                         };
                         let evts = crate::surfaces::desk::desk_ui(ui, &desk, &mut deps);
                         self.apply_desk_events(evts, desk.id, &face_metas);
@@ -881,18 +1019,71 @@ impl JdUi {
         });
 
         // 4b. Editor modal overlay (Task 10).
-        let close_editor = if let Some(ed) = &mut self.state.editor {
-            let mut deps = crate::editor::EditorDeps {
-                theme: &self.theme,
-                commands: &self.vault.commands,
-                index: &self.vault.index,
-                reduced_motion: false,
+        let editor_result: Option<crate::editor::EditorEvent> =
+            if let Some(ed) = &mut self.state.editor {
+                let mut deps = crate::editor::EditorDeps {
+                    theme: &self.theme,
+                    commands: &self.vault.commands,
+                    index: &self.vault.index,
+                    reduced_motion: false,
+                };
+                Some(crate::editor::editor_ui(ui, ed, &mut deps))
+            } else {
+                None
             };
-            let ev = crate::editor::editor_ui(ui, ed, &mut deps);
-            matches!(ev, crate::editor::EditorEvent::CloseAndSave)
-        } else {
-            false
-        };
+
+        // Handle SplitAndClose: dispatch Batch([SaveBody, Split]) and close the editor.
+        // pending_label is set so drain_events uses the Split op's natural label
+        // ("Split card '<title>'" / "Split scrap '<title>'") from the worker.
+        // pending_split is set so drain_events places the two cards side-by-side.
+        if let Some(crate::editor::EditorEvent::SplitAndClose { at_byte }) = editor_result {
+            let editor = self.state.editor.take().unwrap();
+            // Stash the editor's text undo stack.
+            self.state.text_undo.insert(editor.id, editor.undo);
+            self.state.session.open_card = None;
+            self.state.session_dirty_at = Some(std::time::Instant::now());
+            ui.ctx().memory_mut(|mem| mem.stop_text_input());
+            // Set pending_split so drain_events places original + split-off side-by-side.
+            self.state.pending_split = Some(editor.id);
+            // Set pending_label from the index so the journal entry has the right label.
+            // The worker computes "Split card '<title>'" / "Split scrap '<first_line>'"
+            // via op_label; we need to match exactly for the Task 6 echo suffix logic.
+            let pending_label_str = {
+                let idx = self.vault.index.read().unwrap();
+                if let Some(meta) = idx.get(editor.id) {
+                    let is_fleeting = meta.status == jd_core::note::Status::Fleeting;
+                    let kind_word = if is_fleeting { "scrap" } else { "card" };
+                    let display = jd_core::command::label_display(
+                        meta.title.as_deref().unwrap_or(&meta.first_line),
+                    );
+                    format!("Split {kind_word} '{display}'")
+                } else {
+                    "Split card".to_owned()
+                }
+            };
+            self.state.pending_label = Some(pending_label_str);
+            // Dispatch the Batch. The SaveBody ensures the split sees exactly what
+            // the user sees (dirty buffer); the worker splits the saved content.
+            let _ = self.vault.commands.send(VaultCommand::Op {
+                op: jd_core::command::VaultOp::Batch(vec![
+                    jd_core::command::VaultOp::SaveBody {
+                        id: editor.id,
+                        content: editor.buffer.clone(),
+                    },
+                    jd_core::command::VaultOp::Split {
+                        id: editor.id,
+                        at_byte,
+                    },
+                ]),
+                source: OpSource::User,
+            });
+            // Skip the close_editor block below (we already handled it here).
+        }
+
+        let close_editor = matches!(
+            editor_result,
+            Some(crate::editor::EditorEvent::CloseAndSave)
+        );
         if close_editor {
             // Only save when the buffer was actually modified.  A clean
             // open→close must not write the file (which would invalidate
@@ -1284,6 +1475,11 @@ impl JdUi {
                 DeskEvent::CardMenu(ev) => {
                     let current_desk = Some(_desk_id);
                     self.apply_card_menu_event(ev, current_desk);
+                }
+                DeskEvent::CardDroppedOnRail(rail_ev) => {
+                    // Drag-to-rail gesture: route through the same handler as
+                    // a regular rail drop event (CardDroppedOnInbox / CardDroppedOnDesk).
+                    self.apply_rail_event(rail_ev);
                 }
             }
         }

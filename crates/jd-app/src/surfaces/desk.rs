@@ -222,6 +222,9 @@ pub enum DeskEvent {
     },
     /// Context-menu action on a card.
     CardMenu(crate::menus::CardMenuEvent),
+    /// Card was dragged onto a rail row (Inbox or a desk row).
+    /// app.rs handles this as CardDroppedOnInbox / CardDroppedOnDesk.
+    CardDroppedOnRail(crate::rail::RailEvent),
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +248,11 @@ pub struct DeskUiDeps<'a> {
     /// The current desk id — used to determine whether a card is "on a desk"
     /// (so Put Away is enabled when desk surface is active).
     pub current_desk_id: jd_core::session::DeskId,
+    /// Rail row rects from the previous frame (populated by rail_ui each frame).
+    /// On drag release beyond the 4px threshold, if the release pointer position
+    /// is inside one of these rects, we emit CardDroppedOnInbox / CardDroppedOnDesk
+    /// instead of a plain Move.
+    pub rail_row_hits: &'a [(egui::Rect, crate::rail::RailDropTarget)],
 }
 
 // ---------------------------------------------------------------------------
@@ -479,24 +487,75 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
         drag.total_delta += pointer_delta.length();
     }
 
-    // Drag release → emit Move if beyond threshold
+    // Drag release → check rail drop targets first, then emit Move if beyond threshold
     #[allow(clippy::collapsible_if)]
     if primary_released && let Some(drag) = state.drag.take() {
         if drag.total_delta >= 4.0
             && let Some(ptr) = pointer_pos
         {
-            let new_screen = ptr - drag.grab_offset;
-            let new_world = cam.to_world(panel, new_screen);
-            let to = Vec2 {
-                x: new_world.x,
-                y: new_world.y,
-            };
-            events.push(DeskEvent::SessionOp(SessionOp::Move {
-                desk: desk.id,
-                id: drag.id,
-                from: drag.from,
-                to,
-            }));
+            // Check if the pointer is over a rail row (drag-to-rail gesture).
+            // Rail hits are in screen coordinates, same space as `ptr`.
+            let rail_hit = state
+                .rail_row_hits
+                .iter()
+                .find(|(rect, _)| rect.contains(ptr));
+
+            if let Some((_, target)) = rail_hit {
+                // Emit the appropriate rail drop event instead of a plain Move.
+                match *target {
+                    crate::rail::RailDropTarget::Inbox => {
+                        events.push(DeskEvent::CardDroppedOnRail(
+                            crate::rail::RailEvent::CardDroppedOnInbox {
+                                id: drag.id,
+                                source_desk: desk.id,
+                                was_at: drag.from,
+                            },
+                        ));
+                    }
+                    crate::rail::RailDropTarget::Desk(target_desk) => {
+                        if target_desk != desk.id {
+                            // Cross-desk drop.
+                            events.push(DeskEvent::CardDroppedOnRail(
+                                crate::rail::RailEvent::CardDroppedOnDesk {
+                                    target_desk,
+                                    id: drag.id,
+                                    source_desk: desk.id,
+                                    was_at: drag.from,
+                                },
+                            ));
+                        } else {
+                            // Dropped on the same desk's rail row — treat as plain move
+                            // within the desk (user probably didn't want to change desks).
+                            let new_screen = ptr - drag.grab_offset;
+                            let new_world = cam.to_world(panel, new_screen);
+                            let to = Vec2 {
+                                x: new_world.x,
+                                y: new_world.y,
+                            };
+                            events.push(DeskEvent::SessionOp(SessionOp::Move {
+                                desk: desk.id,
+                                id: drag.id,
+                                from: drag.from,
+                                to,
+                            }));
+                        }
+                    }
+                }
+            } else {
+                // Normal move within the desk.
+                let new_screen = ptr - drag.grab_offset;
+                let new_world = cam.to_world(panel, new_screen);
+                let to = Vec2 {
+                    x: new_world.x,
+                    y: new_world.y,
+                };
+                events.push(DeskEvent::SessionOp(SessionOp::Move {
+                    desk: desk.id,
+                    id: drag.id,
+                    from: drag.from,
+                    to,
+                }));
+            }
         }
         // else: tiny drag = click, focus already set on press
     }

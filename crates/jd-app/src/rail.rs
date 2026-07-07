@@ -44,6 +44,21 @@ pub enum RailEvent {
 // RailUiDeps
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// RailDropTarget
+// ---------------------------------------------------------------------------
+
+/// Where a dragged card should land when dropped on a rail row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RailDropTarget {
+    Inbox,
+    Desk(DeskId),
+}
+
+// ---------------------------------------------------------------------------
+// RailUiDeps
+// ---------------------------------------------------------------------------
+
 /// Everything `rail_ui` reads but does not own.
 pub struct RailUiDeps<'a> {
     pub session: &'a SessionState,
@@ -51,6 +66,12 @@ pub struct RailUiDeps<'a> {
     /// under the existing FaceMeta lock pattern.
     pub inbox_count: usize,
     pub id_gen: &'a mut IdGen,
+    /// Output: each rail row's screen rect + its drop target.
+    /// Cleared and repopulated every frame so desk_ui's drag-release path can
+    /// hit-test against it to decide whether to emit CardDroppedOnInbox /
+    /// CardDroppedOnDesk instead of a plain Move.
+    /// app.rs stores this on JdUi.rail_row_hits between frames.
+    pub row_hits: &'a mut Vec<(egui::Rect, RailDropTarget)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,9 +95,15 @@ fn rename_state_id() -> egui::Id {
 
 /// Render the left rail and return events for app.rs to apply.
 /// The rail is always visible regardless of the current surface.
+///
+/// Row rects are recorded into `deps.row_hits` (cleared first) each frame so
+/// desk_ui's drag-release path can hit-test them without an extra pass.
 pub fn rail_ui(ui: &mut egui::Ui, deps: &mut RailUiDeps<'_>) -> Vec<RailEvent> {
     let mut events: Vec<RailEvent> = Vec::new();
     let current = deps.session.current_surface;
+
+    // Clear last frame's hits; we'll repopulate below.
+    deps.row_hits.clear();
 
     // ── Desk list ────────────────────────────────────────────────────────────
     let desks: Vec<(DeskId, String)> = deps
@@ -149,6 +176,10 @@ pub fn rail_ui(ui: &mut egui::Ui, deps: &mut RailUiDeps<'_>) -> Vec<RailEvent> {
                 )
             });
 
+            // Record this row's screen rect for drag-to-rail hit testing.
+            deps.row_hits
+                .push((resp.rect, RailDropTarget::Desk(*desk_id)));
+
             if resp.clicked() {
                 events.push(RailEvent::Switch(SurfaceId::Desk(*desk_id)));
             }
@@ -218,6 +249,8 @@ pub fn rail_ui(ui: &mut egui::Ui, deps: &mut RailUiDeps<'_>) -> Vec<RailEvent> {
             inbox_label.as_str(),
         )
     });
+    // Record Inbox row rect for drag-to-rail hit testing.
+    deps.row_hits.push((inbox_resp.rect, RailDropTarget::Inbox));
     if inbox_resp.clicked() {
         events.push(RailEvent::Switch(SurfaceId::Inbox));
     }

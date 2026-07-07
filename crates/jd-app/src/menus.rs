@@ -14,11 +14,119 @@
 //!   Copy Link     — only when `Status::Permanent` AND `title` is non-empty
 //!                   (scraps have no canonical title to link)
 //!   Reveal in File Manager — always enabled
+//!
+//! `edit_menu_bar` renders the egui menu bar (top panel) with Edit only:
+//!   Undo <label> / Redo <label> — live labels, disabled when None.
+//!   Cut / Copy / Paste — disabled (no programmatic egui 0.35 TextEdit path).
+//!   Split Card — enabled only when editor is open.
+//!   Find — disabled (arrives with the Drawer, WP4).
 
 use eframe::egui;
 use jd_core::id::NoteId;
+use jd_core::journal::Journal;
 use jd_core::note::{Kind, Status};
 use jd_core::session::DeskId;
+
+// ---------------------------------------------------------------------------
+// Edit menu bar action
+// ---------------------------------------------------------------------------
+
+/// Actions that can be fired from the Edit menu bar.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditMenuAction {
+    Undo,
+    Redo,
+    SplitCard,
+}
+
+/// Context needed to render the Edit menu bar correctly.
+pub struct EditMenuCtx<'a> {
+    pub journal: &'a Journal,
+    /// True when the card editor overlay is currently open.
+    pub editor_open: bool,
+}
+
+/// Render the egui top-panel menu bar with an "Edit" menu.
+/// Returns `Some(EditMenuAction)` if an item was clicked, `None` otherwise.
+///
+/// Cut/Copy/Paste are rendered disabled with shortcut-hint tooltips — egui 0.35
+/// has no programmatic way to forward clipboard operations to the focused TextEdit.
+/// The native shortcuts (Cmd+X/C/V) still work inside the TextEdit widget itself.
+///
+/// Find is disabled with tooltip "Ctrl+K — arrives with the Drawer" (WP4).
+pub fn edit_menu_bar(ui: &mut egui::Ui, ctx: &EditMenuCtx<'_>) -> Option<EditMenuAction> {
+    let mut action: Option<EditMenuAction> = None;
+
+    egui::MenuBar::new().ui(ui, |ui| {
+        ui.menu_button("Edit", |ui| {
+            // ── Undo ──────────────────────────────────────────────────────────
+            let undo_label = ctx.journal.undo_label();
+            let undo_text = match undo_label {
+                Some(l) => format!("Undo {l}"),
+                None => "Undo".to_owned(),
+            };
+            let can_undo = undo_label.is_some();
+            ui.add_enabled_ui(can_undo, |ui| {
+                let btn = ui.button(&undo_text);
+                if btn.clicked() {
+                    action = Some(EditMenuAction::Undo);
+                    ui.close();
+                }
+            });
+
+            // ── Redo ──────────────────────────────────────────────────────────
+            let redo_label = ctx.journal.redo_label();
+            let redo_text = match redo_label {
+                Some(l) => format!("Redo {l}"),
+                None => "Redo".to_owned(),
+            };
+            let can_redo = redo_label.is_some();
+            ui.add_enabled_ui(can_redo, |ui| {
+                let btn = ui.button(&redo_text);
+                if btn.clicked() {
+                    action = Some(EditMenuAction::Redo);
+                    ui.close();
+                }
+            });
+
+            ui.separator();
+
+            // ── Cut / Copy / Paste (disabled) ─────────────────────────────────
+            // egui 0.35 provides no programmatic path to forward clipboard ops to
+            // the focused TextEdit widget.  The native shortcuts (Cmd+X/C/V) work
+            // inside the TextEdit directly; these menu items serve as discoverable
+            // placeholders with shortcut hints.
+            ui.add_enabled_ui(false, |ui| {
+                ui.button("Cut")
+                    .on_disabled_hover_text("Use Cmd+X in the editor");
+                ui.button("Copy")
+                    .on_disabled_hover_text("Use Cmd+C in the editor");
+                ui.button("Paste")
+                    .on_disabled_hover_text("Use Cmd+V in the editor");
+            });
+
+            ui.separator();
+
+            // ── Split Card ────────────────────────────────────────────────────
+            let can_split = ctx.editor_open;
+            ui.add_enabled_ui(can_split, |ui| {
+                let btn = ui.button("Split Card");
+                if btn.clicked() {
+                    action = Some(EditMenuAction::SplitCard);
+                    ui.close();
+                }
+            });
+
+            // ── Find (disabled) ───────────────────────────────────────────────
+            ui.add_enabled_ui(false, |ui| {
+                ui.button("Find")
+                    .on_disabled_hover_text("Ctrl+K — arrives with the Drawer");
+            });
+        });
+    });
+
+    action
+}
 
 // ---------------------------------------------------------------------------
 // CardMenuEvent

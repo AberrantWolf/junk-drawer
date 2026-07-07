@@ -148,6 +148,14 @@ pub struct UiState {
     /// (Copy Link needs a `ui` context to call `ctx.copy_text`; we stash it here
     /// from `apply_card_menu_event` and copy it in the render loop).
     pub pending_copy_text: Option<String>,
+    /// Task 8: Split is in flight — the NoteId of the card that was split.
+    /// Set when Ctrl+Shift+Enter dispatches the Batch([SaveBody, Split]); cleared
+    /// in drain_events when an OpDone with source User and result.created non-empty
+    /// arrives (that's the Split completing).  Placement of original + split-off
+    /// rides the op: apply_session(Place, None) for both (not journaled — the
+    /// Split undo trashes the split-off and the undo of the SaveBody restores
+    /// the original body, so placement is part of the same user act).
+    pub pending_split: Option<jd_core::id::NoteId>,
 }
 
 impl Default for UiState {
@@ -171,6 +179,7 @@ impl Default for UiState {
             pending_undo_entry: None,
             pending_set_source: None,
             pending_copy_text: None,
+            pending_split: None,
         }
     }
 }

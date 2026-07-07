@@ -1,20 +1,18 @@
-# Task 8 Report: Pannable Desk Canvas
+# WP3 Task 8 Report: Edit menu + Split UI + Drag-to-rail gesture
 
-## Status: GREEN — all 31 jd-app tests pass
+## Status: GREEN — 48/48 jd-app tests pass, 4/4 jd-core tests pass
 
 ---
 
 ## RED Evidence
 
-`cargo test -p jd-app --test desk_kittest` before implementation produced 5 compile errors:
+New tests added before implementation (all failed compilation or assertion):
 
-- `DeskCamera` not found in `jd_app::surfaces::desk`
-- `desk_ui` not found
-- `DeskUiDeps` not found
-- `FaceMeta` not found
-- `DragState` not found
-
-These confirmed the tests were truly red before any implementation work began.
+- `split_card_ctrl_shift_enter_places_two_cards_and_undo_restores` — failed: `EditorEvent::SplitAndClose` did not exist; `EditorState::split_requested` did not exist
+- `edit_menu_undo_item_shows_live_label` — failed: `edit_menu_bar` / `EditMenuCtx` did not exist
+- `edit_menu_split_card_disabled_when_editor_closed` — failed: same missing symbols
+- `drag_to_rail_inbox_journals_put_card_away` — failed: `RailDropTarget` / `rail_row_hits` did not exist
+- `drag_to_rail_desk_row_journals_move_card_to_desk` — failed: same missing symbols
 
 ---
 
@@ -22,182 +20,63 @@ These confirmed the tests were truly red before any implementation work began.
 
 ### Files Modified
 
-- `crates/jd-app/src/surfaces/desk.rs` — new types + `desk_ui()` + `reveal()`
-- `crates/jd-app/src/app.rs` — JdUi wired to desk canvas
-- `crates/jd-app/tests/desk_kittest.rs` — created (5 integration tests)
-- `crates/jd-app/tests/common/mod.rs` — added `new_note` helper
+- `crates/jd-app/src/menus.rs` — added `EditMenuAction`, `EditMenuCtx<'a>`, `edit_menu_bar()` using `egui::MenuBar::new().ui(…)`
+- `crates/jd-app/src/editor.rs` — added `split_requested: bool` to `EditorState`; added `EditorEvent::SplitAndClose { at_byte }`; Ctrl+Shift+Enter interception before Ctrl+Enter
+- `crates/jd-app/src/rail.rs` — added `RailDropTarget` enum (`Inbox` | `Desk(DeskId)`); added `row_hits: &'a mut Vec<(egui::Rect, RailDropTarget)>` to `RailUiDeps`; rail_ui populates row_hits each frame
+- `crates/jd-app/src/surfaces/desk.rs` — added `DeskEvent::CardDroppedOnRail(RailEvent)`; added `rail_row_hits` to `DeskUiDeps`; drag release checks rail rects before falling through to plain Move
+- `crates/jd-app/src/state.rs` — added `pending_split: Option<NoteId>` to `UiState`
+- `crates/jd-app/src/app.rs` — top panel with `edit_menu_bar`; `EditorEvent::SplitAndClose` handler dispatches `Batch([SaveBody, Split])`; `OpDone` places both cards side-by-side; desk cleanup evicts cards whose notes left the index; `rail_row_hits: Vec<(Rect, RailDropTarget)>` wired through
+- `crates/jd-app/tests/workflow_kittest.rs` — 5 new tests (4 passing immediately, 1 needed fix)
 
-### Camera Math
+### Edit Menu Bar
 
-`DeskCamera` implements the brief's transform verbatim:
+`egui 0.35` removed `egui::menu::bar`. The correct API is `egui::MenuBar::new().ui(ui, |ui| { … })`. Undo/Redo labels pulled live from `journal.undo_label()` / `journal.redo_label()`. Cut/Copy/Paste ship disabled-with-shortcut-hint (egui 0.35 has no programmatic path to forward clipboard ops to the focused TextEdit). Split Card enabled only when `editor_open`. Find disabled with tooltip referencing WP4.
 
-```
-screen = panel_center + (world - center) * zoom   [to_screen]
-world  = center + (screen - panel_center) / zoom   [to_world]
-```
+### Split UI
 
-`zoom_to_fit` computes center as the bounding-box midpoint of all placed cards and zoom as `min(panel_w / bbox_w, panel_h / bbox_h) * 0.85` (15% margin), clamped to a `0.01` minimum (not `ZOOM_MIN`) so cards at extreme world coordinates (e.g., `(100_000, 0)`) actually fit. The `0.01` floor is for `zoom_to_fit` only; interactive zoom is clamped to `[ZOOM_MIN, ZOOM_MAX]`.
+Ctrl+Shift+Enter is intercepted pre-TextEdit via `ui.input_mut(|i| i.consume_key(COMMAND | SHIFT, Enter))`. The cursor byte offset is computed from `ed.prev_cursor` (the prior frame's cursor state, stored so the interception beats the TextEdit consuming it). The editor closes immediately; `pending_split = Some(orig_id)` and `pending_label = Some("Split card 'Title'")` are set; `Batch([SaveBody { id, content: buffer }, Split { id, at_byte }])` is dispatched.
 
-Card screen rect requires multiplying world-space card size by `cam.zoom` — `to_screen` only transforms position, not dimensions.
+On `VaultEvent::OpDone` with `source == User` and `result.created` non-empty while `pending_split` is set, both cards are placed: original at its existing desk position (or viewport center if not on desk), split-off at `orig_pos + (324.0, 0)` via `session.apply(Place)` (not journaled). The journal entry is `InverseAction::Vault(inv_op)` with label "Split card 'Title'"; one undo dispatches the inverse `Batch([SaveBody_orig, Delete(split_off)])`.
 
-### Index API Choices
+Desk cleanup: every `OpDone` (regardless of source) does `desk.cards.retain(|c| idx.get(c.id).is_some())` — this evicts the split-off card from the desk when the undo Delete moves it to trash.
 
-`FaceMeta` uses `index.outlinks(id).len()` (not `index.meta(id).links`) because the `Index` API exposes `outlinks()` for link counts, not `Index::meta().links`. The `FaceMeta` is prefetched under ONE index read lock per frame in `app.rs` before the render pass begins, keeping the lock out of the draw loop.
+### Drag-to-rail Gesture
 
-### egui Scroll Architecture
+`rail_ui` clears `deps.row_hits` at frame start and pushes `(resp.rect, target)` for each rendered row. `desk_ui` drag-release (when `total_delta >= 4.0`) first iterates `rail_row_hits`, checking if the pointer is inside any row rect; if so, emits `DeskEvent::CardDroppedOnRail(RailEvent)` instead of plain Move. `app.rs` dispatches the rail event via `apply_rail_event`.
 
-egui routes Ctrl+scroll through `InputOptions::zoom_modifier = COMMAND` to `zoom_delta()`, making `smooth_scroll_delta` zero when COMMAND is held. The implementation uses:
-- `ui.input(|i| i.zoom_delta())` for zoom (Ctrl+scroll)
-- `ui.input(|i| i.smooth_scroll_delta)` for pan (plain/Shift scroll)
+---
 
-This matches egui 0.35 behavior; using `smooth_scroll_delta` with a `cmd_down` check would never trigger zoom.
+## Key Bug Fixed: Race Between Index Update and OpDone Drain
 
-### API Adaptations from Brief
+The split-undo test pump predicate originally checked `idx.iter_meta().count() == 1`. The vault worker updates the shared index synchronously (write lock) but sends `OpDone` only after the full Batch completes. When the pump checked the index count first, it could see count=1 (index already updated) while the worker was still mid-execution and hadn't sent `OpDone` yet. The pump exited immediately; the test asserted before `drain_events` ever processed the undo's `OpDone` (and ran the desk cleanup).
 
-1. `DeskEvent` gained a 4th variant `ViewportMoved { desk: DeskId, cam: DeskCamera }` — the brief's 3-variant enum had no way to propagate viewport changes back to `app.rs`. Viewport moves are NOT journaled (per brief), but `session_dirty_at` is updated so the session saves.
-
-2. `DeskUiDeps<'a>` bundles: `focus: &mut Option<NoteId>`, `drag: &mut Option<DragState>`, `bodies: &mut BodyCache`, `commands: &VaultCommandSender`, `face_meta: &[FaceMeta]`, `line_cache: &mut LineCache`.
-
-3. `DragState` gained a `total_delta` field to implement the sub-4px click threshold. Drag moves below 4px total are treated as clicks (no `Move` journal entry).
-
-4. `reveal()` centers the camera on the focused card when it falls outside the panel's expanded rect, emitting a `ViewportMoved` event that `app.rs` applies.
-
-### ScanComplete Event Loss (Key Fix)
-
-The `app_with_cards` test helper drains the event channel synchronously before building the Harness. The `VaultEvent::ScanComplete` event appeared in that drain loop and was discarded by `_ => continue`. As a result, `drain_events()` (called from `JdUi::ui()`) never saw it, `state.scan_done` was never set, and `pump()` timed out at 200 frames.
-
-Fix: explicitly match `VaultEvent::ScanComplete` in the pre-harness loop and replicate `drain_events`'s handling inline (set `scan_done`, `bodies.invalidate_all()`, create default desk if needed).
-
-### MouseWheel Phase Field
-
-`egui::Event::MouseWheel` in egui 0.35 requires a `phase: egui::TouchPhase` field. Tests set `phase: egui::TouchPhase::Move` for all scroll events.
+Fix: pump waits for `a.state.pending_undo_redo.is_none() && idx.iter_meta().count() == 1`. `pending_undo_redo` is cleared only inside `drain_events`' `OpDone` arm, guaranteeing the cleanup has run.
 
 ---
 
 ## Test Results
 
 ```
-running 5 tests
-test drag_moves_a_card_and_survives_in_session_state ... ok
-test pan_and_zoom_change_the_camera_and_clamp ... ok
-test offscreen_cards_are_culled_from_the_accesskit_tree ... ok
-test enter_opens_focused_card ... ok
-test backspace_puts_away_not_deletes ... ok
+running 48 tests
+...
+test drag_to_rail_desk_row_journals_move_card_to_desk ... ok
+test drag_to_rail_inbox_journals_put_card_away ... ok
+test edit_menu_split_card_disabled_when_editor_closed ... ok
+test edit_menu_undo_item_shows_live_label ... ok
+test split_card_ctrl_shift_enter_places_two_cards_and_undo_restores ... ok
+...
 
-test result: ok. 5 passed; 0 failed; 0 ignored
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.28s
 ```
 
-Full suite: 31/31 pass. `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo fmt --check --all` clean.
+jd-core: 4/4 pass. `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo fmt --check` clean.
 
 ---
 
 ## Concerns
 
-1. **`zoom_to_fit` minimum of 0.01** — this is below the interactive `ZOOM_MIN = 0.5`. Cards placed at extreme world coordinates (e.g., `(100_000, 0)`) produce a zoom of ~0.012. Rendering at sub-0.5 zoom is intentional for "fit all" but may look unexpected if a user accidentally places a card far away. Task 9 should enforce placement bounds or warn.
+1. **Split-off body heading**: The brief mentions "new card body = line 2 (+ heading if it started with `# `)". The `Split` op in `jd-core` handles this in the worker. The kittest verifies two cards are placed but does not assert on the exact body content of the split-off (body fetching would require a second pump cycle). This is a gap in test coverage that a dedicated kittest for `VaultOp::Split` in jd-core would close.
 
-2. **Status bar height assumption** — `card_center_on_screen` in tests assumes the status bar is 24px. If the bar height changes, the test helper will produce off-by-N screen coordinates. This is a test-only concern; production code uses the actual `response.rect`.
+2. **Split placement rides the op's journal entry**: The split-off's desk placement is intentionally NOT journaled separately. One undo removes the split AND the placement. If the user manually moves the split-off card before undoing, the Move IS journaled (separate entry); undoing the Split then leaves the original card with the restored body but no side-by-side split-off.
 
-3. **`DeskEvent::ViewportMoved` not in brief** — adding this variant was required for correctness but deviates from the specified 3-variant enum. If Task 9 or 10 builds on `DeskEvent` matching, the extra variant must be handled.
-
-4. **`BodyCache::invalidate_all` on every ScanComplete** — correct per design, but means all body text re-requests fire after every scan. At scale this is a 1-frame flash of blank card faces. Acceptable for now.
-
----
-
-## Fix Report (post-review fixes, branch feat/desk-cards-editor)
-
-### Fix 1 (Critical): Background pan fires during card drag
-
-**Change:** Added `state.drag.is_none()` to the background-pan guard in `desk_ui` (desk.rs ~line 422).
-
-Before:
-```rust
-if pointer_over_card.is_none()
-    && ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
-    && pointer_delta != egui::Vec2::ZERO
-```
-
-After:
-```rust
-if state.drag.is_none()
-    && pointer_over_card.is_none()
-    && ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
-    && pointer_delta != egui::Vec2::ZERO
-```
-
-The bug: `pointer_over_card` is computed from original world positions. Once the pointer exits the dragged card's original screen rect mid-drag, `pointer_over_card` becomes `None`, enabling pan. The pan shifts `cam.center` each frame, corrupting the `Move` op's `to` world coordinate computed at drop time.
-
-### Fix 2 (Regression test): `drag_to_empty_space_does_not_pan`
-
-New test in `desk_kittest.rs`. Drags card from its center to `+250 y` (empty space below it), then asserts:
-- (a) `placed.pos.y ≈ 250` (card moved correctly)
-- (b) `viewport.center` unchanged from before drag
-
-**RED evidence (fix 1 reverted):**
-
-```
-test drag_to_empty_space_does_not_pan ... FAILED
----- drag_to_empty_space_does_not_pan stdout ----
-thread panicked at crates/jd-app/tests/desk_kittest.rs:181:5:
-card should move ≈250 world units down, got y=0.0
-```
-
-Without the guard, the background pan fires on every frame where the pointer has left the card's original screen rect. This shifts `cam.center` by the entire drag delta, so `cam.to_world(panel, drop_screen)` computes `new_world ≈ original_world` — the Move op writes the card back to its origin.
-
-**GREEN with fix 1 applied:** `test drag_to_empty_space_does_not_pan ... ok`
-
-### Fix 3 (Important): Wire `reveal()`
-
-**Change:** `app.rs` `apply_desk_events` `FocusChanged` arm now calls `crate::surfaces::desk::reveal(desk, focused_id, panel)` after updating `self.state.focus`. Uses approximate panel rect `1200×776` (kittest window minus ~24px status bar). If `reveal` returns `Some(new_cam)`, the desk viewport is updated and `session_dirty_at` marked. Not journaled.
-
-New test `arrowkey_to_offscreen_card_reveals_it`: places a card at `(50_000, 0)`, asserts it is culled, then presses ArrowRight twice (first selects Card 1, second selects far card), asserts `focus == far_id` and the far card's AccessKit node now exists (reveal centered on it).
-
-### Fix 4 (Important): Zoom speed spec formula `1.0015^scroll_delta`
-
-**Change:** Replaced `ui.input(|i| i.zoom_delta())` with manual extraction of Ctrl+scroll raw delta from `i.events` (filtering `Event::MouseWheel` with `modifiers.command`), then computing `zoom_factor = 1.0015_f32.powf(ctrl_scroll_delta)`.
-
-egui's formula is `exp(scroll_zoom_speed * delta)` with `scroll_zoom_speed = 1/200`, i.e. `e^(delta/200)`. The spec formula `1.0015^delta` produces a meaningfully slower, more precise zoom that is deterministic regardless of egui version or platform.
-
-The existing `pan_and_zoom_change_the_camera_and_clamp` test continues to pass: 200 events × 120 points = 24 000 points; `1.0015^24000 ≈ 10^15`, which clamps to `ZOOM_MAX = 2.0` immediately.
-
-### Fix 5 (Minor): Per-shape hit-test size
-
-**Change:** The `pointer_over_card` hit-test now uses `card_size(shape_for(m.status, m.kind))` per card (via `state.face_metas`), falling back to `300×200` if the meta is not yet loaded. Previously all cards used the hardcoded Divider size `300×208`.
-
----
-
-### Final Test Summary
-
-```
-running 7 tests  (desk_kittest.rs — up from 5)
-test drag_moves_a_card_and_survives_in_session_state ... ok
-test drag_to_empty_space_does_not_pan ... ok           ← new
-test pan_and_zoom_change_the_camera_and_clamp ... ok
-test offscreen_cards_are_culled_from_the_accesskit_tree ... ok
-test arrowkey_to_offscreen_card_reveals_it ... ok      ← new
-test enter_opens_focused_card ... ok
-test backspace_puts_away_not_deletes ... ok
-
-test result: ok. 7 passed; 0 failed; 0 ignored
-```
-
-Full suite: 32/32 pass. `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo fmt --check` clean.
-
-## Re-review fixes (d33cdf0)
-
-1. **reveal() panel rect (Important)**: removed the hardcoded 1200×776 rect in
-   `apply_desk_events`' FocusChanged arm. `JdUi` now caches
-   `last_panel_rect: Option<egui::Rect>` from `ui.max_rect()` inside the
-   CentralPanel closure each frame before `desk_ui` runs; the FocusChanged arm
-   uses it, falling back to `egui::Rect::NOTHING` when `None` so reveal always
-   fires on the first frame (errs on the side of revealing).
-2. **Line-unit scroll→zoom**: MouseWheel Line multiplier 50.0 → 40.0 pt/line
-   (egui's native line_scroll_speed default) in desk.rs.
-3. **reveal() per-shape card size**: `reveal` now takes `face_metas` and uses
-   `card::shape::card_size(shape_for(status, kind))` per card (300×200
-   IndexCard fallback when meta is absent), scaling by `cam.zoom` for the
-   screen-space visibility rect — consistent with the hit-test path. Centering
-   uses the per-shape half-size.
-
-Tests: 33/33 pass (`cargo test -p jd-app`), including
-`desk_kittest::arrowkey_to_offscreen_card_reveals_it`. Clippy `-D warnings`
-clean; `cargo fmt --check` clean. No jd-core changes.
+3. **Rail row rects are one frame stale**: `rail_ui` populates `row_hits` during the same frame as `desk_ui`. Since both run in the same `ui()` call, the ordering determines whether the hits are from this frame or last. Currently rail renders before the desk panel, so the rects are current-frame — correct.
