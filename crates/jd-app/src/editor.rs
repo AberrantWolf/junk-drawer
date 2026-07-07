@@ -150,7 +150,11 @@ pub struct EditorState {
     needs_focus: bool,
     /// Currently selected autocomplete index.
     pub ac_selected: usize,
-    /// Cursor state from the previous frame (for URL-paste-over-selection).
+    /// Esc dismissed the popup for the current autocomplete context.
+    ac_dismissed: bool,
+    /// Cursor state from the previous frame (for pre-TextEdit key interception
+    /// and URL-paste-over-selection; the buffer cannot change between frames,
+    /// so last frame's cursor is current when this frame's input arrives).
     prev_cursor: Option<egui::text::CCursorRange>,
 }
 
@@ -168,6 +172,7 @@ impl EditorState {
             undo,
             needs_focus: true,
             ac_selected: 0,
+            ac_dismissed: false,
             prev_cursor: None,
         }
     }
@@ -322,6 +327,111 @@ pub fn is_probably_url(s: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Autocomplete plumbing (Task 11)
+// ---------------------------------------------------------------------------
+
+/// One row of the autocomplete popup.
+#[derive(Clone, Debug)]
+enum AcItem {
+    /// An existing note title / tag; accepting inserts it.
+    Existing(String),
+    /// "Link as new card: '<query>'" — accepting inserts the query verbatim
+    /// (an unresolved link the user can flesh out later).
+    NewCard(String),
+}
+
+/// Up to 8 fuzzy candidates for the current context, plus the new-card row
+/// for links when the query is not an exact (case-insensitive) title.
+fn ac_candidates(index: &jd_core::index::Index, ctx: &AcContext) -> Vec<AcItem> {
+    use jd_core::index::fuzzy::{FuzzyTier, fuzzy_match};
+    fn ranked(mut hits: Vec<(FuzzyTier, i32, String)>) -> impl Iterator<Item = String> {
+        hits.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        hits.into_iter().take(8).map(|(_, _, t)| t)
+    }
+    match ctx {
+        AcContext::Link { query, .. } if !query.is_empty() => {
+            let hits = index
+                .iter_meta()
+                .filter_map(|m| m.title.as_deref())
+                .filter_map(|t| fuzzy_match(query, t).map(|s| (s.tier, s.score, t.to_owned())))
+                .collect();
+            let mut items: Vec<AcItem> = ranked(hits).map(AcItem::Existing).collect();
+            if index.resolve_title(query).is_none() {
+                items.push(AcItem::NewCard(query.clone()));
+            }
+            items
+        }
+        AcContext::Tag { query, .. } if !query.is_empty() => {
+            let hits = index
+                .all_tags()
+                .into_iter()
+                .filter_map(|(t, _)| {
+                    fuzzy_match(query, t.as_str()).map(|s| (s.tier, s.score, t.as_str().to_owned()))
+                })
+                .collect();
+            ranked(hits).map(AcItem::Existing).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Place the TextEdit caret at `char_pos` (collapsed selection) for the next frame.
+fn set_cursor_char(ctx: &egui::Context, te_id: egui::Id, char_pos: usize) {
+    let mut state = egui::text_edit::TextEditState::load(ctx, te_id).unwrap_or_default();
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(char_pos),
+        )));
+    state.store(ctx, te_id);
+}
+
+/// Accept an autocomplete item: replace the open `[[query` / `#query` with the
+/// completed text and park the caret after it. If the buffer already has `]]`
+/// immediately ahead of the cursor, don't double it.
+fn ac_accept(
+    ed: &mut EditorState,
+    ctx: &egui::Context,
+    te_id: egui::Id,
+    ac_ctx: &AcContext,
+    item: &AcItem,
+    cursor_byte: usize,
+) {
+    let text = match item {
+        AcItem::Existing(t) | AcItem::NewCard(t) => t.as_str(),
+    };
+    match *ac_ctx {
+        AcContext::Link { start, .. } => {
+            let closing_ahead = ed.buffer[cursor_byte..].starts_with("]]");
+            let replacement = if closing_ahead {
+                format!("[[{text}")
+            } else {
+                format!("[[{text}]]")
+            };
+            let start_char = ed.buffer[..start].chars().count();
+            ed.buffer.replace_range(start..cursor_byte, &replacement);
+            let after =
+                start_char + replacement.chars().count() + if closing_ahead { 2 } else { 0 };
+            set_cursor_char(ctx, te_id, after);
+        }
+        AcContext::Tag { start, .. } => {
+            let replacement = format!("#{text} ");
+            let start_char = ed.buffer[..start].chars().count();
+            ed.buffer.replace_range(start..cursor_byte, &replacement);
+            set_cursor_char(ctx, te_id, start_char + replacement.chars().count());
+        }
+        AcContext::None => return,
+    }
+    ed.dirty = true;
+    ed.last_edit = Some(Instant::now());
+    ed.ac_selected = 0;
+}
+
+// ---------------------------------------------------------------------------
 // EditorDeps and editor_ui (Task 10)
 // ---------------------------------------------------------------------------
 
@@ -390,33 +500,138 @@ pub fn editor_ui(
         ui.set_min_size(egui::vec2(540.0, 440.0));
         ui.set_max_size(egui::vec2(540.0, 440.0));
 
-        // --- URL paste intercept (before TextEdit) ---
-        // If the paste is a URL and we had a selection, transform to [text](url).
+        // --- Pre-TextEdit interception (Task 11) ---
+        // Everything that must win over TextEdit's own key handling happens
+        // HERE, before `te.show` — consumed events never reach the widget.
+        // Positions come from last frame's cursor; the buffer cannot have
+        // changed since, so it is current when this frame's input arrives.
+        let te_id = egui::Id::new("editor_te");
+        let has_focus = ui.ctx().memory(|m| m.has_focus(te_id));
+        let cursor_char = ed.prev_cursor.map(|cr| cr.primary.index.0);
+        let cursor_byte = cursor_char.map(|c| char_idx_to_byte(&ed.buffer, c));
+
+        // URL paste over a selection → [selection](url). No other paste transform.
         if let Some(prev_cr) = ed.prev_cursor {
-            let had_selection = prev_cr.primary != prev_cr.secondary;
-            if had_selection {
+            let lo = prev_cr.primary.index.0.min(prev_cr.secondary.index.0);
+            let hi = prev_cr.primary.index.0.max(prev_cr.secondary.index.0);
+            if lo != hi {
                 let mut paste_url: Option<String> = Option::None;
                 ui.input_mut(|i| {
-                    for ev in i.events.iter_mut() {
+                    i.events.retain(|ev| {
                         if let egui::Event::Paste(text) = ev
                             && is_probably_url(text)
                         {
                             paste_url = Some(text.clone());
-                            // Blank out the raw paste so TextEdit doesn't insert it.
-                            *ev = egui::Event::Paste(String::new());
+                            false // consume: TextEdit must not also insert it
+                        } else {
+                            true
                         }
-                    }
+                    });
                 });
                 if let Some(url) = paste_url {
-                    let lo = prev_cr.primary.index.0.min(prev_cr.secondary.index.0);
-                    let hi = prev_cr.primary.index.0.max(prev_cr.secondary.index.0);
                     let byte_lo = char_idx_to_byte(&ed.buffer, lo);
                     let byte_hi = char_idx_to_byte(&ed.buffer, hi);
                     let selected_text = ed.buffer[byte_lo..byte_hi].to_owned();
-                    let md_link = format!("[{}]({})", selected_text, url);
+                    let md_link = format!("[{selected_text}]({url})");
                     ed.buffer.replace_range(byte_lo..byte_hi, &md_link);
+                    set_cursor_char(ui.ctx(), te_id, lo + md_link.chars().count());
                     ed.dirty = true;
                     ed.last_edit = Some(Instant::now());
+                }
+            }
+        }
+
+        // Autocomplete context + candidates (from the pre-edit cursor).
+        let ac_ctx = cursor_byte.map_or(AcContext::None, |cb| ac_context(&ed.buffer, cb));
+        if matches!(ac_ctx, AcContext::None) {
+            ed.ac_dismissed = false;
+            ed.ac_selected = 0;
+        }
+        let ac_items = if ed.ac_dismissed {
+            Vec::new()
+        } else {
+            ac_candidates(&index_guard, &ac_ctx)
+        };
+        let popup_active = has_focus && !ac_items.is_empty();
+        if popup_active {
+            ed.ac_selected = ed.ac_selected.min(ac_items.len() - 1);
+        }
+
+        if popup_active {
+            // The popup owns Up/Down/Enter/Tab/Esc while it is showing.
+            let n = ac_items.len();
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+                ed.ac_selected = (ed.ac_selected + 1) % n;
+            }
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+                ed.ac_selected = (ed.ac_selected + n - 1) % n;
+            }
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                // Esc dismisses the popup ONLY; consuming it here keeps it from
+                // reaching Modal::should_close, so the editor stays open.
+                ed.ac_dismissed = true;
+            }
+            let accept = ui.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+            });
+            if accept && let Some(cb) = cursor_byte {
+                let item = ac_items[ed.ac_selected].clone();
+                ac_accept(ed, ui.ctx(), te_id, &ac_ctx, &item, cb);
+            }
+        } else if has_focus && let (Some(c), Some(cb)) = (cursor_char, cursor_byte) {
+            // Enter: list/quote continuation. Plain Enter passes through
+            // (only Continue/EndList consume the key).
+            let line_start = ed.buffer[..cb].rfind('\n').map_or(0, |p| p + 1);
+            let line_before = ed.buffer[line_start..cb].to_owned();
+            let mut edited = false;
+            match enter_action(&line_before) {
+                EnterAction::Plain => {}
+                EnterAction::Continue(prefix) => {
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                        let ins = format!("\n{prefix}");
+                        ed.buffer.insert_str(cb, &ins);
+                        set_cursor_char(ui.ctx(), te_id, c + ins.chars().count());
+                        ed.dirty = true;
+                        ed.last_edit = Some(Instant::now());
+                        edited = true;
+                    }
+                }
+                EnterAction::EndList { strip_from } => {
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                        let strip_start = line_start + strip_from;
+                        let stripped = ed.buffer[strip_start..cb].chars().count();
+                        ed.buffer.replace_range(strip_start..cb, "");
+                        set_cursor_char(ui.ctx(), te_id, c - stripped);
+                        ed.dirty = true;
+                        ed.last_edit = Some(Instant::now());
+                        edited = true;
+                    }
+                }
+            }
+
+            // Tab / Shift+Tab: indent/outdent list lines only; non-list Tab
+            // passes through (TextEdit inserts \t — acceptable v1). Skipped
+            // when Enter already edited the buffer (cursor bytes are stale).
+            if !edited {
+                let line_end = ed.buffer[cb..]
+                    .find('\n')
+                    .map_or(ed.buffer.len(), |p| cb + p);
+                let line = ed.buffer[line_start..line_end].to_owned();
+                if indent_line(&line, false).is_some() {
+                    let outdent =
+                        ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+                    let indent = !outdent
+                        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+                    if (indent || outdent)
+                        && let Some(new_line) = indent_line(&line, outdent)
+                    {
+                        ed.buffer.replace_range(line_start..line_end, &new_line);
+                        let new_c = if outdent { c.saturating_sub(2) } else { c + 2 };
+                        set_cursor_char(ui.ctx(), te_id, new_c);
+                        ed.dirty = true;
+                        ed.last_edit = Some(Instant::now());
+                    }
                 }
             }
         }
@@ -429,6 +644,7 @@ pub fn editor_ui(
         };
 
         let te = egui::TextEdit::multiline(&mut ed.buffer)
+            .id(te_id)
             .desired_width(540.0 - 32.0) // full width minus padding
             .desired_rows(24)
             .layouter(&mut layouter);
@@ -462,124 +678,33 @@ pub fn editor_ui(
             }
         }
 
-        // --- Enter key: list continuation ---
-        let plain_enter = resp.has_focus()
-            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        if plain_enter && let Some(cr) = te_out.cursor_range {
-            let cursor_byte = char_idx_to_byte(&ed.buffer, cr.primary.index.0);
-            // Find line start
-            let line_start = ed.buffer[..cursor_byte].rfind('\n').map_or(0, |p| p + 1);
-            let line_before = &ed.buffer[line_start..cursor_byte].to_owned();
-            match enter_action(line_before) {
-                EnterAction::Plain => {
-                    ed.buffer.insert(cursor_byte, '\n');
-                }
-                EnterAction::Continue(prefix) => {
-                    let ins = format!("\n{}", prefix);
-                    ed.buffer.insert_str(cursor_byte, &ins);
-                }
-                EnterAction::EndList { strip_from } => {
-                    let strip_start = line_start + strip_from;
-                    ed.buffer.replace_range(strip_start..cursor_byte, "\n");
-                }
-            }
-            ed.dirty = true;
-            ed.last_edit = Some(Instant::now());
-        }
-
-        // --- Tab / Shift+Tab: indent/outdent list lines ---
-        let tab_pressed = resp.has_focus()
-            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
-        let shift_tab_pressed = resp.has_focus()
-            && ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
-        if (tab_pressed || shift_tab_pressed)
-            && let Some(cr) = te_out.cursor_range
-        {
-            let outdent = shift_tab_pressed;
-            let cursor_byte = char_idx_to_byte(&ed.buffer, cr.primary.index.0);
-            let line_start = ed.buffer[..cursor_byte].rfind('\n').map_or(0, |p| p + 1);
-            let line_end = ed.buffer[cursor_byte..]
-                .find('\n')
-                .map_or(ed.buffer.len(), |p| cursor_byte + p);
-            let line = ed.buffer[line_start..line_end].to_owned();
-            if let Some(new_line) = indent_line(&line, outdent) {
-                ed.buffer.replace_range(line_start..line_end, &new_line);
-                ed.dirty = true;
-                ed.last_edit = Some(Instant::now());
-            }
-        }
-
-        // --- Autocomplete popup ---
-        if let Some(cr) = te_out.cursor_range {
-            let cursor_byte = char_idx_to_byte(&ed.buffer, cr.primary.index.0);
-            let ctx = ac_context(&ed.buffer, cursor_byte);
-            match ctx {
-                AcContext::Link { start, ref query } => {
-                    // Collect matching note titles via BM25 query.
-                    let matches: Vec<String> = {
-                        use jd_core::index::search::parse_query;
-                        let q = parse_query(query);
-                        let results = index_guard.query(&q, 10);
-                        results
-                            .into_iter()
-                            .filter_map(|hit| index_guard.get(hit.id).and_then(|m| m.title.clone()))
-                            .collect()
-                    };
-                    if !matches.is_empty() {
-                        egui::Popup::from_response(&resp)
-                            .id(egui::Id::new("ac_popup_link"))
-                            .open(true)
-                            .show(|ui| {
-                                for (i, title) in matches.iter().enumerate() {
-                                    let selected = i == ed.ac_selected;
-                                    if ui.selectable_label(selected, title).clicked() {
-                                        let byte_end =
-                                            char_idx_to_byte(&ed.buffer, cr.primary.index.0);
-                                        let insert_text = format!("{}]]", title);
-                                        ed.buffer.replace_range(start + 2..byte_end, &insert_text);
-                                        ed.dirty = true;
-                                        ed.last_edit = Some(Instant::now());
-                                        ed.ac_selected = 0;
-                                    }
-                                }
-                            });
+        // --- Autocomplete popup rendering (anchored at the caret) ---
+        if popup_active {
+            let anchor_pos = te_out
+                .cursor_range
+                .map(|cr| {
+                    let r = te_out.galley.pos_from_cursor(cr.primary);
+                    te_out.galley_pos + r.left_bottom().to_vec2()
+                })
+                .unwrap_or_else(|| resp.rect.left_bottom());
+            let mut clicked: Option<usize> = Option::None;
+            egui::Popup::from_response(&resp)
+                .id(egui::Id::new("ac_popup"))
+                .open(true)
+                .at_position(anchor_pos)
+                .show(|ui| {
+                    for (i, item) in ac_items.iter().enumerate() {
+                        let label = match item {
+                            AcItem::Existing(t) => t.clone(),
+                            AcItem::NewCard(q) => format!("Link as new card: '{q}'"),
+                        };
+                        if ui.selectable_label(i == ed.ac_selected, label).clicked() {
+                            clicked = Some(i);
+                        }
                     }
-                }
-                AcContext::Tag { start, ref query } => {
-                    // Collect matching tags.
-                    let matches: Vec<String> = {
-                        let all_tags = index_guard.all_tags();
-                        let q = query.to_lowercase();
-                        all_tags
-                            .into_iter()
-                            .filter(|(t, _)| t.as_str().to_lowercase().contains(&q))
-                            .take(10)
-                            .map(|(t, _)| t.as_str().to_owned())
-                            .collect()
-                    };
-                    if !matches.is_empty() {
-                        egui::Popup::from_response(&resp)
-                            .id(egui::Id::new("ac_popup_tag"))
-                            .open(true)
-                            .show(|ui| {
-                                for (i, tag) in matches.iter().enumerate() {
-                                    let selected = i == ed.ac_selected;
-                                    if ui.selectable_label(selected, tag).clicked() {
-                                        let byte_end =
-                                            char_idx_to_byte(&ed.buffer, cr.primary.index.0);
-                                        let insert_text = format!("{} ", tag);
-                                        ed.buffer.replace_range(start + 1..byte_end, &insert_text);
-                                        ed.dirty = true;
-                                        ed.last_edit = Some(Instant::now());
-                                        ed.ac_selected = 0;
-                                    }
-                                }
-                            });
-                    }
-                }
-                AcContext::None => {
-                    ed.ac_selected = 0;
-                }
+                });
+            if let (Some(i), Some(cb)) = (clicked, cursor_byte) {
+                ac_accept(ed, ui.ctx(), te_id, &ac_ctx, &ac_items[i].clone(), cb);
             }
         }
     });

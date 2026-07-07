@@ -405,17 +405,20 @@ fn enter_continues_lists_and_empty_item_ends() {
     node.type_text("- a");
     h.step();
     h.run_ok();
-    h.key_press(egui::Key::Enter);
-    h.step();
-    h.run_ok();
+    // Enter on "- a" → next line auto-continues with "- ".
     h.key_press(egui::Key::Enter);
     h.step();
     h.run_ok();
     let buf = h.state().state.editor.as_ref().unwrap().buffer.clone();
-    assert!(
-        buf.contains("- a"),
-        "should have first list item, got: {:?}",
-        buf
+    assert_eq!(buf, "- a\n- ", "Enter must continue the list with '- '");
+    // Enter again on the empty item → prefix removed, list ended.
+    h.key_press(egui::Key::Enter);
+    h.step();
+    h.run_ok();
+    let buf = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert_eq!(
+        buf, "- a\n",
+        "Enter on the empty item must strip the prefix and end the list"
     );
     assert!(
         !buf.contains("- \n- "),
@@ -425,15 +428,67 @@ fn enter_continues_lists_and_empty_item_ends() {
 }
 
 #[test]
-fn link_autocomplete_shows_popup_and_inserts() {
+fn link_autocomplete_inserts_a_resolved_link() {
     let (_vault, mut h, id) = app_with_one_card("");
+
+    // Create a second note titled "Target Note" so the index can offer it.
+    let seed = jd_core::note::NewNote {
+        body: "# Target Note\ncontent".to_owned(),
+        status: jd_core::note::Status::Permanent,
+        kind: jd_core::note::Kind::Note,
+        source: None,
+        tags: Vec::new(),
+    };
+    h.state()
+        .vault
+        .commands
+        .send(VaultCommand::Op {
+            op: VaultOp::Create {
+                seed,
+                dest: Dest::Notes,
+            },
+            source: OpSource::User,
+        })
+        .unwrap();
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            a.vault
+                .index
+                .read()
+                .unwrap()
+                .resolve_title("Target Note")
+                .is_some()
+        },
+        200,
+        "Target Note indexed",
+    );
+
     open_editor(&mut h, id);
     let node = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
-    node.type_text("[[");
+    node.type_text("[[Tar");
+    h.step();
+    h.step();
+    h.run_ok();
+
+    // The popup must show the candidate.
+    h.get_by_label("Target Note");
+
+    // Enter accepts the highlighted candidate.
+    h.key_press(egui::Key::Enter);
     h.step();
     h.run_ok();
     let buf = h.state().state.editor.as_ref().unwrap().buffer.clone();
-    assert!(buf.contains("[["), "buffer should have [[, got: {:?}", buf);
+    assert!(
+        buf.contains("[[Target Note]]"),
+        "accepting the popup must insert the resolved link, got: {:?}",
+        buf
+    );
+    assert!(
+        !buf.contains("]]]]"),
+        "closing brackets must not be doubled, got: {:?}",
+        buf
+    );
 }
 
 #[test]
