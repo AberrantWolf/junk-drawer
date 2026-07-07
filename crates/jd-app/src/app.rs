@@ -248,6 +248,9 @@ impl JdUi {
                 }
                 VaultEvent::OpFailed { label, message } => {
                     self.state.last_error = Some(format!("{label}: {message}"));
+                    // Clear any pending_label so it cannot leak onto the next
+                    // successful op's journal entry (WP3 Task 4 review finding).
+                    self.state.pending_label = None;
                 }
                 VaultEvent::Error { context, message } => {
                     self.state.last_error = Some(format!("{context}: {message}"));
@@ -847,6 +850,14 @@ impl JdUi {
     /// Open the card editor for `id`, with optional immediate pending_promotion.
     /// Used by InboxEvent::Promote (Ctrl+Enter on inbox card = promote-without-typing).
     fn open_card_editor_with_promotion(&mut self, id: NoteId, pending_promotion: bool) {
+        // Same-id guard: if the editor is already open for this exact id (e.g. a
+        // deferred-open Body event races with a second Promote dispatch for the
+        // same card), do not overwrite the live editor or pending_open_promotion.
+        // This prevents the promotion stash from being silently dropped by a no-op
+        // re-open that would replace pending_open_promotion with its own value.
+        if self.state.editor.as_ref().is_some_and(|e| e.id == id) {
+            return;
+        }
         self.state.session.open_card = Some(id);
         self.state.session_dirty_at = Some(std::time::Instant::now());
         // Stash pending_promotion for the deferred-open path (drain_events Body

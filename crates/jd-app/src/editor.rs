@@ -568,9 +568,11 @@ pub fn editor_ui(
             set_cursor_char(ui.ctx(), te_id, snap.cursor);
             ed.dirty = true;
             ed.last_edit = Some(Instant::now());
-            // If promotion was pending, the undo reverted the triggering newline.
-            // Unset pending_promotion so no compound op is dispatched on close.
-            if ed.pending_promotion {
+            // Clear pending_promotion ONLY when the undo snapshot no longer contains
+            // the triggering newline. Partial undo (e.g. body text typed after the
+            // promoting Enter) reverts the body group but the buffer still has "title\n",
+            // so promotion must survive — close still needs to dispatch the compound op.
+            if ed.pending_promotion && !ed.buffer.contains('\n') {
                 ed.pending_promotion = false;
             }
         }
@@ -668,10 +670,14 @@ pub fn editor_ui(
             // entering an empty list line cannot accidentally promote.
             let is_single_line = !ed.buffer.contains('\n');
             let cursor_at_end = cb == ed.buffer.len();
+            // Guard: buffer must be non-empty (trimmed) — an empty fleeting card
+            // pressing Enter would produce a "# \n" empty-title note otherwise.
+            let has_title = !ed.buffer.trim().is_empty();
             if ed.is_fleeting
                 && !ed.pending_promotion
                 && is_single_line
                 && cursor_at_end
+                && has_title
                 && enter_action(&ed.buffer) == EnterAction::Plain
             {
                 if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
@@ -850,7 +856,13 @@ pub fn editor_ui(
     }
 
     // Autosave: dirty && last_edit > 1s → save, clear dirty, stay open.
+    // IMPORTANT: skip autosave while promotion is pending — the ONE-compound-entry
+    // constraint (WP3 Task 4) requires that the SaveBody for a promotion is bundled
+    // with the Promote op in a single Batch dispatch on close. A mid-pending autosave
+    // would journal a second SaveBody entry, violating the single-entry invariant.
+    // Recovery journaling (JournalBuffer) is unaffected and may continue normally.
     if ed.dirty
+        && !ed.pending_promotion
         && let Some(last_edit) = ed.last_edit
         && last_edit.elapsed().as_secs_f32() > 1.0
     {

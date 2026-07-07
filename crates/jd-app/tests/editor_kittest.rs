@@ -965,6 +965,171 @@ fn ctrl_z_while_pending_reverts_without_vault_op() {
     }
 }
 
+/// Finding 1: partial undo (body text after promoting Enter) must NOT clear pending_promotion.
+/// Enter-promote → type body → one Ctrl+Z → pending STILL true, buffer has newline.
+/// Second Ctrl+Z → pending false, single line.
+#[test]
+fn ctrl_z_partial_undo_preserves_pending_promotion() {
+    let (_, mut h, _id) = app_with_fleeting_on_desk("my scrap title");
+
+    open_editor(&mut h, _id);
+
+    // Enter at end → pending_promotion set, buffer = "my scrap title\n".
+    h.key_press(egui::Key::Enter);
+    h.step();
+    h.run_ok();
+    assert!(
+        h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "pending_promotion must be set after Enter"
+    );
+
+    // Type some body text to create a new undo group after the newline.
+    let node = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+    node.type_text("body content");
+    h.step();
+    h.run_ok();
+
+    let buf = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(
+        buf.contains('\n'),
+        "buffer must still have newline after body typing"
+    );
+
+    // First Ctrl+Z: reverts "body content" group. Buffer still has newline.
+    h.event(egui::Event::Key {
+        key: egui::Key::Z,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    });
+    h.step();
+    h.run_ok();
+
+    let buf_after_first_undo = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(
+        buf_after_first_undo.contains('\n'),
+        "buffer must still contain newline after first Ctrl+Z (body group only reverted), got: {:?}",
+        buf_after_first_undo
+    );
+    assert!(
+        h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "pending_promotion must STILL be true after first Ctrl+Z (newline still present)"
+    );
+
+    // Second Ctrl+Z: reverts the newline. Buffer back to single line.
+    h.event(egui::Event::Key {
+        key: egui::Key::Z,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    });
+    h.step();
+    h.run_ok();
+
+    let buf_after_second_undo = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(
+        !buf_after_second_undo.contains('\n'),
+        "buffer must be single-line after second Ctrl+Z, got: {:?}",
+        buf_after_second_undo
+    );
+    assert!(
+        !h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "pending_promotion must be false after second Ctrl+Z (newline gone)"
+    );
+}
+
+/// Finding 4: empty fleeting buffer + Enter must NOT trigger promotion.
+#[test]
+fn empty_buffer_enter_does_not_promote() {
+    let (_, mut h, _id) = app_with_fleeting_on_desk("");
+
+    open_editor(&mut h, _id);
+
+    // Verify is_fleeting is set and buffer is empty.
+    assert!(
+        h.state().state.editor.as_ref().unwrap().is_fleeting,
+        "editor must know the note is fleeting"
+    );
+    let buf = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(
+        buf.trim().is_empty(),
+        "buffer must be empty, got: {:?}",
+        buf
+    );
+
+    // Press Enter on the empty buffer — must NOT trigger promotion.
+    h.key_press(egui::Key::Enter);
+    h.step();
+    h.run_ok();
+
+    assert!(
+        !h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "Enter on empty buffer must NOT set pending_promotion"
+    );
+}
+
+/// Finding 2: autosave must NOT fire while pending_promotion is true.
+/// Directly set last_edit to a past time while pending and assert no SaveBody op arrives.
+#[test]
+fn autosave_suppressed_while_pending_promotion() {
+    let (_, mut h, _id) = app_with_fleeting_on_desk("autosave scrap");
+
+    open_editor(&mut h, _id);
+
+    // Enter → pending_promotion set.
+    h.key_press(egui::Key::Enter);
+    h.step();
+    h.run_ok();
+    assert!(
+        h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "pending_promotion must be set"
+    );
+
+    // Directly set dirty + last_edit to a past time (> 1s ago) to simulate
+    // autosave eligibility — same pattern as autosave_fires_after_a_quiet_second.
+    if let Some(ed) = h.state_mut().state.editor.as_mut() {
+        ed.dirty = true;
+        // Force last_edit to 2 seconds ago so the autosave threshold is cleared.
+        ed.last_edit = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+    }
+
+    // Record journal length before pumping — autosave must NOT add an entry.
+    let journal_len_before = h.state().state.journal.len();
+
+    // Pump several frames to give autosave a chance to fire (if it incorrectly would).
+    for _ in 0..20 {
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Editor must still be open.
+    assert!(h.state().state.editor.is_some(), "editor must remain open");
+
+    // dirty must remain set (autosave was suppressed, did not clear it).
+    assert!(
+        h.state().state.editor.as_ref().unwrap().dirty,
+        "dirty must remain true — autosave was suppressed by pending_promotion"
+    );
+
+    // pending_promotion must still be set (no spurious compound op sent).
+    assert!(
+        h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "pending_promotion must still be true"
+    );
+
+    // No extra journal entry (no autosave SaveBody was dispatched and completed).
+    // Give worker a moment in case anything was sent.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    h.run_ok();
+    let journal_len_after = h.state().state.journal.len();
+    assert_eq!(
+        journal_len_before, journal_len_after,
+        "autosave while pending must not push a journal entry (was {journal_len_before}, now {journal_len_after})"
+    );
+}
+
 /// Ctrl+Z in the editor must never push to the app journal.
 #[test]
 fn ctrl_z_in_editor_never_touches_the_app_journal() {
