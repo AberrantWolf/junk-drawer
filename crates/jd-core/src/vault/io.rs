@@ -11,7 +11,83 @@ use crate::id::NoteId;
 const MAX_FILENAME_BYTES: usize = 120;
 const FORBIDDEN: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
 
+/// Test-only global failpoint for `atomic_save` (WP3 Task 1 seam).
+///
+/// Encoding: one atomic packs two u16 fields, `(skip << 16) | fail`.
+///
+/// API:
+/// - `arm(skip, fail)` — let the next `skip` saves through, then fail the
+///   next `fail` saves; after that, everything passes again.
+/// - `disarm()` — reset to 0 (pass everything).
+///
+/// This is the narrowest seam consistent with the WP1d `atomic_save_with`
+/// checkpoint pattern.  It lives entirely inside this file and is compiled
+/// only under `cfg(test)` or the `test-failpoints` feature (enabled for this
+/// crate's own tests via the self dev-dependency in Cargo.toml — never in
+/// production builds).  Tests use it to force mid-batch or mid-loop rollback
+/// failures in the worker.
+///
+/// **Concurrency note**: the counter is process-global, so tests that arm it
+/// must not run concurrently with other saves; serialize such tests with a
+/// shared mutex in the test binary.
+#[cfg(any(test, feature = "test-failpoints"))]
+pub mod failpoint {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    /// skip (high 16) | fail (low 16) — both stored as i32 halves.
+    static SAVE_FAILPOINT: AtomicI32 = AtomicI32::new(0);
+
+    /// Arm: skip the next `skip` saves, then fail the next `fail` saves.
+    pub fn arm(skip: u16, fail: u16) {
+        SAVE_FAILPOINT.store(((skip as i32) << 16) | (fail as i32), Ordering::SeqCst);
+    }
+
+    /// Disarm: all subsequent saves pass through.
+    pub fn disarm() {
+        SAVE_FAILPOINT.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn check() -> std::io::Result<()> {
+        loop {
+            let v = SAVE_FAILPOINT.load(Ordering::SeqCst);
+            let skip = (v >> 16) as u16;
+            let fail = (v & 0xFFFF) as u16;
+
+            if skip == 0 && fail == 0 {
+                return Ok(());
+            }
+
+            let new_v = if skip > 0 {
+                // Still skipping: decrement skip, keep fail
+                (((skip - 1) as i32) << 16) | (fail as i32)
+            } else {
+                // Failing: skip=0, decrement fail
+                fail as i32 - 1
+            };
+
+            match SAVE_FAILPOINT.compare_exchange(v, new_v, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => {
+                    if skip > 0 {
+                        return Ok(()); // this was a skip
+                    } else {
+                        return Err(std::io::Error::other("atomic_save failpoint triggered"));
+                    }
+                }
+                Err(_) => continue, // raced; retry
+            }
+        }
+    }
+}
+
 pub fn atomic_save(abs_path: &Path, content: &str) -> Result<(), IoError> {
+    #[cfg(any(test, feature = "test-failpoints"))]
+    if let Err(e) = failpoint::check() {
+        return Err(IoError {
+            path: abs_path.to_owned(),
+            op: "save",
+            source: e,
+        });
+    }
     atomic_save_with(abs_path, content, &|_| Ok(()))
 }
 

@@ -1708,6 +1708,7 @@ dependencies = [
 name = "jd-core"
 version = "0.1.0"
 dependencies = [
+ "jd-core",
  "notify",
 ]
 

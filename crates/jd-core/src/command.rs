@@ -17,20 +17,87 @@ pub enum OpSource {
     UndoRedo,
 }
 
+/// The complete vocabulary of mutations the vault worker can execute.
+///
+/// # Path-stability decision (WP3, 2026-07-07)
+///
+/// Body-derived filenames make some undo paths rel_path-unstable.  Two known
+/// cases:
+///
+/// 1. **Untitled-note Batch undo** — a note whose filename derives from its
+///    body content gets a new SaveBody inverse; if the body changed the
+///    filename between the original op and its undo, the undo file may land
+///    under a different (collision-suffixed) path.
+///
+/// 2. **RenameTitle undo after old name re-claimed** — when a note is renamed
+///    A → B and then another note is created with title A, undoing the rename
+///    (B → A) cannot reclaim the original filename `A.md` because it is now
+///    occupied.  The undo writes the content to `A (<short-id>).md` instead.
+///
+/// **Decision**: accept and document.  Collision suffixing (spec §2) already
+/// guarantees no clobber; a path-drifted undo is still a correct content
+/// restore — the note's id, body, and index entry are all restored correctly.
+/// The suffix is a filesystem artefact, not a data loss.
 #[derive(Clone, Debug, PartialEq)]
 pub enum VaultOp {
-    Create { seed: NewNote, dest: Dest },
-    SaveBody { id: NoteId, content: String },
-    RenameTitle { id: NoteId, new_title: String },
-    Promote { id: NoteId },
-    Demote { id: NoteId },
-    SetKind { id: NoteId, kind: Kind },
-    SetSource { id: NoteId, source: Option<String> },
-    SetTags { id: NoteId, tags: Vec<Tag> },
-    Toss { id: NoteId },
-    Delete { id: NoteId },
-    Restore { id: NoteId },
-    Split { id: NoteId, at_byte: usize },
+    Create {
+        seed: NewNote,
+        dest: Dest,
+    },
+    SaveBody {
+        id: NoteId,
+        content: String,
+    },
+    RenameTitle {
+        id: NoteId,
+        new_title: String,
+    },
+    Promote {
+        id: NoteId,
+    },
+    Demote {
+        id: NoteId,
+    },
+    SetKind {
+        id: NoteId,
+        kind: Kind,
+    },
+    SetSource {
+        id: NoteId,
+        source: Option<String>,
+    },
+    SetTags {
+        id: NoteId,
+        tags: Vec<Tag>,
+    },
+    Toss {
+        id: NoteId,
+    },
+    Delete {
+        id: NoteId,
+    },
+    Restore {
+        id: NoteId,
+    },
+    /// Split a note at a byte offset, extracting the tail into a new note and
+    /// inserting a `[[link]]` reference in the host.
+    ///
+    /// # Undo label
+    ///
+    /// The op label for journaling and status display is **"Split card"** (or
+    /// "Split scrap" for fleeting notes).  The WP3 status echo (Task 6 in
+    /// jd-app) appends "(split-off card moved to trash)" when showing the
+    /// undo of a Split — pin that suffix in jd-app, not here.
+    ///
+    /// # Undo behaviour
+    ///
+    /// The inverse is `Batch([SaveBody(original_host_body), Delete(new_id)])`.
+    /// `Delete` moves the split-off note to trash (not permanent deletion),
+    /// so the split-off content is always recoverable from the trash floor.
+    Split {
+        id: NoteId,
+        at_byte: usize,
+    },
     Batch(Vec<VaultOp>),
 }
 

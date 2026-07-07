@@ -3,5 +3,14 @@ name = "jd-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Test-only failpoint seam in vault::io (WP3 Task 1). Never enable in
+# production builds; the self dev-dependency below turns it on for this
+# crate's own tests (unit + integration) automatically.
+test-failpoints = []
+
 [dependencies]
 notify = "8.2.0"
+
+[dev-dependencies]
+jd-core = { path = ".", features = ["test-failpoints"] }

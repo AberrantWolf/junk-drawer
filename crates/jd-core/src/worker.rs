@@ -823,6 +823,11 @@ fn execute_op(
                 Err(e) => return Err((label, format!("rename index self: {e}"))),
             }
 
+            // Track already-rewritten referrers for rollback on mid-loop failure:
+            // (ref_abs, ref_rel, original_full_content)
+            let mut rewritten_referrers: Vec<(std::path::PathBuf, std::path::PathBuf, String)> =
+                Vec::new();
+
             for ref_id in referrers {
                 let ref_meta = match index.read().unwrap().get(ref_id).cloned() {
                     Some(m) => m,
@@ -868,8 +873,56 @@ fn execute_op(
                 let new_ref_content = new_ref_doc.serialize();
 
                 if let Err(e) = atomic_save(&ref_abs, &new_ref_content) {
+                    // Mid-loop failure: roll back already-rewritten referrers and
+                    // the self-rename, surfacing any rollback failures as Error events.
+                    let mut rollback_failed: Vec<String> = Vec::new();
+
+                    // Roll back already-written referrers (most recent first)
+                    for (rb_abs, rb_rel, orig_content) in rewritten_referrers.into_iter().rev() {
+                        if let Err(rb_e) = atomic_save(&rb_abs, &orig_content) {
+                            rollback_failed
+                                .push(format!("referrer '{}': {rb_e}", rb_rel.display()));
+                        } else {
+                            ledger.remove(&rb_rel);
+                            if let Ok((rm, rb)) = parse_note_file(vault, &rb_rel) {
+                                index.write().unwrap().upsert(rm, &rb);
+                            }
+                        }
+                    }
+
+                    // Roll back self-rename: restore original content to old_abs,
+                    // remove new_abs if path changed.
+                    if let Err(rb_e) = atomic_save(&old_abs, &content) {
+                        rollback_failed.push(format!("self '{}': {rb_e}", old_rel.display()));
+                    } else {
+                        if old_abs != new_abs {
+                            let _ = std::fs::remove_file(&new_abs);
+                        }
+                        ledger.remove(&new_rel);
+                        if let Some(s) = stat(&old_abs) {
+                            ledger.insert(old_rel.clone(), s);
+                        }
+                        if let Ok((sm, sb)) = parse_note_file(vault, &old_rel) {
+                            let mut ix = index.write().unwrap();
+                            ix.remove(id);
+                            ix.upsert(sm, &sb);
+                        }
+                    }
+
+                    if !rollback_failed.is_empty() {
+                        emit(VaultEvent::Error {
+                            context: "batch rollback".into(),
+                            message: format!(
+                                "rename rollback failed for: {}",
+                                rollback_failed.join("; ")
+                            ),
+                        });
+                    }
+
                     return Err((label, format!("rename rewrite referrer: {e}")));
                 }
+                // Save succeeded: record original content for potential future rollback
+                rewritten_referrers.push((ref_abs.clone(), ref_rel.clone(), ref_content));
                 if let Some(s) = stat(&ref_abs) {
                     ledger.insert(ref_rel.clone(), s);
                 }
@@ -1015,25 +1068,42 @@ fn execute_op(
         }
 
         VaultOp::Batch(ops) => {
-            let mut done_inverses: Vec<VaultOp> = Vec::new();
+            // Each completed member: (forward label, Option<inverse op>)
+            let mut done: Vec<(String, Option<VaultOp>)> = Vec::new();
             let mut all_created: Vec<NoteId> = Vec::new();
             let mut first_label: Option<String> = None;
 
             for op in ops {
                 match execute_op(vault, index, id_gen, ledger, emit, op) {
                     Ok(result) => {
-                        if let Some(inv) = result.inverse {
-                            done_inverses.push(inv);
-                        }
-                        all_created.extend(result.created);
                         if first_label.is_none() {
-                            first_label = Some(result.label);
+                            first_label = Some(result.label.clone());
                         }
+                        done.push((result.label, result.inverse));
+                        all_created.extend(result.created);
                     }
                     Err((label, msg)) => {
-                        // Rollback in reverse order (best-effort; ignore rollback errors)
-                        for inv in done_inverses.into_iter().rev() {
-                            let _ = execute_op(vault, index, id_gen, ledger, emit, inv);
+                        // Rollback in reverse order; collect any rollback failures.
+                        // A rollback failure means the vault may be in mixed state —
+                        // surface each as VaultEvent::Error so the user can see it.
+                        let mut rollback_failed: Vec<String> = Vec::new();
+                        for (fwd_label, inv_op) in done.into_iter().rev() {
+                            if let Some(inv) = inv_op
+                                && let Err((rb_label, rb_msg)) =
+                                    execute_op(vault, index, id_gen, ledger, emit, inv)
+                            {
+                                rollback_failed
+                                    .push(format!("'{fwd_label}' → {rb_label}: {rb_msg}"));
+                            }
+                        }
+                        if !rollback_failed.is_empty() {
+                            emit(VaultEvent::Error {
+                                context: "batch rollback".into(),
+                                message: format!(
+                                    "rollback failed for: {}",
+                                    rollback_failed.join("; ")
+                                ),
+                            });
                         }
                         // Return the failing member's label with the error
                         return Err((label, msg));
@@ -1041,7 +1111,8 @@ fn execute_op(
                 }
             }
 
-            done_inverses.reverse();
+            let done_inverses: Vec<VaultOp> =
+                done.into_iter().rev().filter_map(|(_, inv)| inv).collect();
             Ok(OpResult {
                 inverse: Some(VaultOp::Batch(done_inverses)),
                 label: first_label.unwrap_or_else(|| "Batch".into()),
