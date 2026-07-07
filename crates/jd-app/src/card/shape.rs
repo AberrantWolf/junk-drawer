@@ -93,7 +93,10 @@ fn seed_from_id(id: NoteId) -> u64 {
 ///   (Divider includes the tab notch; Literature and IndexCard are plain rounded rects
 ///   for their outline — Tab and footer are decorations drawn on top).
 ///
-/// All points are guaranteed to stay within `rect.expand(0.1)`.
+/// All points are guaranteed to stay within `rect.expand(0.1)` for `Scrap`,
+/// `IndexCard`, and `Literature`. For `Divider`, the tab vertices protrude
+/// `DIVIDER_TAB.y` above `rect.min.y` by design — use [`divider_full_rect`] to
+/// obtain the bounding box that includes the tab.
 pub fn outline(
     shape: CardShape,
     style: CardStyle,
@@ -128,14 +131,19 @@ fn plain_rounded_rect(rect: egui::Rect) -> Vec<egui::Pos2> {
 
 /// Scrap torn-edge outline: irregular top edge seeded from `id`, straight sides.
 ///
-/// Walk the top edge in ~14px steps, jittering y by ±3px.  The three remaining
-/// edges are straight lines (4px corner approximation folded into the polygon).
+/// Walk the top edge in ~14px steps, jittering y by ±3px around a baseline that
+/// is inset 3px below the top edge.  Because the baseline is `rect.min.y + 3.0`
+/// and `dy ∈ [-3, +3]`, tear points range over `[rect.min.y, rect.min.y + 6]` —
+/// genuinely two-sided without any clamping.  The three remaining edges are
+/// straight lines (4px corner approximation folded into the polygon).
 fn scrap_torn_outline(rect: egui::Rect, id: NoteId) -> Vec<egui::Pos2> {
     let seed = seed_from_id(id);
     let mut rng = Xorshift128::new(seed);
 
     let step = 14.0_f32;
     let jitter = 3.0_f32;
+    // Baseline is inset 3px so ±3px jitter stays inside [rect.min.y, rect.min.y+6].
+    let baseline_y = rect.min.y + jitter;
     let width = rect.width();
     let steps = ((width / step).ceil() as usize).max(2);
 
@@ -155,7 +163,8 @@ fn scrap_torn_outline(rect: egui::Rect, id: NoteId) -> Vec<egui::Pos2> {
         // Scale to [0.0, 1.0] then to [-jitter, +jitter]
         let frac = (raw & 0xFFFF) as f32 / 65535.0;
         let dy = frac * 2.0 * jitter - jitter;
-        let y = (rect.min.y + dy).clamp(rect.min.y, rect.max.y);
+        // No clamp needed: baseline_y ± jitter = [rect.min.y, rect.min.y + 6]
+        let y = baseline_y + dy;
         pts.push(egui::pos2(x.min(rect.max.x), y));
         x += step;
     }
@@ -168,6 +177,19 @@ fn scrap_torn_outline(rect: egui::Rect, id: NoteId) -> Vec<egui::Pos2> {
     pts.push(egui::pos2(rect.min.x, rect.max.y));
 
     pts
+}
+
+/// Return the full bounding box of a Divider card, including the protruding tab.
+///
+/// `body_rect` is the rect passed to [`outline`] for a `Divider` card.  The
+/// returned rect extends `DIVIDER_TAB.y` above `body_rect.min.y` and is wide
+/// enough to enclose both the body and the tab.  Task 7 should use this instead
+/// of computing the tab offset manually.
+pub fn divider_full_rect(body_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(body_rect.min.x, body_rect.min.y - DIVIDER_TAB.y),
+        body_rect.max,
+    )
 }
 
 /// Divider outline: body rect plus a tab protruding above the top-left corner.
@@ -266,6 +288,51 @@ mod tests {
         for p in &a {
             assert!(rect.expand(0.1).contains(*p), "tear stays inside the rect");
         }
+
+        // Two-sidedness: at least one tear point strictly above the baseline
+        // (y < rect.min.y + 3) and one strictly below (y > rect.min.y + 3).
+        // Use nid(1) which is deterministic.
+        let baseline = rect.min.y + 3.0;
+        let tear_pts: Vec<_> = a
+            .iter()
+            .filter(|p| p.x > rect.min.x && p.x < rect.max.x)
+            .collect();
+        assert!(
+            tear_pts.iter().any(|p| p.y < baseline),
+            "tear must have at least one point above the baseline"
+        );
+        assert!(
+            tear_pts.iter().any(|p| p.y > baseline),
+            "tear must have at least one point below the baseline"
+        );
+    }
+
+    #[test]
+    fn shape_for_exhaustive() {
+        use jd_core::note::{Kind, Status};
+        // Fleeting always → Scrap regardless of kind
+        assert_eq!(shape_for(Status::Fleeting, Kind::Note), CardShape::Scrap);
+        assert_eq!(
+            shape_for(Status::Fleeting, Kind::Literature),
+            CardShape::Scrap
+        );
+        assert_eq!(
+            shape_for(Status::Fleeting, Kind::Structure),
+            CardShape::Scrap
+        );
+        // Permanent: kind determines shape
+        assert_eq!(
+            shape_for(Status::Permanent, Kind::Note),
+            CardShape::IndexCard
+        );
+        assert_eq!(
+            shape_for(Status::Permanent, Kind::Literature),
+            CardShape::Literature
+        );
+        assert_eq!(
+            shape_for(Status::Permanent, Kind::Structure),
+            CardShape::Divider
+        );
     }
 
     #[test]
