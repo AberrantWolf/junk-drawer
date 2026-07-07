@@ -28,6 +28,10 @@ pub struct ScanOutcome {
 /// Deterministic ID for files without a frontmatter id (decision #1):
 /// 128-bit FNV-1a over the rel path, two offset bases. Stable across
 /// rescans; becomes persistent when the worker first rewrites frontmatter.
+///
+/// The path is normalized to forward-slash separators before hashing, so
+/// the same note in a synced vault produces the same id on all platforms
+/// (Windows `inbox\scrap.md` and UNIX `inbox/scrap.md` are identical).
 pub fn synthetic_id(rel: &Path) -> NoteId {
     fn fnv64(bytes: &[u8], mut hash: u64) -> u64 {
         for &b in bytes {
@@ -36,7 +40,11 @@ pub fn synthetic_id(rel: &Path) -> NoteId {
         }
         hash
     }
-    let s = rel.to_string_lossy();
+    let s = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
     let a = fnv64(s.as_bytes(), 0xcbf2_9ce4_8422_2325);
     let b = fnv64(s.as_bytes(), 0x9e37_79b9_7f4a_7c15);
     let mut bytes = [0u8; 16];
@@ -141,4 +149,17 @@ pub fn scan(
         metas: all_metas,
         quarantined: all_quarantined,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_id_is_separator_independent() {
+        use std::path::PathBuf;
+        let forward = synthetic_id(std::path::Path::new("inbox/scrap.md"));
+        let joined = synthetic_id(&PathBuf::from("inbox").join("scrap.md"));
+        assert_eq!(forward, joined);
+    }
 }
