@@ -2,7 +2,8 @@
 //! (decision §6.11). ~500 lines was the spec's budget; keep it lean.
 //! tantivy explicitly rejected (Appendix B).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 
 use crate::id::NoteId;
 use crate::tag::Tag;
@@ -81,6 +82,44 @@ pub struct SearchHit {
     /// Lowercased terms that hit, incl. prefix expansions and phrase words —
     /// input for make_snippet (decision §6.10).
     pub matched_terms: Vec<String>,
+}
+
+/// Entry for the bounded min-heap used in `query`.
+///
+/// The heap is keyed so that the *lowest-scoring* hit sits at the top and can
+/// be evicted when a better candidate arrives.  We want the final output
+/// ordered score DESC then id ASC (matching the previous full-sort), so the
+/// min-heap comparator must be the *inverse*:
+///
+///   heap order: score ASC (Reverse), then id DESC (Reverse) on tiebreak
+///
+/// That keeps the worst current hit accessible at the top.  After popping all
+/// entries, reversing the vec restores score DESC / id ASC order.
+#[derive(PartialEq)]
+struct HeapEntry {
+    /// `Reverse` so that lower scores sort higher in the max-heap → min-heap.
+    score_rev: Reverse<u32>, // bits of f32, compared via total_cmp polarity
+    /// `Reverse` on id so that *larger* ids sort higher in the heap (evicted
+    /// first when scores tie), giving us id ASC in the final reversed output.
+    id_rev: Reverse<NoteId>,
+    /// Lazily-built matched terms — only cloned for hits that enter the heap.
+    matched_terms: Vec<String>,
+}
+
+impl Eq for HeapEntry {}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score_rev
+            .cmp(&other.score_rev)
+            .then(self.id_rev.cmp(&other.id_rev))
+    }
 }
 
 #[derive(Default)]
@@ -309,39 +348,82 @@ impl SearchIndex {
             })
             .collect();
 
-        // Score: per group, the best-scoring expansion counts.
-        let mut hits: Vec<SearchHit> = candidates
+        // Score candidates and keep the top-`limit` via a bounded min-heap.
+        //
+        // We score cheaply first (no String clones) and only materialise
+        // `matched_terms` for hits that actually enter the heap, eliminating
+        // ~17k×2 String clones per dense query.
+        //
+        // Heap polarity: score ASC (Reverse) / id DESC (Reverse) so the worst
+        // current hit sits at the top and is evicted first.  Popping all
+        // entries and reversing the vec restores the spec order: score DESC
+        // then id ASC.
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(limit + 1);
+
+        for id in candidates {
+            let doc_len = self.doc_len[&id];
+
+            // Cheap scoring pass — no String allocations.
+            let mut score = 0.0f32;
+            let mut best_terms: Vec<(&String, f32)> = Vec::new();
+            for resolved in &resolved_groups {
+                let mut best: Option<(f32, &String)> = None;
+                for &(term, posts, df) in resolved {
+                    if let Some(positions) = posts.get(&id) {
+                        let s = self.bm25(positions.len(), df, doc_len);
+                        if best.is_none_or(|(b, _)| s > b) {
+                            best = Some((s, term));
+                        }
+                    }
+                }
+                if let Some((s, term)) = best {
+                    score += s;
+                    best_terms.push((term, s));
+                }
+            }
+
+            // Evict if the heap is full and this score does not beat the worst
+            // entry.  Compare using the same total_cmp polarity as the heap key.
+            let score_bits = Reverse(score.to_bits()); // NaN-safe: to_bits preserves total_cmp order for non-NaN f32
+            let id_rev = Reverse(id);
+            if heap.len() >= limit && let Some(worst) = heap.peek() {
+                // worse-or-equal: score_bits > worst (min-heap so worst is at top
+                // with the LOWEST score, i.e. the HIGHEST Reverse(bits))
+                let new_entry_worse = score_bits > worst.score_rev
+                    || (score_bits == worst.score_rev && id_rev < worst.id_rev);
+                if new_entry_worse {
+                    continue;
+                }
+                heap.pop();
+            }
+
+            // This hit qualifies — now pay for the String clones.
+            let mut matched: Vec<String> = Vec::new();
+            for (term, _) in &best_terms {
+                if !matched.contains(*term) {
+                    matched.push((*term).clone());
+                }
+            }
+
+            heap.push(HeapEntry {
+                score_rev: score_bits,
+                id_rev,
+                matched_terms: matched,
+            });
+        }
+
+        // Drain heap into a vec, then sort to get the spec order: score DESC,
+        // id ASC.  The heap guarantees at most `limit` entries, so this sort
+        // is O(limit · log limit) — negligible.
+        let mut hits: Vec<SearchHit> = heap
             .into_iter()
-            .map(|id| {
-                let doc_len = self.doc_len[&id];
-                let mut score = 0.0;
-                let mut matched: Vec<String> = Vec::new();
-                for resolved in &resolved_groups {
-                    let mut best: Option<(f32, &String)> = None;
-                    for &(term, posts, df) in resolved {
-                        if let Some(positions) = posts.get(&id) {
-                            let s = self.bm25(positions.len(), df, doc_len);
-                            if best.is_none_or(|(b, _)| s > b) {
-                                best = Some((s, term));
-                            }
-                        }
-                    }
-                    if let Some((s, term)) = best {
-                        score += s;
-                        if !matched.contains(term) {
-                            matched.push(term.clone());
-                        }
-                    }
-                }
-                SearchHit {
-                    id,
-                    score,
-                    matched_terms: matched,
-                }
+            .map(|e| SearchHit {
+                id: e.id_rev.0,
+                score: f32::from_bits(e.score_rev.0),
+                matched_terms: e.matched_terms,
             })
             .collect();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
-        hits.truncate(limit);
         hits
     }
 
