@@ -246,6 +246,9 @@ fn run_initial_scan(
         for (meta, body) in &outcome.metas {
             ix.upsert(meta.clone(), body);
         }
+        // One O(total terms) pass so similar() serves from the norm cache.
+        // Per-upsert refresh would blow the incremental reindex budget.
+        ix.refresh_similarity_cache();
     }
 
     emit(VaultEvent::ScanComplete {

@@ -92,6 +92,11 @@ pub struct SearchIndex {
     doc_len: HashMap<NoteId, u32>,
     /// Sum of doc_len values — keeps avg doc length O(1) for BM25.
     total_len: u64,
+    /// Cached tf-idf norms per doc; invalidated wholesale on any mutation
+    /// (idf shifts globally when df/N change, so per-doc invalidation is wrong).
+    norms: HashMap<NoteId, f32>,
+    /// True when `norms` is out of date and must be rebuilt before use.
+    norms_dirty: bool,
 }
 
 impl SearchIndex {
@@ -108,6 +113,7 @@ impl SearchIndex {
     }
 
     pub fn add_doc(&mut self, id: NoteId, text: &str) {
+        self.norms_dirty = true;
         self.remove_doc(id);
         let tokens = tokenize(text);
         self.total_len += tokens.len() as u64;
@@ -130,6 +136,7 @@ impl SearchIndex {
     }
 
     pub fn remove_doc(&mut self, id: NoteId) {
+        self.norms_dirty = true;
         let Some(old) = self.doc_terms.remove(&id) else {
             return;
         };
@@ -144,6 +151,28 @@ impl SearchIndex {
         if let Some(len) = self.doc_len.remove(&id) {
             self.total_len -= len as u64;
         }
+    }
+
+    /// Rebuild the per-doc tf-idf norm cache if dirty.  Call this once after a
+    /// batch of mutations to amortize the O(total_terms) rebuild cost.
+    pub(crate) fn ensure_norms(&mut self) {
+        if !self.norms_dirty {
+            return;
+        }
+        self.norms.clear();
+        for (id, terms) in &self.doc_terms {
+            let norm: f32 = terms
+                .iter()
+                .map(|(t, tf)| {
+                    let df = self.terms.get(t).map_or(1, HashMap::len);
+                    let w = *tf as f32 * self.idf(df);
+                    w * w
+                })
+                .sum::<f32>()
+                .sqrt();
+            self.norms.insert(*id, norm);
+        }
+        self.norms_dirty = false;
     }
 
     fn idf(&self, df: usize) -> f32 {
@@ -419,6 +448,11 @@ pub fn make_snippet(body: &str, terms: &[String], radius: usize) -> Snippet {
 impl SearchIndex {
     /// Cosine similarity over tf-idf vectors, computed sparsely via postings.
     /// For ghost fans and post-promotion suggestions (spec §6).
+    ///
+    /// When the norm cache is clean (after `ensure_norms`), candidate doc norms
+    /// are read from `self.norms` in O(1) rather than recomputed.  When dirty
+    /// (after a mutation before `ensure_norms` is called), falls back to the
+    /// original per-call computation — correct but slower.
     pub fn similar(&self, id: NoteId, k: usize) -> Vec<(NoteId, f32)> {
         let Some(src_terms) = self.doc_terms.get(&id) else {
             return Vec::new();
@@ -435,7 +469,14 @@ impl SearchIndex {
                 .sum::<f32>()
                 .sqrt()
         };
-        let src_norm = norm_of(src_terms);
+        let src_norm = if self.norms_dirty {
+            norm_of(src_terms)
+        } else {
+            self.norms
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| norm_of(src_terms))
+        };
         if src_norm == 0.0 {
             return Vec::new();
         }
@@ -455,7 +496,14 @@ impl SearchIndex {
         let mut out: Vec<(NoteId, f32)> = dot
             .into_iter()
             .map(|(d, dp)| {
-                let n = norm_of(&self.doc_terms[&d]);
+                let n = if self.norms_dirty {
+                    norm_of(&self.doc_terms[&d])
+                } else {
+                    self.norms
+                        .get(&d)
+                        .copied()
+                        .unwrap_or_else(|| norm_of(&self.doc_terms[&d]))
+                };
                 (d, if n == 0.0 { 0.0 } else { dp / (src_norm * n) })
             })
             .collect();
@@ -668,5 +716,37 @@ mod tests {
         s.add_doc(nid(3), "alpha delta");
         assert_eq!(s.similar(nid(1), 1).len(), 1);
         assert!(s.similar(nid(99), 5).is_empty());
+    }
+
+    #[test]
+    fn similar_results_identical_with_and_without_cache() {
+        let mut s = SearchIndex::new();
+        s.add_doc(nid(1), "zettelkasten method for permanent notes");
+        s.add_doc(nid(2), "permanent notes are the zettelkasten heart");
+        s.add_doc(nid(3), "gardening tips for tomato plants");
+        let dirty = s.similar(nid(1), 5); // cache dirty → per-call path
+        s.ensure_norms();
+        let cached = s.similar(nid(1), 5); // cache clean
+        assert_eq!(dirty.len(), cached.len());
+        for (a, b) in dirty.iter().zip(&cached) {
+            assert_eq!(a.0, b.0);
+            assert!((a.1 - b.1).abs() < 1e-6, "{} vs {}", a.1, b.1);
+        }
+    }
+
+    #[test]
+    fn cache_invalidates_on_mutation() {
+        let mut s = SearchIndex::new();
+        s.add_doc(nid(1), "alpha beta");
+        s.add_doc(nid(2), "alpha gamma");
+        s.ensure_norms();
+        s.add_doc(nid(3), "alpha beta delta"); // changes df(alpha,beta) → all norms stale
+        let sim = s.similar(nid(1), 5); // must not use stale cache
+        assert!(sim.iter().any(|&(d, _)| d == nid(3)));
+        s.ensure_norms();
+        let sim2 = s.similar(nid(1), 5);
+        for (a, b) in sim.iter().zip(&sim2) {
+            assert!((a.1 - b.1).abs() < 1e-6);
+        }
     }
 }

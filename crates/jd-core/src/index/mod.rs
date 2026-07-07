@@ -277,4 +277,13 @@ impl Index {
     pub fn similar(&self, id: NoteId, k: usize) -> Vec<(NoteId, f32)> {
         self.search.similar(id, k)
     }
+
+    /// Rebuild the tf-idf norm cache that accelerates `similar`.  Intended to
+    /// run once after bulk indexing (initial scan, rescan) — NOT per upsert:
+    /// the rebuild is O(total terms) and would blow the incremental reindex
+    /// budget.  While the cache is dirty, `similar` falls back to the
+    /// (correct, slower) per-call computation.
+    pub fn refresh_similarity_cache(&mut self) {
+        self.search.ensure_norms();
+    }
 }

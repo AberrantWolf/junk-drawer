@@ -75,6 +75,8 @@ fn build_index(v: &Vault) -> Index {
     for (meta, body) in out.metas {
         ix.upsert(meta, &body);
     }
+    // Mirrors the worker's post-scan refresh (worker.rs run_initial_scan).
+    ix.refresh_similarity_cache();
     ix
 }
 
