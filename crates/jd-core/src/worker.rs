@@ -786,9 +786,11 @@ fn execute_op(
             let new_abs = filename_for(&new_title, id, &old_dir);
             let new_rel = vault.rel(&new_abs).unwrap_or_else(|| new_abs.clone());
 
-            // Write new content to new path
-            let mut new_doc = NoteDoc::parse(&content);
-            new_doc.body = new_body;
+            // Write new content to new path — reuse the fm from the first parse (no second parse)
+            let mut new_doc = NoteDoc {
+                fm: doc.fm.clone(),
+                body: new_body,
+            };
             new_doc.fm.set_modified(Timestamp::now());
             let new_content = new_doc.serialize();
 
@@ -1164,18 +1166,17 @@ fn handle_watch(
                         if meta.id != prev.id {
                             // The file lost its frontmatter id (e.g. external overwrite).
                             // Preserve identity: reuse the existing id, remove the old entry
-                            // and re-insert under that id.
-                            index.write().unwrap().remove(prev.id);
+                            // and re-insert under that id — one lock, one call.
                             meta.id = prev.id;
                         }
                         // WP1d handoff: preserve created timestamp
                         meta.created = prev.created;
                         emit_id = prev.id;
+                        index.write().unwrap().replace_at_path(prev.id, meta, &body);
                     } else {
                         emit_id = meta.id;
+                        index.write().unwrap().upsert(meta, &body);
                     }
-
-                    index.write().unwrap().upsert(meta, &body);
                     emit(VaultEvent::External {
                         changed: vec![emit_id],
                         removed: vec![],
