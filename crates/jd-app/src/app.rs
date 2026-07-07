@@ -34,6 +34,8 @@ pub struct JdUi {
     waker: Waker,
     pub scan_done: bool,
     pub last_error: Option<String>,
+    pub theme: crate::theme::Theme,
+    pub fonts_installed: bool,
 }
 
 impl JdUi {
@@ -47,6 +49,8 @@ impl JdUi {
             waker,
             scan_done: false,
             last_error: None,
+            theme: crate::theme::Theme::light(),
+            fonts_installed: false,
         })
     }
 
@@ -64,6 +68,18 @@ impl JdUi {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        if !self.fonts_installed {
+            crate::theme::install_fonts(ui.ctx());
+            self.fonts_installed = true;
+        }
+        let dark = ui.style().visuals.dark_mode;
+        if dark != self.theme.dark {
+            self.theme = if dark {
+                crate::theme::Theme::dark()
+            } else {
+                crate::theme::Theme::light()
+            };
+        }
         self.waker.attach(ui.ctx());
         self.drain_events();
         // Status line (bottom). Real surfaces land in Tasks 8-9.

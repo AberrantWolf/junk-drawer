@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
-use eframe::egui::{self, FontFamily, FontId, TextFormat, text::LayoutJob};
+use eframe::egui::{self, text::LayoutJob};
 use jd_core::lexer::{LineState, SpanStyle, StyledSpan, lex_line};
 
 /// Per-line lexing is O(n^2) on pathological unclosed-delimiter lines
@@ -69,51 +69,6 @@ fn lex_capped(
     (spans, exit)
 }
 
-/// Map a lexer span to an egui TextFormat. Colors come from theme.rs from
-/// Task 4 on; the spike uses egui's current visuals so it stands alone.
-fn format_for(style: SpanStyle, visuals: &egui::Visuals) -> TextFormat {
-    let body = FontId::new(BODY_SIZE, FontFamily::Proportional);
-    let mono = FontId::new(MONO_SIZE, FontFamily::Monospace);
-    let text = visuals.text_color();
-    let weak = visuals.weak_text_color();
-    let accent = visuals.hyperlink_color;
-    let mut f = TextFormat::simple(body.clone(), text);
-    match style {
-        SpanStyle::Text | SpanStyle::ListMarker => {}
-        SpanStyle::Heading(n) => {
-            f.font_id = FontId::new(heading_size(n), FontFamily::Proportional);
-            // Bold family arrives with theme.rs (Task 4); size alone carries the spike.
-        }
-        SpanStyle::HeadingMarker => {
-            f.font_id = FontId::new(heading_size(1), FontFamily::Proportional);
-            f.color = weak;
-        }
-        SpanStyle::Bold | SpanStyle::BoldItalic => { /* bold family in Task 4 */ }
-        SpanStyle::Italic => f.italics = true,
-        SpanStyle::Strike => f.strikethrough = egui::Stroke::new(1.0, text),
-        SpanStyle::InlineCode | SpanStyle::CodeBlock | SpanStyle::CodeFenceMarker => {
-            f.font_id = mono;
-            f.background = visuals.extreme_bg_color;
-        }
-        SpanStyle::TaskBoxUnchecked | SpanStyle::TaskBoxChecked => f.color = weak,
-        SpanStyle::QuoteMarker => f.color = weak,
-        SpanStyle::Quote => f.italics = true,
-        SpanStyle::WikiLink { resolved } => {
-            f.color = accent;
-            if !resolved {
-                f.underline = egui::Stroke::new(1.0, accent); // dashed styling refined in Task 4
-            }
-        }
-        SpanStyle::Tag => f.color = accent,
-        SpanStyle::Url | SpanStyle::MdLinkUrl => {
-            f.color = accent;
-            f.underline = egui::Stroke::new(1.0, accent);
-        }
-        SpanStyle::MdLinkText => f.color = accent,
-    }
-    f
-}
-
 /// Build the mixed-size galley for `text`. HEADING SIZES ARE REAL SIZES —
 /// this is the spike's whole bet. One LayoutJob for the entire buffer;
 /// egui's TextEdit maps cursor hits through the galley, so as long as the
@@ -125,17 +80,17 @@ pub fn layout_body(
     wrap_width: f32,
     cache: &mut LineCache,
     resolve: &dyn Fn(&str) -> bool,
+    theme: &crate::theme::Theme,
 ) -> Arc<egui::Galley> {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width;
-    let visuals = ui.visuals().clone();
     let mut state = LineState::Normal;
     let mut offset = 0usize;
     for (i, line) in text.split('\n').enumerate() {
         if i > 0 {
             // The '\n' itself: append with the BODY format so every byte of
             // the buffer is present in the job (cursor mapping requirement).
-            job.append("\n", 0.0, format_for(SpanStyle::Text, &visuals));
+            job.append("\n", 0.0, crate::theme::text_format(SpanStyle::Text, theme));
             offset += 1;
         }
         let key = line_key(line, state);
@@ -147,10 +102,20 @@ pub fn layout_body(
         if spans.is_empty() {
             // empty line: append a zero-width body-sized section so the line
             // has a defined height and the cursor can sit on it.
-            job.append("", 0.0, format_for(SpanStyle::Text, &visuals));
+            job.append("", 0.0, crate::theme::text_format(SpanStyle::Text, theme));
         }
         for s in &spans {
-            job.append(&line[s.range.clone()], 0.0, format_for(s.style, &visuals));
+            let mut fmt = crate::theme::text_format(s.style, theme);
+            // Fix HeadingMarker level: derive level from the '#' count in the line,
+            // rather than always using heading_size(1).
+            if s.style == SpanStyle::HeadingMarker {
+                let level = line.bytes().take_while(|&b| b == b'#').count().clamp(1, 3) as u8;
+                fmt.font_id = eframe::egui::FontId::new(
+                    heading_size(level),
+                    eframe::egui::FontFamily::Name("inter-bold".into()),
+                );
+            }
+            job.append(&line[s.range.clone()], 0.0, fmt);
         }
         state = exit;
         offset += line.len();

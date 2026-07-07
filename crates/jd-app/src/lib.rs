@@ -3,3 +3,4 @@
 pub mod app;
 pub mod editor;
 pub mod surfaces;
+pub mod theme;
