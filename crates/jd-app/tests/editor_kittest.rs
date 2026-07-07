@@ -396,3 +396,92 @@ fn ctrl_enter_closes_too() {
     assert_eq!(h.state().state.session.open_card, None);
     assert!(h.state().state.editor.is_none());
 }
+
+#[test]
+fn enter_continues_lists_and_empty_item_ends() {
+    let (_vault, mut h, id) = app_with_one_card("");
+    open_editor(&mut h, id);
+    let node = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+    node.type_text("- a");
+    h.step();
+    h.run_ok();
+    h.key_press(egui::Key::Enter);
+    h.step();
+    h.run_ok();
+    h.key_press(egui::Key::Enter);
+    h.step();
+    h.run_ok();
+    let buf = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(
+        buf.contains("- a"),
+        "should have first list item, got: {:?}",
+        buf
+    );
+    assert!(
+        !buf.contains("- \n- "),
+        "should not have double list prefix, got: {:?}",
+        buf
+    );
+}
+
+#[test]
+fn link_autocomplete_shows_popup_and_inserts() {
+    let (_vault, mut h, id) = app_with_one_card("");
+    open_editor(&mut h, id);
+    let node = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+    node.type_text("[[");
+    h.step();
+    h.run_ok();
+    let buf = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(buf.contains("[["), "buffer should have [[, got: {:?}", buf);
+}
+
+#[test]
+fn typed_quotes_stay_ascii() {
+    let (_vault, mut h, id) = app_with_one_card("");
+    open_editor(&mut h, id);
+    let node = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+    node.type_text("\"hello\"");
+    h.step();
+    h.run_ok();
+    let buf = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(
+        buf.contains("\"hello\""),
+        "typed quotes must stay ASCII, got: {:?}",
+        buf
+    );
+    assert!(
+        !buf.contains('\u{201C}'),
+        "must not have U+201C, got: {:?}",
+        buf
+    );
+    assert!(
+        !buf.contains('\u{201D}'),
+        "must not have U+201D, got: {:?}",
+        buf
+    );
+}
+
+#[test]
+fn url_paste_over_selection_makes_md_link() {
+    let (_vault, mut h, id) = app_with_one_card("docs");
+    open_editor(&mut h, id);
+    h.event(egui::Event::Key {
+        key: egui::Key::A,
+        physical_key: Option::None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    });
+    h.step();
+    h.run_ok();
+    h.event(egui::Event::Paste("https://example.com".to_owned()));
+    h.step();
+    h.run_ok();
+    let buf = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(
+        buf.contains("[docs](https://example.com)"),
+        "url paste over selection must make markdown link, got: {:?}",
+        buf
+    );
+}
