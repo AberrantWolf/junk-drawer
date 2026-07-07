@@ -16,21 +16,15 @@ fn buffer_path(vault: &Vault, id: NoteId) -> PathBuf {
 
 /// Persist an unsaved buffer to the recovery directory so a crash loses nothing.
 ///
-/// # Single-writer contract (spec §3)
-/// Must be called only from the vault worker thread (or single-threaded
-/// tests). WP1e wraps this in a `VaultCommand`; direct calls from app
-/// code race the worker's writes.
-pub fn journal_buffer(vault: &Vault, id: NoteId, content: &str) -> Result<(), IoError> {
+/// pub(crate): callable only via the vault worker's `VaultOp`s — enforced structurally since WP1e.
+pub(crate) fn journal_buffer(vault: &Vault, id: NoteId, content: &str) -> Result<(), IoError> {
     atomic_save(&buffer_path(vault, id), content)
 }
 
 /// Remove the recovery buffer for a note after a successful save.
 ///
-/// # Single-writer contract (spec §3)
-/// Must be called only from the vault worker thread (or single-threaded
-/// tests). WP1e wraps this in a `VaultCommand`; direct calls from app
-/// code race the worker's writes.
-pub fn clear_buffer(vault: &Vault, id: NoteId) {
+/// pub(crate): callable only via the vault worker's `VaultOp`s — enforced structurally since WP1e.
+pub(crate) fn clear_buffer(vault: &Vault, id: NoteId) {
     let _ = std::fs::remove_file(buffer_path(vault, id));
 }
 
@@ -55,4 +49,23 @@ pub fn pending_recoveries(vault: &Vault) -> Vec<(NoteId, String)> {
     }
     out.sort_by_key(|(id, _)| *id);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vault::testutil::TempDir;
+
+    #[test]
+    fn recovery_journal_round_trip() {
+        let t = TempDir::new();
+        let v = Vault::open(t.path()).unwrap();
+        let id = crate::vault::scan::synthetic_id(std::path::Path::new("inbox/x.md"));
+        journal_buffer(&v, id, "unsaved keystrokes").unwrap();
+        let pending = pending_recoveries(&v);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0], (id, "unsaved keystrokes".to_owned()));
+        clear_buffer(&v, id);
+        assert!(pending_recoveries(&v).is_empty());
+    }
 }

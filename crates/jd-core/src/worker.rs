@@ -529,8 +529,12 @@ fn execute_op(
 
             atomic_save(&new_abs, &new_content)
                 .map_err(|e| ("Promote note".to_string(), format!("promote write: {e}")))?;
-            std::fs::remove_file(&old_abs)
-                .map_err(|e| ("Promote note".to_string(), format!("promote remove old: {e}")))?;
+            std::fs::remove_file(&old_abs).map_err(|e| {
+                (
+                    "Promote note".to_string(),
+                    format!("promote remove old: {e}"),
+                )
+            })?;
 
             ledger.remove(&old_rel);
             if let Some(s) = stat(&new_abs) {
