@@ -614,9 +614,14 @@ fn batch_rolls_back_on_member_failure() {
             source: OpSource::User,
         })
         .unwrap();
-    drain_until(&h, |e| {
-        matches!(e, VaultEvent::OpFailed { .. }).then_some(())
+    let label = drain_until(&h, |e| match e {
+        VaultEvent::OpFailed { label, .. } => Some(label.clone()),
+        _ => None,
     });
+    assert_ne!(
+        label, "Operation",
+        "OpFailed must carry the failing op's label"
+    );
 
     h.commands.send(VaultCommand::ReadBody { id }).unwrap();
     let body = drain_until(&h, |e| match e {

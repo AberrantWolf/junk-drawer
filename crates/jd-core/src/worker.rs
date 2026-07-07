@@ -239,8 +239,9 @@ fn run_initial_scan(
 }
 
 /// Execute a single VaultOp, returning an OpResult on success or an error
-/// message on failure.  The `emit` callback is used only for Conflict events
+/// tuple (label, message) on failure.  The `emit` callback is used only for Conflict events
 /// (SaveBody conflict path succeeds with divergence: OpFailed is NOT emitted).
+/// For Batch, the error carries the failing member's label.
 fn execute_op(
     vault: &Vault,
     index: &SharedIndex,
@@ -248,7 +249,7 @@ fn execute_op(
     ledger: &mut WriteLedger,
     emit: &impl Fn(VaultEvent),
     op: VaultOp,
-) -> Result<OpResult, String> {
+) -> Result<OpResult, (String, String)> {
     match op {
         VaultOp::Create { seed, dest } => {
             let id = NoteId::generate(id_gen);
@@ -279,7 +280,9 @@ fn execute_op(
             };
             let content = doc.serialize();
 
-            atomic_save(&abs_path, &content).map_err(|e| e.to_string())?;
+            let display = label_display(&title);
+            atomic_save(&abs_path, &content)
+                .map_err(|e| (op_label("Create", false, &display), format!("create: {e}")))?;
 
             if let Some(s) = stat(&abs_path) {
                 ledger.insert(rel_path.clone(), s);
@@ -288,7 +291,6 @@ fn execute_op(
             match parse_note_file(vault, &rel_path) {
                 Ok((meta, body)) => {
                     let is_fleeting = meta.status == Status::Fleeting;
-                    let display = label_display(&title);
                     index.write().unwrap().upsert(meta, &body);
                     Ok(OpResult {
                         inverse: Some(VaultOp::Delete { id }),
@@ -296,17 +298,18 @@ fn execute_op(
                         created: vec![id],
                     })
                 }
-                Err(e) => Err(format!("create note index: {e}")),
+                Err(e) => Err((
+                    op_label("Create", false, &display),
+                    format!("create index: {e}"),
+                )),
             }
         }
 
         VaultOp::SaveBody { id, content } => {
-            let meta = index
-                .read()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let meta = index.read().unwrap().get(id).cloned().ok_or_else(|| {
+                let label = "Edit note".to_string();
+                (label, format!("note {id} not found in index"))
+            })?;
             let rel_path = meta.rel_path.clone();
             let abs_path = vault.abs(&rel_path);
             let is_fleeting = meta.status == Status::Fleeting;
@@ -320,6 +323,8 @@ fn execute_op(
                 Ok(s) => NoteDoc::parse(&s).body,
                 Err(_) => String::new(),
             };
+
+            let label = op_label("Edit", is_fleeting, &label_display(&display_title));
 
             // Conflict check (decision #5): if ledger HAS an entry AND current stat ≠ ledger
             if let Some(&ledger_stat) = ledger.get(&rel_path) {
@@ -341,7 +346,7 @@ fn execute_op(
                     let conflict_content = conflict_doc.serialize();
 
                     if let Err(e) = atomic_save(&conflict_path, &conflict_content) {
-                        return Err(format!("save conflict copy: {e}"));
+                        return Err((label, format!("save conflict copy: {e}")));
                     }
 
                     if let Ok((cmeta, cbody)) = parse_note_file(vault, &conflict_rel) {
@@ -354,7 +359,6 @@ fn execute_op(
                     });
 
                     // Op "succeeds with divergence" — return Ok with old-body inverse
-                    let label = op_label("Edit", is_fleeting, &label_display(&display_title));
                     return Ok(OpResult {
                         inverse: Some(VaultOp::SaveBody {
                             id,
@@ -395,7 +399,8 @@ fn execute_op(
             doc.fm.set_modified(Timestamp::now());
             let new_content = doc.serialize();
 
-            atomic_save(&abs_path, &new_content).map_err(|e| format!("save body: {e}"))?;
+            atomic_save(&abs_path, &new_content)
+                .map_err(|e| (label.clone(), format!("save body: {e}")))?;
 
             if let Some(s) = stat(&abs_path) {
                 ledger.insert(rel_path.clone(), s);
@@ -406,13 +411,12 @@ fn execute_op(
                     index.write().unwrap().upsert(m, &b);
                 }
                 Err(e) => {
-                    return Err(format!("save body index: {e}"));
+                    return Err((label, format!("save body index: {e}")));
                 }
             }
 
             clear_buffer(vault, id);
 
-            let label = op_label("Edit", is_fleeting, &label_display(&display_title));
             Ok(OpResult {
                 inverse: Some(VaultOp::SaveBody {
                     id,
@@ -424,57 +428,58 @@ fn execute_op(
         }
 
         VaultOp::Toss { id } => {
-            let meta = index
-                .read()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let meta = index.read().unwrap().get(id).cloned().ok_or_else(|| {
+                let label = "Toss note".to_string();
+                (label, format!("note {id} not found in index"))
+            })?;
             let is_fleeting = meta.status == Status::Fleeting;
             let display = meta
                 .title
                 .clone()
                 .unwrap_or_else(|| meta.first_line.clone());
             let rel_path = meta.rel_path.clone();
+            let label = op_label("Toss", is_fleeting, &label_display(&display));
 
-            trash_note(vault, &meta).map_err(|e| e.to_string())?;
+            trash_note(vault, &meta).map_err(|e| (label.clone(), e.to_string()))?;
             ledger.remove(&rel_path);
             index.write().unwrap().remove(id);
 
             Ok(OpResult {
                 inverse: Some(VaultOp::Restore { id }),
-                label: op_label("Toss", is_fleeting, &label_display(&display)),
+                label,
                 created: vec![],
             })
         }
 
         VaultOp::Delete { id } => {
-            let meta = index
-                .read()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let meta = index.read().unwrap().get(id).cloned().ok_or_else(|| {
+                let label = "Delete note".to_string();
+                (label, format!("note {id} not found in index"))
+            })?;
             let is_fleeting = meta.status == Status::Fleeting;
             let display = meta
                 .title
                 .clone()
                 .unwrap_or_else(|| meta.first_line.clone());
             let rel_path = meta.rel_path.clone();
+            let label = op_label("Delete", is_fleeting, &label_display(&display));
 
-            trash_note(vault, &meta).map_err(|e| e.to_string())?;
+            trash_note(vault, &meta).map_err(|e| (label.clone(), e.to_string()))?;
             ledger.remove(&rel_path);
             index.write().unwrap().remove(id);
 
             Ok(OpResult {
                 inverse: Some(VaultOp::Restore { id }),
-                label: op_label("Delete", is_fleeting, &label_display(&display)),
+                label,
                 created: vec![],
             })
         }
 
         VaultOp::Restore { id } => {
-            let new_rel = restore(vault, id).map_err(|e| e.to_string())?;
+            let new_rel = restore(vault, id).map_err(|e| {
+                let label = "Restore note".to_string();
+                (label, e.to_string())
+            })?;
 
             match parse_note_file(vault, &new_rel) {
                 Ok((meta, body)) => {
@@ -495,17 +500,15 @@ fn execute_op(
                         created: vec![],
                     })
                 }
-                Err(e) => Err(format!("restore index: {e}")),
+                Err(e) => Err(("Restore note".to_string(), format!("restore index: {e}"))),
             }
         }
 
         VaultOp::Promote { id } => {
-            let meta = index
-                .read()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let meta = index.read().unwrap().get(id).cloned().ok_or_else(|| {
+                let label = "Promote note".to_string();
+                (label, format!("note {id} not found in index"))
+            })?;
             let old_rel = meta.rel_path.clone();
             let old_abs = vault.abs(&old_rel);
             let display = meta
@@ -513,8 +516,8 @@ fn execute_op(
                 .clone()
                 .unwrap_or_else(|| meta.first_line.clone());
 
-            let content =
-                std::fs::read_to_string(&old_abs).map_err(|e| format!("promote read: {e}"))?;
+            let content = std::fs::read_to_string(&old_abs)
+                .map_err(|e| ("Promote note".to_string(), format!("promote read: {e}")))?;
             let mut doc = NoteDoc::parse(&content);
             doc.fm.set_status(Status::Permanent);
             doc.fm.set_modified(Timestamp::now());
@@ -524,8 +527,10 @@ fn execute_op(
             let new_abs = filename_for(&display, id, &notes_dir);
             let new_rel = vault.rel(&new_abs).unwrap_or_else(|| new_abs.clone());
 
-            atomic_save(&new_abs, &new_content).map_err(|e| format!("promote write: {e}"))?;
-            std::fs::remove_file(&old_abs).map_err(|e| format!("promote remove old: {e}"))?;
+            atomic_save(&new_abs, &new_content)
+                .map_err(|e| ("Promote note".to_string(), format!("promote write: {e}")))?;
+            std::fs::remove_file(&old_abs)
+                .map_err(|e| ("Promote note".to_string(), format!("promote remove old: {e}")))?;
 
             ledger.remove(&old_rel);
             if let Some(s) = stat(&new_abs) {
@@ -534,25 +539,27 @@ fn execute_op(
 
             match parse_note_file(vault, &new_rel) {
                 Ok((m, b)) => {
-                    index.write().unwrap().remove(id);
-                    index.write().unwrap().upsert(m, &b);
+                    // Collapse into single write-lock scope
+                    {
+                        let mut ix = index.write().unwrap();
+                        ix.remove(id);
+                        ix.upsert(m, &b);
+                    }
                     Ok(OpResult {
                         inverse: Some(VaultOp::Demote { id }),
                         label: op_label("Promote", true, &label_display(&display)),
                         created: vec![],
                     })
                 }
-                Err(e) => Err(format!("promote index: {e}")),
+                Err(e) => Err(("Promote note".to_string(), format!("promote index: {e}"))),
             }
         }
 
         VaultOp::Demote { id } => {
-            let meta = index
-                .read()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let meta = index.read().unwrap().get(id).cloned().ok_or_else(|| {
+                let label = "Demote note".to_string();
+                (label, format!("note {id} not found in index"))
+            })?;
             let old_rel = meta.rel_path.clone();
             let old_abs = vault.abs(&old_rel);
             let display = meta
@@ -560,8 +567,8 @@ fn execute_op(
                 .clone()
                 .unwrap_or_else(|| meta.first_line.clone());
 
-            let content =
-                std::fs::read_to_string(&old_abs).map_err(|e| format!("demote read: {e}"))?;
+            let content = std::fs::read_to_string(&old_abs)
+                .map_err(|e| ("Demote note".to_string(), format!("demote read: {e}")))?;
             let mut doc = NoteDoc::parse(&content);
             doc.fm.set_status(Status::Fleeting);
             doc.fm.set_modified(Timestamp::now());
@@ -571,8 +578,10 @@ fn execute_op(
             let new_abs = filename_for(&display, id, &inbox_dir);
             let new_rel = vault.rel(&new_abs).unwrap_or_else(|| new_abs.clone());
 
-            atomic_save(&new_abs, &new_content).map_err(|e| format!("demote write: {e}"))?;
-            std::fs::remove_file(&old_abs).map_err(|e| format!("demote remove old: {e}"))?;
+            atomic_save(&new_abs, &new_content)
+                .map_err(|e| ("Demote note".to_string(), format!("demote write: {e}")))?;
+            std::fs::remove_file(&old_abs)
+                .map_err(|e| ("Demote note".to_string(), format!("demote remove old: {e}")))?;
 
             ledger.remove(&old_rel);
             if let Some(s) = stat(&new_abs) {
@@ -581,25 +590,27 @@ fn execute_op(
 
             match parse_note_file(vault, &new_rel) {
                 Ok((m, b)) => {
-                    index.write().unwrap().remove(id);
-                    index.write().unwrap().upsert(m, &b);
+                    // Collapse into single write-lock scope
+                    {
+                        let mut ix = index.write().unwrap();
+                        ix.remove(id);
+                        ix.upsert(m, &b);
+                    }
                     Ok(OpResult {
                         inverse: Some(VaultOp::Promote { id }),
                         label: op_label("Demote", false, &label_display(&display)),
                         created: vec![],
                     })
                 }
-                Err(e) => Err(format!("demote index: {e}")),
+                Err(e) => Err(("Demote note".to_string(), format!("demote index: {e}"))),
             }
         }
 
         VaultOp::SetKind { id, kind } => {
-            let meta = index
-                .read()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let meta = index.read().unwrap().get(id).cloned().ok_or_else(|| {
+                let label = "Edit note".to_string();
+                (label, format!("note {id} not found in index"))
+            })?;
             let old_kind = meta.kind;
             let is_fleeting = meta.status == Status::Fleeting;
             let display = meta
@@ -609,14 +620,16 @@ fn execute_op(
             let rel_path = meta.rel_path.clone();
             let abs_path = vault.abs(&rel_path);
 
-            let content =
-                std::fs::read_to_string(&abs_path).map_err(|e| format!("set_kind read: {e}"))?;
+            let label = op_label("Edit", is_fleeting, &label_display(&display));
+            let content = std::fs::read_to_string(&abs_path)
+                .map_err(|e| (label.clone(), format!("set_kind read: {e}")))?;
             let mut doc = NoteDoc::parse(&content);
             doc.fm.set_kind(kind);
             doc.fm.set_modified(Timestamp::now());
             let new_content = doc.serialize();
 
-            atomic_save(&abs_path, &new_content).map_err(|e| format!("set_kind write: {e}"))?;
+            atomic_save(&abs_path, &new_content)
+                .map_err(|e| (label.clone(), format!("set_kind write: {e}")))?;
 
             if let Some(s) = stat(&abs_path) {
                 ledger.insert(rel_path.clone(), s);
@@ -627,21 +640,19 @@ fn execute_op(
                     index.write().unwrap().upsert(m, &b);
                     Ok(OpResult {
                         inverse: Some(VaultOp::SetKind { id, kind: old_kind }),
-                        label: op_label("Edit", is_fleeting, &label_display(&display)),
+                        label,
                         created: vec![],
                     })
                 }
-                Err(e) => Err(format!("set_kind index: {e}")),
+                Err(e) => Err((label, format!("set_kind index: {e}"))),
             }
         }
 
         VaultOp::SetSource { id, source } => {
-            let meta = index
-                .read()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let meta = index.read().unwrap().get(id).cloned().ok_or_else(|| {
+                let label = "Edit note".to_string();
+                (label, format!("note {id} not found in index"))
+            })?;
             let old_source = meta.source.clone();
             let is_fleeting = meta.status == Status::Fleeting;
             let display = meta
@@ -651,14 +662,16 @@ fn execute_op(
             let rel_path = meta.rel_path.clone();
             let abs_path = vault.abs(&rel_path);
 
-            let content =
-                std::fs::read_to_string(&abs_path).map_err(|e| format!("set_source read: {e}"))?;
+            let label = op_label("Edit", is_fleeting, &label_display(&display));
+            let content = std::fs::read_to_string(&abs_path)
+                .map_err(|e| (label.clone(), format!("set_source read: {e}")))?;
             let mut doc = NoteDoc::parse(&content);
             doc.fm.set_source(source.as_deref());
             doc.fm.set_modified(Timestamp::now());
             let new_content = doc.serialize();
 
-            atomic_save(&abs_path, &new_content).map_err(|e| format!("set_source write: {e}"))?;
+            atomic_save(&abs_path, &new_content)
+                .map_err(|e| (label.clone(), format!("set_source write: {e}")))?;
 
             if let Some(s) = stat(&abs_path) {
                 ledger.insert(rel_path.clone(), s);
@@ -672,21 +685,19 @@ fn execute_op(
                             id,
                             source: old_source,
                         }),
-                        label: op_label("Edit", is_fleeting, &label_display(&display)),
+                        label,
                         created: vec![],
                     })
                 }
-                Err(e) => Err(format!("set_source index: {e}")),
+                Err(e) => Err((label, format!("set_source index: {e}"))),
             }
         }
 
         VaultOp::SetTags { id, tags } => {
-            let meta = index
-                .read()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let meta = index.read().unwrap().get(id).cloned().ok_or_else(|| {
+                let label = "Edit note".to_string();
+                (label, format!("note {id} not found in index"))
+            })?;
             let old_tags: Vec<_> = meta.tags.iter().cloned().collect();
             let is_fleeting = meta.status == Status::Fleeting;
             let display = meta
@@ -696,14 +707,16 @@ fn execute_op(
             let rel_path = meta.rel_path.clone();
             let abs_path = vault.abs(&rel_path);
 
-            let content =
-                std::fs::read_to_string(&abs_path).map_err(|e| format!("set_tags read: {e}"))?;
+            let label = op_label("Edit", is_fleeting, &label_display(&display));
+            let content = std::fs::read_to_string(&abs_path)
+                .map_err(|e| (label.clone(), format!("set_tags read: {e}")))?;
             let mut doc = NoteDoc::parse(&content);
             doc.fm.set_tags(&tags);
             doc.fm.set_modified(Timestamp::now());
             let new_content = doc.serialize();
 
-            atomic_save(&abs_path, &new_content).map_err(|e| format!("set_tags write: {e}"))?;
+            atomic_save(&abs_path, &new_content)
+                .map_err(|e| (label.clone(), format!("set_tags write: {e}")))?;
 
             if let Some(s) = stat(&abs_path) {
                 ledger.insert(rel_path.clone(), s);
@@ -714,17 +727,19 @@ fn execute_op(
                     index.write().unwrap().upsert(m, &b);
                     Ok(OpResult {
                         inverse: Some(VaultOp::SetTags { id, tags: old_tags }),
-                        label: op_label("Edit", is_fleeting, &label_display(&display)),
+                        label,
                         created: vec![],
                     })
                 }
-                Err(e) => Err(format!("set_tags index: {e}")),
+                Err(e) => Err((label, format!("set_tags index: {e}"))),
             }
         }
 
-        VaultOp::RenameTitle { .. } => Err("not yet implemented".into()),
+        VaultOp::RenameTitle { .. } => {
+            Err(("Rename note".to_string(), "not yet implemented".to_string()))
+        }
 
-        VaultOp::Split { .. } => Err("not yet implemented".into()),
+        VaultOp::Split { .. } => Err(("Split note".to_string(), "not yet implemented".to_string())),
 
         VaultOp::Batch(ops) => {
             let mut done_inverses: Vec<VaultOp> = Vec::new();
@@ -742,12 +757,13 @@ fn execute_op(
                             first_label = Some(result.label);
                         }
                     }
-                    Err(msg) => {
-                        // Rollback in reverse order (best-effort)
+                    Err((label, msg)) => {
+                        // Rollback in reverse order (best-effort; ignore rollback errors)
                         for inv in done_inverses.into_iter().rev() {
                             let _ = execute_op(vault, index, id_gen, ledger, emit, inv);
                         }
-                        return Err(msg);
+                        // Return the failing member's label with the error
+                        return Err((label, msg));
                     }
                 }
             }
@@ -778,10 +794,7 @@ fn handle_command(
         VaultCommand::Op { op, source } => {
             match execute_op(vault, index, id_gen, ledger, emit, op) {
                 Ok(result) => emit(VaultEvent::OpDone { result, source }),
-                Err(msg) => emit(VaultEvent::OpFailed {
-                    label: "Operation".into(),
-                    message: msg,
-                }),
+                Err((label, message)) => emit(VaultEvent::OpFailed { label, message }),
             }
         }
 
