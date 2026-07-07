@@ -151,6 +151,8 @@ pub fn text_format(style: SpanStyle, th: &Theme) -> TextFormat {
             f.color = th.text_weak;
         }
         SpanStyle::ListMarker => f.color = th.text_weak,
+        // TODO(WP3): face-only ☐/☑ glyph substitution + click-to-toggle (needs a face-side text
+        // transform; the editor must keep raw source).
         SpanStyle::TaskBoxUnchecked | SpanStyle::TaskBoxChecked => f.color = th.text_weak,
         SpanStyle::QuoteMarker => f.color = th.text_weak,
         SpanStyle::Quote => f.font_id = named("inter-italic", BODY_SIZE),

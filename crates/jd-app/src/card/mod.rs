@@ -39,7 +39,7 @@ pub struct CardFace<'a> {
 ///   2. Outline fill (paper cream / plain bg)
 ///   3. Ruled lines (IndexCard/Literature + Paper only)
 ///   4. Divider tab bg + title-on-tab  /  Literature footer strip
-///   5. Title galley (inter-bold 17.0) for non-Scrap, non-Divider
+///   5. (removed) — title IS the body's first heading; layout_body renders it
 ///   6. Body galley (layout_body, clipped, 10 px margin)
 ///   7. Focus ring (2 px `focus_ring`) when `face.focused`
 pub fn card_face(
@@ -72,14 +72,21 @@ pub fn card_face(
         .trim_start_matches('#')
         .trim();
 
-    let label = card_a11y_label(
-        face.title,
-        first_body_line,
+    // Build the a11y label inside the closure (move) so no `.clone()` is needed.
+    let (title, fbl, is_scrap, links, tags) = (
+        face.title.to_owned(),
+        first_body_line.to_owned(),
         face.shape == CardShape::Scrap,
         face.links,
         face.tags,
     );
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone()));
+    resp.widget_info(move || {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            true,
+            card_a11y_label(&title, &fbl, is_scrap, links, tags),
+        )
+    });
 
     let painter = ui.painter();
 
@@ -179,48 +186,58 @@ pub fn card_face(
     }
 
     // -----------------------------------------------------------------------
-    // 5. Title galley (non-Scrap, non-Divider)
+    // 5. Title galley — REMOVED for IndexCard/Literature.
+    //
+    // In this vault format the note title IS the body's first `#` heading, so
+    // the body galley (layout_body) already renders it large/bold.  Painting a
+    // separate title string here would duplicate it on every real card face.
+    //
+    // Divider: title lives on the tab (step 4a); no title in body area.
+    // Scrap:   no title concept.
     // -----------------------------------------------------------------------
-    let body_top = if face.shape == CardShape::Literature {
-        // Leave room for the title above the body, but still place it
-        rect.min.y + 8.0
-    } else {
-        rect.min.y + 10.0
-    };
-
-    if face.shape != CardShape::Scrap && face.shape != CardShape::Divider && !face.title.is_empty()
-    {
-        let title_font = egui::FontId::new(17.0, egui::FontFamily::Name("inter-bold".into()));
-        painter.text(
-            egui::pos2(rect.min.x + 10.0, body_top),
-            egui::Align2::LEFT_TOP,
-            face.title,
-            title_font,
-            th.text,
-        );
-    }
 
     // -----------------------------------------------------------------------
     // 6. Body galley
     // -----------------------------------------------------------------------
     if let Some(body_text) = face.body {
-        // For Scrap: start at top with 10px margin; no separate title.
-        // For Literature: start below title + leave footer room.
-        // For Divider/IndexCard: start below title with margin.
-        let content_top = match face.shape {
-            CardShape::Scrap => rect.min.y + 10.0,
-            CardShape::Divider => rect.min.y + 10.0,
-            CardShape::Literature => body_top + 22.0,
-            CardShape::IndexCard => body_top + 22.0,
-        };
+        // For IndexCard/Literature the body galley starts near the top — the
+        // first heading line IS the title, rendered large/bold by layout_body.
+        // For Scrap/Divider: also start at top with 10 px margin.
+        // Literature: leave room at the bottom for the footer strip.
+        let content_top = rect.min.y + 10.0;
         let content_bottom = if face.shape == CardShape::Literature {
             rect.max.y - FOOTER_H - 4.0
         } else {
             rect.max.y - 10.0
         };
 
+        // For Divider: the title is already on the tab, so strip the first
+        // heading line from the body before rendering to avoid duplication.
+        // (The shared layouter must keep the raw source byte-exact for the
+        // editor's cursor mapping; we do the strip here, face-side only.)
+        let body_for_layout: &str;
+        let stripped_body: String;
+        if face.shape == CardShape::Divider && !face.title.is_empty() {
+            let first_line_end = body_text
+                .find('\n')
+                .map(|i| i + 1)
+                .unwrap_or(body_text.len());
+            let first_line = body_text[..first_line_end]
+                .trim_end_matches('\n')
+                .trim_start_matches('#')
+                .trim();
+            if first_line == face.title {
+                stripped_body = body_text[first_line_end..].to_owned();
+                body_for_layout = &stripped_body;
+            } else {
+                body_for_layout = body_text;
+            }
+        } else {
+            body_for_layout = body_text;
+        }
+
         let wrap_width = rect.width() - 20.0;
-        let galley = layout_body(ui, body_text, wrap_width, cache, &|_| false, th);
+        let galley = layout_body(ui, body_for_layout, wrap_width, cache, &|_| false, th);
 
         let clip_rect = egui::Rect::from_min_max(
             egui::pos2(rect.min.x + 10.0, content_top),
