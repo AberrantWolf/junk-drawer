@@ -333,7 +333,20 @@ impl SearchIndex {
                 candidates.retain(|id| !posts.contains_key(id));
             }
         }
-        candidates.retain(|id| q.phrases.iter().all(|p| self.phrase_matches(p, *id)));
+        // Hoist per-word postings maps once, outside the per-doc retain loop.
+        // Each phrase word previously did a BTreeMap lookup + HashMap probe per
+        // candidate doc; now only the HashMap probe happens per doc.
+        let phrase_postings: Vec<Vec<&HashMap<NoteId, Vec<u32>>>> = q
+            .phrases
+            .iter()
+            .map(|phrase| phrase.iter().filter_map(|w| self.terms.get(w)).collect())
+            .collect();
+        candidates.retain(|id| {
+            phrase_postings
+                .iter()
+                .zip(&q.phrases)
+                .all(|(maps, phrase)| Self::phrase_matches_hoisted(maps, phrase.len(), *id))
+        });
 
         // Pre-resolve each group's term → (&postings_map, df) once, outside the
         // per-candidate loop.  This avoids one BTreeMap lookup per term per candidate.
@@ -429,10 +442,20 @@ impl SearchIndex {
         hits
     }
 
-    fn phrase_matches(&self, phrase: &[String], id: NoteId) -> bool {
+    /// Check phrase adjacency using pre-hoisted postings maps (one per word).
+    /// `maps` must have the same length as the phrase; each entry is the
+    /// doc→positions map for that word, looked up once before the retain loop.
+    fn phrase_matches_hoisted(
+        maps: &[&HashMap<NoteId, Vec<u32>>],
+        phrase_len: usize,
+        id: NoteId,
+    ) -> bool {
+        if maps.len() != phrase_len {
+            return false;
+        }
         let mut anchors: Option<Vec<u32>> = None;
-        for word in phrase {
-            let Some(positions) = self.terms.get(word).and_then(|p| p.get(&id)) else {
+        for posts in maps {
+            let Some(positions) = posts.get(&id) else {
                 return false;
             };
             anchors = Some(match anchors {
