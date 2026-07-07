@@ -934,3 +934,291 @@ fn inbox_promote_event_opens_editor_with_pending_promotion() {
         );
     }
 }
+
+// ===========================================================================
+// Task 5: Toss / Delete / Trash surface
+// ===========================================================================
+
+/// Create a permanent note, place it on the desk, and return (vault, harness, id, desk_id).
+fn app_with_permanent_card() -> (common::TempDir, Harness<'static, JdUi>, NoteId, DeskId) {
+    let vault = common::temp_vault();
+    let mut app = JdUi::new(vault.path()).expect("JdUi::new");
+    let seed = jd_core::note::NewNote {
+        body: "# My Permanent Card\nbody text".to_owned(),
+        status: jd_core::note::Status::Permanent,
+        kind: jd_core::note::Kind::Note,
+        source: None,
+        tags: Vec::new(),
+    };
+    app.vault
+        .commands
+        .send(VaultCommand::Op {
+            op: VaultOp::Create {
+                seed,
+                dest: Dest::Notes,
+            },
+            source: OpSource::User,
+        })
+        .unwrap();
+    let note_id = loop {
+        match app
+            .vault
+            .events
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("OpDone for permanent card")
+        {
+            VaultEvent::OpDone { result, .. } => {
+                break result.created.into_iter().next().expect("Create yields id");
+            }
+            VaultEvent::ScanComplete { .. } => {
+                app.state.scan_done = true;
+                app.state.bodies.invalidate_all();
+                if app.state.session.desks.is_empty() {
+                    use jd_core::id::IdGen;
+                    let mut id_gen = IdGen::new();
+                    let desk_id = DeskId::generate(&mut id_gen);
+                    let _ = app.state.session.apply(&SessionOp::CreateDesk {
+                        id: desk_id,
+                        name: "Desk".into(),
+                    });
+                    app.state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+                }
+            }
+            _ => continue,
+        }
+    };
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .build_ui_state(|ui, app: &mut JdUi| app.ui(ui), app);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.scan_done && !a.state.session.desks.is_empty(),
+        200,
+        "scan + desk",
+    );
+    let desk_id = h.state().state.session.desks[0].id;
+    let _ = h.state_mut().state.session.apply(&SessionOp::Place {
+        desk: desk_id,
+        id: note_id,
+        pos: Vec2 { x: 400.0, y: 200.0 },
+    });
+    // Focus the card.
+    h.state_mut().state.focus = Some(note_id);
+    h.run_ok();
+    (vault, h, note_id, desk_id)
+}
+
+/// Del on a focused Fleeting note on the desk tosses it immediately (no confirm).
+#[test]
+fn del_on_desk_fleeting_tosses_immediately_no_confirm() {
+    let (_v, mut h, ids) = app_with_fleeting(1);
+    let id = ids[0];
+
+    // Place on desk and focus.
+    {
+        let app = h.state_mut();
+        let desk_id = app.state.session.desks[0].id;
+        let _ = app.state.session.apply(&SessionOp::Place {
+            desk: desk_id,
+            id,
+            pos: Vec2 { x: 300.0, y: 200.0 },
+        });
+        app.state.focus = Some(id);
+        app.state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+    }
+    h.run_ok();
+
+    // Press Delete.
+    h.key_press(egui::Key::Delete);
+    h.run_ok();
+
+    // No confirm modal should appear (pending_confirm is None).
+    assert!(
+        h.state().state.pending_confirm.is_none(),
+        "Del on Fleeting must NOT open confirm modal"
+    );
+
+    // Toss completes: note gone from index.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id).is_none()
+        },
+        200,
+        "toss to complete after Del on fleeting desk card",
+    );
+
+    let idx = h.state().vault.index.read().unwrap();
+    assert!(idx.get(id).is_none(), "tossed note must be gone from index");
+}
+
+/// Del on a Permanent card on the desk opens the confirm modal.
+#[test]
+fn del_on_desk_permanent_opens_confirm_modal() {
+    let (_v, mut h, note_id, _desk_id) = app_with_permanent_card();
+
+    // Press Delete.
+    h.key_press(egui::Key::Delete);
+    h.run_ok();
+
+    // pending_confirm must be set to the note's id.
+    assert_eq!(
+        h.state().state.pending_confirm,
+        Some(note_id),
+        "Del on Permanent must set pending_confirm to the note id"
+    );
+
+    // The confirm modal heading must be visible.
+    h.get_by_label("Delete card");
+}
+
+/// Del on Permanent, then Esc cancels: note is still present, no delete fired.
+#[test]
+fn del_permanent_then_esc_cancels_no_delete() {
+    let (_v, mut h, note_id, _desk_id) = app_with_permanent_card();
+
+    // Press Delete → confirm modal opens.
+    h.key_press(egui::Key::Delete);
+    h.run_ok();
+    assert_eq!(h.state().state.pending_confirm, Some(note_id));
+
+    // Press Esc → cancel.
+    h.key_press(egui::Key::Escape);
+    h.run_ok();
+
+    // pending_confirm must be cleared.
+    assert!(
+        h.state().state.pending_confirm.is_none(),
+        "Esc must clear pending_confirm"
+    );
+
+    // Note must still be present in the index.
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert!(
+            idx.get(note_id).is_some(),
+            "note must still exist after Esc cancel"
+        );
+    }
+}
+
+/// Del on Permanent, then Enter confirms: note moves to trash.
+#[test]
+fn del_permanent_then_enter_confirms_moves_to_trash() {
+    let (vault, mut h, note_id, _desk_id) = app_with_permanent_card();
+
+    // Press Delete → confirm modal opens.
+    h.key_press(egui::Key::Delete);
+    h.run_ok();
+    assert_eq!(h.state().state.pending_confirm, Some(note_id));
+
+    // Press Enter → confirm delete.
+    h.key_press(egui::Key::Enter);
+    h.run_ok();
+
+    // pending_confirm must be cleared.
+    assert!(
+        h.state().state.pending_confirm.is_none(),
+        "Enter must clear pending_confirm"
+    );
+
+    // Wait for Delete to complete: note gone from index.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(note_id).is_none()
+        },
+        200,
+        "delete to complete after Del+Enter on permanent card",
+    );
+
+    // Note must be in the trash directory (has a .meta sidecar).
+    let trash_dir = vault.path().join(".junkdrawer/trash");
+    let meta_path = trash_dir.join(format!("{note_id}.meta"));
+    assert!(
+        meta_path.exists(),
+        "deleted note must have a .meta sidecar in trash"
+    );
+}
+
+/// Toss a Fleeting scrap: disappears from inbox, appears in trash listing.
+/// Restore: note back in inbox (still Fleeting).
+#[test]
+fn toss_scrap_appears_in_trash_restore_back_in_inbox() {
+    let (_v, mut h, ids) = app_with_staggered_fleeting();
+    let id = ids[0];
+
+    // Toss via InboxEvent::Toss.
+    {
+        use jd_app::surfaces::inbox::InboxEvent;
+        h.state_mut().apply_inbox_event(InboxEvent::Toss(id));
+    }
+
+    // Wait for toss to complete (note removed from fleeting index).
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id).is_none()
+        },
+        200,
+        "toss to complete",
+    );
+
+    // Note is gone from fleeting list.
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert!(
+            !idx.fleeting().contains(&id),
+            "tossed note must not be in fleeting"
+        );
+    }
+
+    // Switch to Trash surface: row must be visible.
+    h.state_mut().state.session.current_surface = Some(SurfaceId::Trash);
+    h.run_ok();
+    h.get_by_label_contains("Trashed:");
+
+    // Restore via TrashEvent::Restore.
+    {
+        use jd_app::surfaces::trash::TrashEvent;
+        h.state_mut().apply_trash_event(TrashEvent::Restore(id));
+    }
+
+    // Wait for Restore to complete: note back in index.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id).is_some()
+        },
+        200,
+        "restore to complete",
+    );
+
+    // Note is back in the fleeting index (status preserved).
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let meta = idx.get(id).expect("restored note must be in index");
+        assert_eq!(
+            meta.status,
+            jd_core::note::Status::Fleeting,
+            "restored note must still be Fleeting"
+        );
+        assert!(
+            idx.fleeting().contains(&id),
+            "restored note must be in fleeting list"
+        );
+    }
+}
+
+/// Trash surface: retention notice is visible.
+#[test]
+fn trash_surface_shows_retention_notice() {
+    let (_v, mut h, _ids) = app_with_fleeting(0);
+    h.state_mut().state.session.current_surface = Some(SurfaceId::Trash);
+    h.run_ok();
+    h.get_by_label_contains("30 days");
+}

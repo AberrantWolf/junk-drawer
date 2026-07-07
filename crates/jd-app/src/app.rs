@@ -19,6 +19,7 @@ use crate::rail::{RailEvent, RailUiDeps};
 use crate::state::UiState;
 use crate::surfaces::desk::{DeskEvent, DeskUiDeps, DragState, FaceMeta};
 use crate::surfaces::inbox::{InboxEvent, InboxUiDeps};
+use crate::surfaces::trash::{TrashEvent, TrashUiDeps};
 
 /// Repaint hook: the worker wakes us between frames; the egui Context only
 /// exists once the first frame runs, so it's injected lazily.
@@ -497,6 +498,60 @@ impl JdUi {
                     source: OpSource::User,
                 });
             }
+
+            // ------------------------------------------------------------------
+            // Del key: toss or delete the focused card (Task 5).
+            // Fleeting → VaultOp::Toss immediately (no confirm).
+            // Permanent → open delete-confirm modal (pending_confirm).
+            // Inbox surface handles Del for its own fleeting list; this branch
+            // handles the desk surface (where both Fleeting and Permanent notes
+            // may be focused) and the Trash surface (no-op).
+            // When a confirm modal is already pending, Del is a no-op here
+            // (Enter/Esc in the modal section below handles it).
+            // ------------------------------------------------------------------
+            let del_pressed = ui.input(|i| i.key_pressed(egui::Key::Delete));
+            if del_pressed
+                && self.state.pending_confirm.is_none()
+                && matches!(
+                    self.state.session.current_surface,
+                    Some(jd_core::session::SurfaceId::Desk(_))
+                )
+                && let Some(focused_id) = self.state.focus
+            {
+                let is_fleeting = {
+                    let idx = self.vault.index.read().unwrap();
+                    idx.get(focused_id)
+                        .map(|m| m.status == jd_core::note::Status::Fleeting)
+                        .unwrap_or(false)
+                };
+                if is_fleeting {
+                    let _ = self.vault.commands.send(VaultCommand::Op {
+                        op: VaultOp::Toss { id: focused_id },
+                        source: OpSource::User,
+                    });
+                } else {
+                    // Permanent note: open the confirm modal.
+                    self.state.pending_confirm = Some(focused_id);
+                }
+            }
+
+            // ------------------------------------------------------------------
+            // Delete-confirm modal (Task 5): Enter = confirm delete, Esc = cancel.
+            // Runs whenever pending_confirm is Some, regardless of surface.
+            // ------------------------------------------------------------------
+            if let Some(confirm_id) = self.state.pending_confirm {
+                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if enter_pressed {
+                    self.state.pending_confirm = None;
+                    let _ = self.vault.commands.send(VaultCommand::Op {
+                        op: VaultOp::Delete { id: confirm_id },
+                        source: OpSource::User,
+                    });
+                } else if esc_pressed {
+                    self.state.pending_confirm = None;
+                }
+            }
         }
 
         // 4. Render: left rail + central surface + status line; editor overlay (Task 10).
@@ -666,8 +721,17 @@ impl JdUi {
                     self.apply_inbox_events(evts);
                 }
 
-                // Task 5: Trash surface — placeholder until it lands.
-                Some(SurfaceId::Trash) | None => {
+                // Task 5: Trash surface.
+                Some(SurfaceId::Trash) => {
+                    let mut deps = TrashUiDeps {
+                        vault_ref: &self.vault_ref,
+                        theme: &self.theme,
+                    };
+                    let evts = crate::surfaces::trash::trash_ui(ui, &mut deps);
+                    self.apply_trash_events(evts);
+                }
+
+                None => {
                     crate::surfaces::placeholder::placeholder_ui(ui);
                 }
 
@@ -741,6 +805,51 @@ impl JdUi {
             self.state.session_dirty_at = Some(std::time::Instant::now());
             // Return focus to the desk card by clearing the focused-widget memory.
             ui.ctx().memory_mut(|mem| mem.stop_text_input());
+        }
+
+        // 4c. Delete-confirm modal (Task 5).
+        // Rendered as a centred egui::Modal when pending_confirm is Some.
+        // Enter = Delete (VaultOp::Delete → moves to Trash), Esc = Cancel.
+        // The keyboard dispatch in section 3 (above) already handles Enter/Esc
+        // and clears pending_confirm; this block renders the visible dialog.
+        if let Some(confirm_id) = self.state.pending_confirm {
+            let title = {
+                let idx = self.vault.index.read().unwrap();
+                idx.get(confirm_id)
+                    .and_then(|m| m.title.clone())
+                    .unwrap_or_else(|| {
+                        idx.get(confirm_id)
+                            .map(|m| m.first_line.clone())
+                            .unwrap_or_default()
+                    })
+            };
+            let modal =
+                egui::Modal::new(egui::Id::new("delete_confirm_modal")).show(ui.ctx(), |ui| {
+                    ui.set_width(320.0);
+                    ui.heading("Delete card");
+                    ui.add_space(8.0);
+                    ui.label(format!("Delete '{title}'? It moves to Trash."));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        // "Delete" button — same as pressing Enter.
+                        let delete_btn = ui.button("Delete");
+                        let cancel_btn = ui.button("Cancel");
+                        if delete_btn.clicked() {
+                            self.state.pending_confirm = None;
+                            let _ = self.vault.commands.send(VaultCommand::Op {
+                                op: VaultOp::Delete { id: confirm_id },
+                                source: OpSource::User,
+                            });
+                        }
+                        if cancel_btn.clicked() {
+                            self.state.pending_confirm = None;
+                        }
+                    });
+                });
+            // Dismiss on click outside the modal.
+            if modal.should_close() {
+                self.state.pending_confirm = None;
+            }
         }
 
         // 5. Debounced saves: if session_dirty_at elapsed > 1s → save and clear.
@@ -925,6 +1034,25 @@ impl JdUi {
     fn apply_inbox_events(&mut self, events: Vec<InboxEvent>) {
         for ev in events {
             self.apply_inbox_event(ev);
+        }
+    }
+
+    /// Apply a single `TrashEvent` — public so kitests can dispatch events directly.
+    pub fn apply_trash_event(&mut self, ev: TrashEvent) {
+        match ev {
+            TrashEvent::Restore(id) => {
+                let _ = self.vault.commands.send(VaultCommand::Op {
+                    op: VaultOp::Restore { id },
+                    source: OpSource::User,
+                });
+            }
+        }
+    }
+
+    /// Apply `TrashEvent`s emitted by `trash_ui`.
+    fn apply_trash_events(&mut self, events: Vec<TrashEvent>) {
+        for ev in events {
+            self.apply_trash_event(ev);
         }
     }
 

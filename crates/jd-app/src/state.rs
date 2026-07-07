@@ -119,6 +119,10 @@ pub struct UiState {
     /// body hasn't arrived yet (deferred open via drain_events Body event),
     /// stash the flag here so the Body handler can forward it.
     pub pending_open_promotion: bool,
+    /// WP3 Task 5: delete-confirm pending for this NoteId (Permanent note only).
+    /// Set when Del is pressed on a Permanent note; cleared by Enter (confirm)
+    /// or Esc (cancel) in the confirm modal.
+    pub pending_confirm: Option<NoteId>,
 }
 
 impl Default for UiState {
@@ -136,6 +140,7 @@ impl Default for UiState {
             text_undo: HashMap::new(),
             pending_label: None,
             pending_open_promotion: false,
+            pending_confirm: None,
         }
     }
 }
