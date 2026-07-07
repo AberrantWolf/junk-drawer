@@ -552,7 +552,11 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
         if resp.double_clicked() {
             events.push(DeskEvent::OpenCard(card.id));
         }
-        if is_focused {
+        // Only hold keyboard focus on the card when the editor is closed.
+        // While the editor modal is open, its TextEdit owns keyboard focus;
+        // stealing it here every frame would prevent Event::Text from reaching
+        // the TextEdit (desk renders inside CentralPanel, before the modal overlay).
+        if is_focused && !state.editor_open {
             resp.request_focus();
         }
     }

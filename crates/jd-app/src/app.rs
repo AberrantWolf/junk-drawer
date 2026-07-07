@@ -424,15 +424,19 @@ impl JdUi {
             };
             let ev = crate::editor::editor_ui(ui, ed, &mut deps);
             if matches!(ev, crate::editor::EditorEvent::CloseAndSave) {
-                // Always save on close — SaveBody is idempotent and the editor
-                // may have unsaved changes from autosave timing gaps.
-                let _ = self.vault.commands.send(VaultCommand::Op {
-                    op: jd_core::command::VaultOp::SaveBody {
-                        id: ed.id,
-                        content: ed.buffer.clone(),
-                    },
-                    source: jd_core::command::OpSource::User,
-                });
+                // Only save when the buffer was actually modified.  A clean
+                // open→close must not write the file (which would invalidate
+                // the body cache via the watcher echo and push a phantom undo
+                // entry with label "Save body").
+                if ed.dirty {
+                    let _ = self.vault.commands.send(VaultCommand::Op {
+                        op: jd_core::command::VaultOp::SaveBody {
+                            id: ed.id,
+                            content: ed.buffer.clone(),
+                        },
+                        source: jd_core::command::OpSource::User,
+                    });
+                }
                 self.state.editor = None;
                 self.state.session.open_card = None;
                 self.state.session_dirty_at = Some(std::time::Instant::now());
@@ -465,10 +469,7 @@ impl JdUi {
                     // Kick off the body fetch (or use cached body immediately).
                     // If the body is already cached, open the editor right now.
                     // If not, drain_events will open it when the Body event arrives.
-                    if let Some(cached) = self
-                        .state
-                        .bodies
-                        .get_or_request(id, &self.vault.commands)
+                    if let Some(cached) = self.state.bodies.get_or_request(id, &self.vault.commands)
                         && self.state.editor.is_none()
                     {
                         self.state.editor =

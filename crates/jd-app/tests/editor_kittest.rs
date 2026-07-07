@@ -130,18 +130,17 @@ fn enter_opens_editor_esc_saves_and_closes() {
     // Open the editor.
     open_editor(&mut h, id);
 
-    // Editor widget must be present.
+    // Editor widget must be present and focused (open_editor already called
+    // node.focus() + node.click() + h.run_ok(); the desk fix ensures the card's
+    // request_focus() does not steal focus back while the editor modal is open).
     h.get_by_role(egui::accesskit::Role::MultilineTextInput);
 
-    // Directly mutate the editor buffer and mark dirty (simulates a user typing).
-    // kittest Event::Text works only for the focused widget; in a Modal the
-    // TextEdit focus is reported by egui but the accessibility tree may not
-    // surface it via the node's type_text path.  Direct mutation tests the
-    // save/close round-trip, which is the spec's goal.
-    if let Some(ed) = h.state_mut().state.editor.as_mut() {
-        ed.buffer.push_str(" again");
-        ed.dirty = true;
-    }
+    // Drive typing through real egui events.
+    // open_editor leaves the TextEdit focused; type_text queues Event::Text which
+    // the focused TextEdit processes in the next step().
+    let node = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+    node.type_text(" again");
+    h.step();
     h.run_ok();
 
     // Wait for Esc close + SaveBody OpDone.
@@ -234,6 +233,60 @@ fn autosave_fires_after_a_quiet_second() {
 }
 
 #[test]
+fn open_close_without_edit_leaves_mtime_unchanged() {
+    // Dirty-gate: opening and immediately closing the editor (no typing) must NOT
+    // write the file, push a "Save body" journal entry, or invalidate the body cache
+    // via the watcher echo.
+    let (vault, mut h, id) = app_with_one_card("untouched body");
+
+    // Capture the note file path and its mtime before opening.
+    let abs = {
+        let idx = h.state().vault.index.read().unwrap();
+        let meta = idx.get(id).expect("note in index");
+        vault.path().join(&meta.rel_path)
+    };
+    let mtime_before = std::fs::metadata(&abs)
+        .expect("note file exists")
+        .modified()
+        .expect("mtime");
+
+    // Record the journal depth before opening.
+    let journal_len_before = h.state().state.journal.len();
+
+    // Open the editor and immediately close with Esc — no typing.
+    open_editor(&mut h, id);
+    h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+    h.key_press(egui::Key::Escape);
+    common::pump(
+        &mut h,
+        &mut |a: &jd_app::app::JdUi| a.state.editor.is_none(),
+        100,
+        "editor closes on Esc (no edit)",
+    );
+
+    // Give the worker a moment — if a SaveBody were sent it would arrive here.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    h.run_ok();
+
+    // File mtime must be unchanged (no write happened).
+    let mtime_after = std::fs::metadata(&abs)
+        .expect("note file still exists")
+        .modified()
+        .expect("mtime after");
+    assert_eq!(
+        mtime_before, mtime_after,
+        "clean open→close must not write the file (mtime changed)"
+    );
+
+    // No phantom journal entry must have been pushed for the SaveBody.
+    let journal_len_after = h.state().state.journal.len();
+    assert_eq!(
+        journal_len_before, journal_len_after,
+        "clean open→close must not push a phantom journal entry (was {journal_len_before}, now {journal_len_after})"
+    );
+}
+
+#[test]
 fn editor_styles_headings_larger() {
     use std::sync::{Arc, Mutex};
 
@@ -244,9 +297,15 @@ fn editor_styles_headings_larger() {
     // The editor must be open with a MultilineTextInput.
     h.get_by_role(egui::accesskit::Role::MultilineTextInput);
 
-    // Capture galley row heights via a side-channel in the editor state.
-    // We inspect the LineCache behavior indirectly: the editor state is accessible.
-    // We verify via layout_body directly (same approach as spike_layouter.rs).
+    // NOTE: This test covers layout_body in isolation (a standalone Harness below).
+    // The wiring between JdUi, the modal TextEdit, and the layouter is exercised by
+    // enter_opens_editor_esc_saves_and_closes and ctrl_enter_closes_too, which drive
+    // real typing through the AccessKit node via the real editor modal.
+    //
+    // Galley row-height capture uses a standalone harness because egui's layouter
+    // closure is local to editor_ui and cannot be extracted from the running JdUi
+    // harness without invasive instrumentation.  The standalone harness runs the
+    // same layout_body function with the same font installation path.
     let row_heights: Arc<Mutex<Option<(f32, f32)>>> = Arc::new(Mutex::new(None));
     let rh = row_heights.clone();
 
@@ -295,11 +354,11 @@ fn ctrl_enter_closes_too() {
     open_editor(&mut h, id);
     h.get_by_role(egui::accesskit::Role::MultilineTextInput);
 
-    // Directly mutate the editor buffer and mark dirty (simulates typing).
-    if let Some(ed) = h.state_mut().state.editor.as_mut() {
-        ed.buffer.push_str(" extra");
-        ed.dirty = true;
-    }
+    // Drive typing through real egui events (same pattern as
+    // enter_opens_editor_esc_saves_and_closes).
+    let node = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+    node.type_text(" extra");
+    h.step();
     h.run_ok();
 
     // Ctrl+Enter → CloseAndSave.

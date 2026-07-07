@@ -198,11 +198,8 @@ pub fn editor_ui(
 ) -> EditorEvent {
     // --- build the resolve closure from the index ---
     let index_guard = deps.index.read().unwrap();
-    // SAFETY: the guard lives for the duration of this function; the closure
-    // borrows the guard's data.  We transmute the lifetime so the closure can
-    // be stored as `dyn Fn + '_` without the borrow checker fighting the
-    // `layouter` closure below.  This is safe because both closures are stack-
-    // allocated and outlive each other exactly.
+    // `index_guard` lives for the duration of this function; `resolve_fn` borrows
+    // it immutably.  Both are stack-local, so the lifetime is sound.
     let resolve_fn = |title: &str| index_guard.resolve_title(title).is_some();
 
     let mut close_requested = false;
