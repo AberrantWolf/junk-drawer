@@ -257,6 +257,10 @@ impl JdUi {
                     // evicted from the desk immediately after the op completes.
                     // We scan all desk card ids against the current index — O(n*m) but
                     // n (desk cards) and m (op executions) are both small in practice.
+                    // Note: this retain runs on every OpDone regardless of op family.
+                    // A tighter gate (e.g. only when result.created is non-empty or the
+                    // inverse involves Delete/Toss) would reduce overhead, but the op
+                    // frequency and desk sizes are both small, so the breadth is accepted.
                     {
                         let idx = self.vault.index.read().unwrap();
                         let mut any_removed = false;
@@ -290,8 +294,14 @@ impl JdUi {
                     {
                         self.state.pending_split = None;
                         let split_off_id = result.created[0];
-                        // Find the current desk.
-                        if let Some(SurfaceId::Desk(desk_id)) = self.state.session.current_surface {
+                        // Resolve the desk to place on: prefer current desk, fall back to
+                        // the first desk when current_surface is Inbox or another non-desk
+                        // surface (e.g. the user opened a scrap from the Inbox and split it).
+                        let desk_id = match self.state.session.current_surface {
+                            Some(SurfaceId::Desk(id)) => Some(id),
+                            _ => self.state.session.desks.first().map(|d| d.id),
+                        };
+                        if let Some(desk_id) = desk_id {
                             // Determine the original card's position on this desk.
                             let orig_pos = self
                                 .state
@@ -328,7 +338,7 @@ impl JdUi {
                             // (The actual card size may differ if the split-off is a Scrap,
                             // but we use the host card's nominal width for a clean layout.)
                             let split_off_pos = CoreVec2 {
-                                x: orig_pos.x + 300.0 + 24.0,
+                                x: orig_pos.x + 324.0,
                                 y: orig_pos.y,
                             };
                             self.state.session.apply(&SessionOp::Place {
@@ -337,6 +347,32 @@ impl JdUi {
                                 pos: split_off_pos,
                             });
                             self.state.session_dirty_at = Some(std::time::Instant::now());
+                            // When the split was triggered from a non-desk surface, echo
+                            // the placement so the act isn't silent.
+                            if !matches!(
+                                self.state.session.current_surface,
+                                Some(SurfaceId::Desk(_))
+                            ) {
+                                let desk_name = self
+                                    .state
+                                    .session
+                                    .desks
+                                    .iter()
+                                    .find(|d| d.id == desk_id)
+                                    .map(|d| d.name.as_str())
+                                    .unwrap_or("desk");
+                                self.state.status_echo = Some((
+                                    format!("Split placed on desk '{desk_name}'"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        } else {
+                            // No desks exist — the split cards are in the vault but cannot
+                            // be placed anywhere. This should not happen post-bootstrap.
+                            self.state.status_echo = Some((
+                                "Split cards are in the vault (no desk to place them)".to_owned(),
+                                std::time::Instant::now(),
+                            ));
                         }
                     } else if source == OpSource::User && self.state.pending_split.is_some() {
                         // Split Batch completed but created is empty (shouldn't happen

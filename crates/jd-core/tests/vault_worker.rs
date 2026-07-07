@@ -781,6 +781,79 @@ fn split_of_untitled_tail_makes_a_scrap() {
     assert!(read_body(&h, id).contains("[[and split from here onward]]"));
 }
 
+/// Regression: split at a byte offset past multibyte (non-ASCII) characters must
+/// not land mid-codepoint or drift.  The split-off body must be exactly the suffix
+/// after the split point, and the host body must end with a link to that suffix.
+#[test]
+fn split_non_ascii_body_byte_offset_correct() {
+    let t = TempDir::new();
+    let (h, _) = boot(&t);
+    drain_until(&h, |e| {
+        matches!(e, VaultEvent::ScanComplete { .. }).then_some(())
+    });
+    // Body has multibyte chars ("é" = 2 bytes, "ö" = 2 bytes) before the split point.
+    let body = "# Héllo wörld\nsecond line\n";
+    let id = send_op(
+        &h,
+        VaultOp::Create {
+            seed: perm(body),
+            dest: Dest::Notes,
+        },
+    )
+    .created[0];
+
+    // Split at the start of "second line" — byte offset immediately after the '\n'.
+    // "# Héllo wörld\n" is 16 bytes (h=1, é=2, l=1, l=1, o=1, ' '=1, w=1, ö=2, r=1,
+    // l=1, d=1, \n=1 → "# " (2) + "H" (1) + "é" (2) + "llo" (3) + " " (1) + "w" (1)
+    // + "ö" (2) + "rld" (3) + "\n" (1) = 16 bytes).
+    let at_byte = body
+        .find("second line")
+        .expect("second line must be in body");
+
+    // Verify the byte offset is on a char boundary (defensive assertion).
+    assert!(
+        body.is_char_boundary(at_byte),
+        "test setup: at_byte {at_byte} must be on a char boundary"
+    );
+
+    let split = send_op(&h, VaultOp::Split { id, at_byte });
+    assert_eq!(
+        split.created.len(),
+        1,
+        "split must produce exactly one new note"
+    );
+    let new_id = split.created[0];
+
+    // The split-off body must be exactly the suffix starting at at_byte.
+    let expected_suffix = &body[at_byte..];
+    let split_off_body = read_body(&h, new_id);
+    assert_eq!(
+        split_off_body, expected_suffix,
+        "split-off body must be exactly the suffix after the split point"
+    );
+
+    // The host body must contain only the prefix (up to at_byte) and the wiki-link.
+    let host_body = read_body(&h, id);
+    let expected_prefix = &body[..at_byte];
+    assert!(
+        host_body.starts_with(expected_prefix),
+        "host body must start with the prefix before the split point; \
+         got: {host_body:?}, expected prefix: {expected_prefix:?}"
+    );
+    // Host body must not contain the raw suffix text as a bare line (it moved to
+    // the split-off); it will contain the link text inside [[…]] which is fine.
+    // We check that "second line" only appears inside a wiki-link, not as raw text.
+    assert!(
+        !host_body.contains("\nsecond line\n"),
+        "host body must not contain bare 'second line' text; got: {host_body:?}"
+    );
+    // Host body must contain a wiki-link to the split-off.
+    assert!(
+        host_body.contains("[["),
+        "host body must contain a wiki-link to the split-off; got: {host_body:?}"
+    );
+}
+
 #[test]
 fn external_edit_preserves_created_timestamp() {
     let t = TempDir::new();

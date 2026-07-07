@@ -2850,3 +2850,215 @@ fn drag_to_rail_desk_row_journals_move_card_to_desk() {
         "journal label must identify the target desk"
     );
 }
+
+/// Build a harness with one multiline fleeting scrap in the inbox and the
+/// current surface set to Inbox.  Returns (vault, harness, scrap_id).
+/// The body is "first line\nsecond line\n" so a cursor split is possible.
+fn app_with_multiline_inbox_scrap() -> (common::TempDir, Harness<'static, JdUi>, NoteId) {
+    let vault = common::temp_vault();
+    let mut app = JdUi::new(vault.path()).expect("JdUi::new");
+    let seed = jd_core::note::NewNote {
+        body: "first line\nsecond line\n".to_owned(),
+        status: jd_core::note::Status::Fleeting,
+        kind: jd_core::note::Kind::Note,
+        source: None,
+        tags: Vec::new(),
+    };
+    app.vault
+        .commands
+        .send(VaultCommand::Op {
+            op: VaultOp::Create {
+                seed,
+                dest: Dest::Inbox,
+            },
+            source: OpSource::User,
+        })
+        .unwrap();
+    let scrap_id = loop {
+        match app
+            .vault
+            .events
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("OpDone for multiline scrap")
+        {
+            VaultEvent::OpDone { result, .. } => {
+                break result.created.into_iter().next().expect("Create yields id");
+            }
+            VaultEvent::ScanComplete { .. } => {
+                app.state.scan_done = true;
+                app.state.bodies.invalidate_all();
+                if app.state.session.desks.is_empty() {
+                    use jd_core::id::IdGen;
+                    let mut id_gen = IdGen::new();
+                    let desk_id = DeskId::generate(&mut id_gen);
+                    let _ = app.state.session.apply(&SessionOp::CreateDesk {
+                        id: desk_id,
+                        name: "Main".into(),
+                    });
+                    app.state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+                }
+            }
+            _ => continue,
+        }
+    };
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .build_ui_state(|ui, app: &mut JdUi| app.ui(ui), app);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.scan_done && !a.state.session.desks.is_empty(),
+        200,
+        "scan + desk",
+    );
+    // Switch to Inbox surface.
+    h.state_mut().state.session.current_surface = Some(SurfaceId::Inbox);
+    h.run_ok();
+    (vault, h, scrap_id)
+}
+
+/// Task 8 regression: splitting a scrap that was opened from the Inbox surface
+/// (current_surface == Inbox, not a Desk) must still place BOTH cards on the
+/// first desk, not silently drop them.  A status_echo must also be set.
+#[test]
+fn split_from_inbox_surface_places_both_cards_on_first_desk() {
+    let (_v, mut h, scrap_id) = app_with_multiline_inbox_scrap();
+
+    // Confirm we are on the Inbox surface.
+    assert_eq!(
+        h.state().state.session.current_surface,
+        Some(SurfaceId::Inbox),
+        "must start on Inbox surface"
+    );
+
+    // Wait for body to be cached.
+    let commands = h.state().vault.commands.clone();
+    h.state_mut()
+        .state
+        .bodies
+        .get_or_request(scrap_id, &commands);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.bodies.get_cached(scrap_id).is_some(),
+        200,
+        "body cache populated for inbox scrap",
+    );
+
+    // Open the editor directly (simulates opening a scrap from the inbox).
+    {
+        let app = h.state_mut();
+        let body = app.state.bodies.get_cached(scrap_id).unwrap().text.clone();
+        app.state.editor = Some(jd_app::editor::EditorState::open(
+            scrap_id, body, None, true, // is_fleeting
+            false,
+        ));
+        app.state.session.open_card = Some(scrap_id);
+    }
+    h.run_ok();
+    assert!(
+        h.state().state.editor.is_some(),
+        "editor must be open before split"
+    );
+
+    // Position cursor at start of "second line" (after the first '\n').
+    // Body is "first line\nsecond line\n".
+    let cursor_byte = {
+        let ed = h.state().state.editor.as_ref().unwrap();
+        ed.buffer
+            .find('\n')
+            .map(|p| p + 1)
+            .expect("body must contain a newline to split")
+    };
+    let te_id = egui::Id::new("editor_te");
+    {
+        let char_pos = {
+            let ed = h.state().state.editor.as_ref().unwrap();
+            ed.buffer[..cursor_byte].chars().count()
+        };
+        let mut te_state = egui::text_edit::TextEditState::load(&h.ctx, te_id).unwrap_or_default();
+        te_state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(char_pos),
+            )));
+        te_state.store(&h.ctx, te_id);
+    }
+    h.step();
+
+    // Before split: no cards on the desk (scrap was only in inbox).
+    let desk_card_count_before = h.state().state.session.desks[0].cards.len();
+
+    // Press Ctrl+Shift+Enter to trigger the split.
+    h.key_press_modifiers(
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        egui::Key::Enter,
+    );
+    h.run_ok();
+
+    // Editor must be closed.
+    assert!(
+        h.state().state.editor.is_none(),
+        "editor must close after split"
+    );
+
+    // Wait for the split Batch to complete and pending_split cleared.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            a.state.pending_split.is_none() && {
+                let idx = a.vault.index.read().unwrap();
+                // Original scrap + 1 split-off = at least 2 notes
+                idx.iter_meta().count() >= 2
+            }
+        },
+        200,
+        "split from inbox to complete",
+    );
+    h.run_ok();
+
+    // Both cards must be on the first desk (placed by the fallback path).
+    assert!(
+        h.state().state.session.desks[0]
+            .cards
+            .iter()
+            .any(|c| c.id == scrap_id),
+        "original scrap must be placed on the first desk after inbox split \
+         (desk cards: {:?})",
+        h.state().state.session.desks[0]
+            .cards
+            .iter()
+            .map(|c| c.id)
+            .collect::<Vec<_>>()
+    );
+
+    let split_off_id: NoteId = {
+        let idx = h.state().vault.index.read().unwrap();
+        idx.iter_meta()
+            .map(|m| m.id)
+            .find(|&id| id != scrap_id)
+            .expect("split-off note must exist in index")
+    };
+    assert!(
+        h.state().state.session.desks[0]
+            .cards
+            .iter()
+            .any(|c| c.id == split_off_id),
+        "split-off card must be placed on the first desk after inbox split"
+    );
+
+    // Desk must have gained cards (went from 0 to 2, or grew by 2 if somehow populated).
+    assert_eq!(
+        h.state().state.session.desks[0].cards.len(),
+        desk_card_count_before + 2,
+        "desk must have exactly 2 new cards after inbox-origin split"
+    );
+
+    // A status_echo must have been set (the act must not be silent).
+    let echo = h.state().state.status_echo.as_ref().map(|(s, _)| s.clone());
+    assert!(
+        echo.as_deref()
+            .map(|s| s.contains("Split placed on desk"))
+            .unwrap_or(false),
+        "status_echo must say 'Split placed on desk' after inbox-origin split, got: {:?}",
+        echo
+    );
+}
