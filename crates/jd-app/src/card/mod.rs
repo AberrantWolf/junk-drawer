@@ -33,18 +33,38 @@ pub struct CardFace<'a> {
 
 /// Transform task box markers for face-side display only.
 ///
-/// Replaces `"- [ ] "` with `"- ☐ "` and `"- [x] "` / `"- [X] "` with `"- ☑ "`
+/// Replaces `"- [ ] "` with `"- □ "` and `"- [x] "` / `"- [X] "` with `"- ■ "`
 /// in each line. Returns the transformed text and, for each task box, the
-/// 0-based char offset of the `☐`/`☑` glyph within the returned string.
+/// 0-based char offset of the `□`/`■` glyph within the returned string.
 /// The raw source body is NOT modified.
+///
+/// Lines inside code fences (``` … ```) are skipped — a line whose
+/// `trim_start()` starts with ` ``` ` toggles `in_fence`; while
+/// `in_fence` is true, no task recognition is performed.  This mirrors the
+/// rule used by `jd_core::lexer::lex_line` exactly.
 pub fn face_body_with_checkbox_glyphs(raw: &str) -> (String, Vec<usize>) {
     let mut out = String::with_capacity(raw.len());
     let mut glyph_char_offsets: Vec<usize> = Vec::new();
     let mut char_count = 0usize;
+    let mut in_fence = false;
     for (i, line) in raw.split('\n').enumerate() {
         if i > 0 {
             out.push('\n');
             char_count += 1;
+        }
+        // Fence tracking: a line whose trimmed form starts with ``` toggles
+        // in_fence (mirrors jd_core::lexer::lex_line behaviour).
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            char_count += line.chars().count();
+            continue;
+        }
+        // While inside a fence, copy verbatim — no task recognition.
+        if in_fence {
+            out.push_str(line);
+            char_count += line.chars().count();
+            continue;
         }
         // Check for "- [ ] " or "- [x] " / "- [X] " prefix (after optional leading whitespace).
         let trimmed = line.trim_start();
@@ -61,9 +81,10 @@ pub fn face_body_with_checkbox_glyphs(raw: &str) -> (String, Vec<usize>) {
             char_count += indent + 2; // indent chars (ascii) + "- "
             // Record char offset of the glyph.
             glyph_char_offsets.push(char_count);
-            // Write the glyph.
-            let glyph = if is_checked { "☑" } else { "☐" };
-            out.push_str(glyph);
+            // Write the glyph.  □ (U+25A1) for unchecked, ■ (U+25A0) for checked —
+            // both are covered by the bundled Inter font.
+            let glyph = if is_checked { '■' } else { '□' };
+            out.push(glyph);
             char_count += 1; // one char for the glyph
             // Write the rest after the task box marker ("[ ] " or "[x] " = 4 bytes from trimmed[2..6]).
             let rest = &trimmed[6..]; // skip "[ ] " or "[x] " (4 bytes after "- ")
@@ -81,46 +102,54 @@ pub fn face_body_with_checkbox_glyphs(raw: &str) -> (String, Vec<usize>) {
 /// Toggle the Nth (0-based ordinal) task box in the raw body string.
 /// Returns the new body with `"- [ ]"` ↔ `"- [x]"` toggled.
 /// If the ordinal is out of range, returns the body unchanged.
+///
+/// Recognition matches `face_body_with_checkbox_glyphs` exactly:
+/// - Lines are iterated; task boxes are recognised only at the start of the
+///   line (after optional leading whitespace).
+/// - Lines inside code fences (``` … ```) are skipped.  A line whose
+///   `trim_start()` starts with ` ``` ` toggles `in_fence`.
 pub fn toggle_task_box(raw: &str, ordinal: usize) -> String {
-    let mut count = 0usize;
-    let mut result = String::with_capacity(raw.len());
-    let mut last_end = 0usize;
-    // Find each "- [" occurrence and check for "- [ ] " or "- [x] " / "- [X] ".
-    let bytes = raw.as_bytes();
-    let mut i = 0usize;
-    while i + 5 <= bytes.len() {
-        // Look for "- [" at position i (after any leading whitespace, at start of trimmed line).
-        // We scan for "- [ ] " or "- [x] " / "- [X] ".
-        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b' ' {
-            // Could be a list item. Check if bytes[i+2..i+6] is "[ ] " or "[x] " or "[X] ".
-            if i + 6 <= bytes.len() {
-                let pat = &bytes[i + 2..i + 6];
-                let is_unchecked = pat == b"[ ] ";
-                let is_checked = pat == b"[x] " || pat == b"[X] ";
-                if is_unchecked || is_checked {
-                    if count == ordinal {
-                        // Toggle this box.
-                        result.push_str(&raw[last_end..i + 2]); // up to and including "- "
-                        if is_unchecked {
-                            result.push_str("[x] "); // toggle to checked
-                        } else {
-                            result.push_str("[ ] "); // toggle to unchecked
-                        }
-                        last_end = i + 6; // skip "[ ] " or "[x] "
-                        // Append the rest.
-                        result.push_str(&raw[last_end..]);
-                        return result;
-                    }
-                    count += 1;
-                    i += 6;
-                    continue;
-                }
+    let mut in_fence = false;
+    // Collect (byte_start, is_unchecked) for each recognised task box.
+    let mut boxes: Vec<(usize, bool)> = Vec::new();
+    let mut line_start = 0usize;
+    // Split into lines while tracking byte offsets.
+    for line in raw.split('\n') {
+        let trimmed = line.trim_start();
+        // Fence tracking (mirrors lex_line rule).
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            line_start += line.len() + 1; // +1 for '\n'
+            continue;
+        }
+        if !in_fence {
+            let indent = line.len() - trimmed.len();
+            // Task-box patterns, line-start-only (after optional indent).
+            let is_unchecked = trimmed.starts_with("- [ ] ");
+            let is_checked = trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ");
+            if is_unchecked || is_checked {
+                // Byte offset of the '[' in the raw string.
+                let bracket_pos = line_start + indent + 2; // "- " = 2 bytes
+                boxes.push((bracket_pos, is_unchecked));
             }
         }
-        i += 1;
+        line_start += line.len() + 1;
     }
-    // Ordinal not found; return unchanged.
-    raw.to_owned()
+    // Apply the toggle at the ordinal position.
+    if let Some(&(bracket_pos, is_unchecked)) = boxes.get(ordinal) {
+        let mut result = String::with_capacity(raw.len());
+        result.push_str(&raw[..bracket_pos]);
+        if is_unchecked {
+            result.push_str("[x] ");
+        } else {
+            result.push_str("[ ] ");
+        }
+        result.push_str(&raw[bracket_pos + 4..]); // skip old "[ ] " or "[x] "
+        result
+    } else {
+        // Ordinal not found; return unchanged.
+        raw.to_owned()
+    }
 }
 
 /// Render a card face at `rect` (desk-space; caller has already applied any
@@ -397,9 +426,9 @@ mod tests {
     fn face_body_replaces_task_boxes_with_glyphs() {
         let raw = "# Title\n- [ ] unchecked\n- [x] checked\n- [X] also checked\n- plain item";
         let (face, offsets) = face_body_with_checkbox_glyphs(raw);
-        // Glyph replacements
-        assert!(face.contains("☐"), "must contain ☐ for unchecked");
-        assert!(face.contains("☑"), "must contain ☑ for checked");
+        // Glyph replacements — □ (U+25A1) / ■ (U+25A0), both in Inter.
+        assert!(face.contains('□'), "must contain □ for unchecked");
+        assert!(face.contains('■'), "must contain ■ for checked");
         // Raw markers must not appear in the face body
         assert!(
             !face.contains("- [ ]"),
@@ -460,5 +489,75 @@ mod tests {
         let (face, offsets) = face_body_with_checkbox_glyphs(raw);
         assert_eq!(face, raw, "no task boxes: face body must equal raw");
         assert!(offsets.is_empty(), "no checkbox offsets for task-free body");
+    }
+
+    /// A "- [ ]" line inside a code fence must not produce a glyph on the
+    /// face and must not be counted as a task box ordinal.
+    #[test]
+    fn face_body_skips_task_boxes_inside_code_fence() {
+        let raw = "- [ ] real task one\n```\n- [ ] fenced fake\n```\n- [ ] real task two";
+        let (face, offsets) = face_body_with_checkbox_glyphs(raw);
+        // Only the two real tasks get glyphs.
+        assert_eq!(
+            offsets.len(),
+            2,
+            "fenced task must not produce a glyph offset"
+        );
+        // The fenced line must appear verbatim (no glyph substitution).
+        assert!(
+            face.contains("- [ ] fenced fake"),
+            "fenced task line must be copied verbatim, got: {face:?}"
+        );
+        // The real tasks must be substituted.
+        assert!(
+            face.contains("□ real task one"),
+            "first real task must get □, got: {face:?}"
+        );
+        assert!(
+            face.contains("□ real task two"),
+            "second real task must get □, got: {face:?}"
+        );
+    }
+
+    /// Toggling ordinal 1 (the SECOND real task) must skip the fenced line
+    /// and toggle only "real task two".  Byte positions are asserted exactly.
+    #[test]
+    fn toggle_task_box_skips_fenced_tasks() {
+        let raw = "- [ ] real task one\n```\n- [ ] fenced fake\n```\n- [ ] real task two";
+        // ordinal 0 → real task one
+        let r0 = toggle_task_box(raw, 0);
+        assert!(
+            r0.contains("- [x] real task one"),
+            "ordinal 0 must toggle first real task, got: {r0:?}"
+        );
+        assert!(
+            r0.contains("- [ ] fenced fake"),
+            "fenced line must be untouched, got: {r0:?}"
+        );
+        assert!(
+            r0.contains("- [ ] real task two"),
+            "second real task must be untouched, got: {r0:?}"
+        );
+        // ordinal 1 → real task two (fenced one is ordinal-invisible)
+        let r1 = toggle_task_box(raw, 1);
+        assert!(
+            r1.contains("- [ ] real task one"),
+            "first real task must be untouched, got: {r1:?}"
+        );
+        assert!(
+            r1.contains("- [ ] fenced fake"),
+            "fenced line must be untouched, got: {r1:?}"
+        );
+        assert!(
+            r1.contains("- [x] real task two"),
+            "ordinal 1 must toggle second real task, got: {r1:?}"
+        );
+        // Byte-assert: "real task two" starts toggled at exact position.
+        let expected_byte_off = raw.rfind("- [ ] real task two").unwrap();
+        assert_eq!(
+            &r1[expected_byte_off..expected_byte_off + 19],
+            "- [x] real task two",
+            "toggled bytes must be at exact offset"
+        );
     }
 }

@@ -223,10 +223,11 @@ fn snapshot_task_list_card_face_glyphs() {
     h.run_ok();
 
     // Verify the face body transform produces glyph characters.
+    // □ (U+25A1) for unchecked, ■ (U+25A0) for checked — both in Inter.
     let raw = "# Task card\n- [ ] buy milk\n- [x] write tests\n- [ ] ship it";
     let (face_body, offsets) = face_body_with_checkbox_glyphs(raw);
-    assert!(face_body.contains("☐"), "face body must contain ☐");
-    assert!(face_body.contains("☑"), "face body must contain ☑");
+    assert!(face_body.contains('□'), "face body must contain □");
+    assert!(face_body.contains('■'), "face body must contain ■");
     assert!(!face_body.contains("- [ ]"), "raw marker must be gone");
     assert_eq!(
         offsets.len(),
