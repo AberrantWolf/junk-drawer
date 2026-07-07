@@ -1,0 +1,7 @@
+threshold = 0.6
+
+[mac]
+threshold = 1.2
+
+[windows]
+threshold = 1.2
