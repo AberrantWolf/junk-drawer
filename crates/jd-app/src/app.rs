@@ -16,7 +16,7 @@ use jd_core::vault::Vault;
 use jd_core::worker::{self, VaultCommand, VaultEvent, VaultHandle};
 
 use crate::rail::{RailEvent, RailUiDeps};
-use crate::state::UiState;
+use crate::state::{UiState, UndoRedoKind};
 use crate::surfaces::desk::{DeskEvent, DeskUiDeps, DragState, FaceMeta};
 use crate::surfaces::inbox::{InboxEvent, InboxUiDeps};
 use crate::surfaces::trash::{TrashEvent, TrashUiDeps};
@@ -94,14 +94,22 @@ impl JdUi {
     /// Apply a session op, always mark dirty, and push a journal entry when
     /// `journal` is `Some(label)`.  This is the single authoritative path for
     /// all session mutations.
-    fn apply_session(&mut self, op: SessionOp, journal: Option<&'static str>) {
+    pub fn apply_session(&mut self, op: SessionOp, journal: Option<&'static str>) {
         let inverse = self.state.session.apply(&op);
         self.state.session_dirty_at = Some(std::time::Instant::now());
         if let Some(label) = journal {
+            let context = jd_core::journal::OpContext {
+                desk: if let Some(SurfaceId::Desk(desk_id)) = self.state.session.current_surface {
+                    Some(desk_id)
+                } else {
+                    None
+                },
+                note: None,
+            };
             self.state.journal.push(JournalEntry {
                 label: label.to_owned(),
                 inverse: InverseAction::Session(inverse),
-                context: OpContext::default(),
+                context,
             });
         }
     }
@@ -240,11 +248,44 @@ impl JdUi {
                         // a compound op (Batch([SaveBody, Promote])), use it
                         // instead of the worker's generic Batch label.
                         let label = self.state.pending_label.take().unwrap_or(result.label);
+                        // Build OpContext: current desk + first subject id from the inverse op.
+                        let mut subject_ids: Vec<NoteId> = Vec::new();
+                        op_subject_ids(&inv_op, &mut subject_ids);
+                        let context = OpContext {
+                            desk: if let Some(SurfaceId::Desk(desk_id)) =
+                                self.state.session.current_surface
+                            {
+                                Some(desk_id)
+                            } else {
+                                None
+                            },
+                            note: subject_ids.into_iter().next(),
+                        };
                         self.state.journal.push(JournalEntry {
                             label,
                             inverse: InverseAction::Vault(inv_op),
-                            context: OpContext::default(),
+                            context,
                         });
+                    } else if source == OpSource::UndoRedo {
+                        // Fresh inverse from the async undo/redo op.
+                        if let (Some(kind), Some(mut stashed), Some(fresh_inv)) = (
+                            self.state.pending_undo_redo.take(),
+                            self.state.pending_undo_entry.take(),
+                            result.inverse,
+                        ) {
+                            let context = stashed.context;
+                            stashed.inverse = InverseAction::Vault(fresh_inv);
+                            match kind {
+                                UndoRedoKind::Undo => {
+                                    self.state.journal.push_redo(stashed);
+                                }
+                                UndoRedoKind::Redo => {
+                                    self.state.journal.push_undo_from_redo(stashed);
+                                }
+                            }
+                            // View-travel: if the entry's context names a desk, switch to it.
+                            self.do_view_travel(context);
+                        }
                     }
                 }
                 VaultEvent::OpFailed { label, message } => {
@@ -344,7 +385,10 @@ impl JdUi {
                         id,
                         pos: was_at,
                     }),
-                    context: OpContext::default(),
+                    context: OpContext {
+                        desk: Some(source_desk),
+                        note: Some(id),
+                    },
                 });
             }
 
@@ -404,7 +448,10 @@ impl JdUi {
                             pos: was_at,
                         },
                     ]),
-                    context: OpContext::default(),
+                    context: OpContext {
+                        desk: Some(source_desk),
+                        note: Some(id),
+                    },
                 });
             }
         }
@@ -538,6 +585,56 @@ impl JdUi {
             }
 
             // ------------------------------------------------------------------
+            // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: undo/redo (Task 6).
+            // ------------------------------------------------------------------
+            if self.state.pending_confirm.is_none() {
+                let ctrl_z = ui.input(|i| {
+                    i.events.iter().any(|e| {
+                        matches!(
+                            e,
+                            egui::Event::Key {
+                                key: egui::Key::Z,
+                                pressed: true,
+                                modifiers,
+                                ..
+                            } if modifiers.command && !modifiers.shift
+                        )
+                    })
+                });
+                let ctrl_shift_z = ui.input(|i| {
+                    i.events.iter().any(|e| {
+                        matches!(
+                            e,
+                            egui::Event::Key {
+                                key: egui::Key::Z,
+                                pressed: true,
+                                modifiers,
+                                ..
+                            } if modifiers.command && modifiers.shift
+                        )
+                    })
+                });
+                let ctrl_y = ui.input(|i| {
+                    i.events.iter().any(|e| {
+                        matches!(
+                            e,
+                            egui::Event::Key {
+                                key: egui::Key::Y,
+                                pressed: true,
+                                modifiers,
+                                ..
+                            } if modifiers.command
+                        )
+                    })
+                });
+                if ctrl_z {
+                    self.execute_undo();
+                } else if ctrl_shift_z || ctrl_y {
+                    self.execute_redo();
+                }
+            }
+
+            // ------------------------------------------------------------------
             // Delete-confirm modal (Task 5): Enter = confirm delete, Esc = cancel.
             // Runs whenever pending_confirm is Some, regardless of surface.
             // ------------------------------------------------------------------
@@ -564,12 +661,24 @@ impl JdUi {
         // 4. Render: left rail + central surface + status line; editor overlay (Task 10).
 
         // ------------------------------------------------------------------
+        // Expire stale status echo (Task 6).
+        // ------------------------------------------------------------------
+        if let Some((_, ref ts)) = self.state.status_echo
+            && ts.elapsed() >= std::time::Duration::from_secs(4)
+        {
+            self.state.status_echo = None;
+        }
+
+        // ------------------------------------------------------------------
         // Status line (bottom) — must be added before SidePanel and CentralPanel.
         // ------------------------------------------------------------------
         let fit_clicked = egui::Panel::bottom("status_line")
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Junk Drawer");
+                    if let Some((ref echo_text, _)) = self.state.status_echo {
+                        ui.label(echo_text.as_str());
+                    }
                     let fit = ui.button("Fit");
                     // Zoom % — show for the active desk surface only.
                     if let Some(SurfaceId::Desk(desk_id)) = self.state.session.current_surface
@@ -1072,6 +1181,149 @@ impl JdUi {
     fn apply_rail_events(&mut self, events: Vec<RailEvent>) {
         for ev in events {
             self.apply_rail_event(ev);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Task 6: undo/redo executors + view-travel helper
+    // ------------------------------------------------------------------
+
+    /// View-travel: if `ctx` names a desk, switch to it (if not already there).
+    /// If it also names a note on that desk, reveal (pan/center) it.
+    fn do_view_travel(&mut self, ctx: OpContext) {
+        let Some(desk_id) = ctx.desk else { return };
+        // Switch surface if not already on this desk.
+        if self.state.session.current_surface != Some(SurfaceId::Desk(desk_id)) {
+            self.state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+            self.state.session_dirty_at = Some(std::time::Instant::now());
+        }
+        // Reveal the note if present on this desk.
+        // Clone desk to avoid borrow conflict with iter_mut below.
+        if let Some(note_id) = ctx.note
+            && let Some(desk) = self
+                .state
+                .session
+                .desks
+                .iter()
+                .find(|d| d.id == desk_id)
+                .cloned()
+            && desk.cards.iter().any(|c| c.id == note_id)
+        {
+            let panel = self.last_panel_rect.unwrap_or(egui::Rect::NOTHING);
+            // Pass empty face_metas — reveal falls back to 300×200 size.
+            if let Some(new_cam) = crate::surfaces::desk::reveal(&desk, note_id, panel, &[]) {
+                if let Some(d) = self
+                    .state
+                    .session
+                    .desks
+                    .iter_mut()
+                    .find(|d| d.id == desk_id)
+                {
+                    d.viewport.center = jd_core::geom::Vec2 {
+                        x: new_cam.center.x,
+                        y: new_cam.center.y,
+                    };
+                    d.viewport.zoom = new_cam.zoom;
+                }
+                self.state.session_dirty_at = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    /// Execute the top-of-undo-stack entry (Ctrl+Z).
+    fn execute_undo(&mut self) {
+        let Some(entry) = self.state.journal.pop_undo() else {
+            return;
+        };
+        let label = entry.label.clone();
+        let context = entry.context;
+        let echo = if label.starts_with("Split card") || label.starts_with("Split scrap") {
+            format!("Undid: {label} (split-off card moved to trash)")
+        } else {
+            format!("Undid: {label}")
+        };
+        self.state.status_echo = Some((echo, std::time::Instant::now()));
+        match entry.inverse.clone() {
+            InverseAction::Vault(op) => {
+                // Async: stash entry, send op, wait for OpDone to build redo entry.
+                self.state.pending_undo_redo = Some(UndoRedoKind::Undo);
+                self.state.pending_undo_entry = Some(entry);
+                let _ = self.vault.commands.send(VaultCommand::Op {
+                    op,
+                    source: OpSource::UndoRedo,
+                });
+            }
+            InverseAction::Session(op) => {
+                let inv = self.state.session.apply(&op);
+                self.state.session_dirty_at = Some(std::time::Instant::now());
+                self.state.journal.push_redo(JournalEntry {
+                    label,
+                    inverse: InverseAction::Session(inv),
+                    context,
+                });
+                self.do_view_travel(context);
+            }
+            InverseAction::Sessions(ops) => {
+                let mut inverses: Vec<SessionOp> = Vec::new();
+                for op in &ops {
+                    let inv = self.state.session.apply(op);
+                    inverses.push(inv);
+                }
+                self.state.session_dirty_at = Some(std::time::Instant::now());
+                inverses.reverse();
+                self.state.journal.push_redo(JournalEntry {
+                    label,
+                    inverse: InverseAction::Sessions(inverses),
+                    context,
+                });
+                self.do_view_travel(context);
+            }
+        }
+    }
+
+    /// Execute the top-of-redo-stack entry (Ctrl+Y / Ctrl+Shift+Z).
+    fn execute_redo(&mut self) {
+        let Some(entry) = self.state.journal.pop_redo() else {
+            return;
+        };
+        let label = entry.label.clone();
+        let context = entry.context;
+        self.state.status_echo = Some((format!("Redid: {label}"), std::time::Instant::now()));
+        match entry.inverse.clone() {
+            InverseAction::Vault(op) => {
+                // Async: stash entry, wait for OpDone to build undo entry.
+                self.state.pending_undo_redo = Some(UndoRedoKind::Redo);
+                self.state.pending_undo_entry = Some(entry);
+                let _ = self.vault.commands.send(VaultCommand::Op {
+                    op,
+                    source: OpSource::UndoRedo,
+                });
+            }
+            InverseAction::Session(op) => {
+                let inv = self.state.session.apply(&op);
+                self.state.session_dirty_at = Some(std::time::Instant::now());
+                self.state.journal.push_undo_from_redo(JournalEntry {
+                    label,
+                    inverse: InverseAction::Session(inv),
+                    context,
+                });
+                self.do_view_travel(context);
+            }
+            InverseAction::Sessions(ops) => {
+                let mut inverses: Vec<SessionOp> = Vec::new();
+                for op in &ops {
+                    let inv = self.state.session.apply(op);
+                    inverses.push(inv);
+                }
+                self.state.session_dirty_at = Some(std::time::Instant::now());
+                inverses.reverse();
+                self.state.journal.push_undo_from_redo(JournalEntry {
+                    label,
+                    inverse: InverseAction::Sessions(inverses),
+                    context,
+                });
+                self.do_view_travel(context);
+            }
         }
     }
 }

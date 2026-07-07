@@ -95,6 +95,17 @@ pub struct PendingCreate {
 }
 
 // ---------------------------------------------------------------------------
+// UndoRedoKind
+// ---------------------------------------------------------------------------
+
+/// Whether an in-flight UndoRedo vault op is completing an undo or a redo.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UndoRedoKind {
+    Undo,
+    Redo,
+}
+
+// ---------------------------------------------------------------------------
 // UiState
 // ---------------------------------------------------------------------------
 
@@ -123,6 +134,13 @@ pub struct UiState {
     /// Set when Del is pressed on a Permanent note; cleared by Enter (confirm)
     /// or Esc (cancel) in the confirm modal.
     pub pending_confirm: Option<NoteId>,
+    /// Task 6: status echo for "Undid: X" / "Redid: X" shown in the status bar for ~4s.
+    pub status_echo: Option<(String, std::time::Instant)>,
+    /// Task 6: tracks whether the in-flight UndoRedo op is completing an undo or redo.
+    pub pending_undo_redo: Option<UndoRedoKind>,
+    /// Task 6: the journal entry stashed when a vault undo/redo is in flight.
+    /// drain_events uses this to build the new entry (fresh inverse from OpDone).
+    pub pending_undo_entry: Option<jd_core::journal::JournalEntry>,
 }
 
 impl Default for UiState {
@@ -141,6 +159,9 @@ impl Default for UiState {
             pending_label: None,
             pending_open_promotion: false,
             pending_confirm: None,
+            status_echo: None,
+            pending_undo_redo: None,
+            pending_undo_entry: None,
         }
     }
 }

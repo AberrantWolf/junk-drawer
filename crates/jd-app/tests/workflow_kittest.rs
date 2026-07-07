@@ -1388,3 +1388,410 @@ fn inbox_del_key_tosses_and_trash_restore_round_trip() {
         );
     }
 }
+
+// ===========================================================================
+// Task 6: undo/redo
+// ===========================================================================
+
+/// Move a card (session Move op), press Ctrl+Z → position restored + status_echo shows "Undid:"
+#[test]
+fn app_undo_restores_card_position() {
+    let (_v, mut h, note_id, desk_id) = app_with_placed_card();
+
+    // Record original position.
+    let orig_pos = h.state().state.session.desks[0]
+        .cards
+        .iter()
+        .find(|c| c.id == note_id)
+        .unwrap()
+        .pos;
+
+    // Move the card via apply_session.
+    let new_pos = Vec2 {
+        x: orig_pos.x + 100.0,
+        y: orig_pos.y + 100.0,
+    };
+    {
+        h.state_mut().apply_session(
+            SessionOp::Move {
+                desk: desk_id,
+                id: note_id,
+                from: orig_pos,
+                to: new_pos,
+            },
+            Some("Move card"),
+        );
+    }
+    h.run_ok();
+
+    // Verify card moved.
+    let moved_pos = h.state().state.session.desks[0]
+        .cards
+        .iter()
+        .find(|c| c.id == note_id)
+        .unwrap()
+        .pos;
+    assert_ne!(moved_pos, orig_pos, "card should have moved");
+
+    // Press Ctrl+Z.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_ok();
+
+    // Position restored.
+    let after_undo_pos = h.state().state.session.desks[0]
+        .cards
+        .iter()
+        .find(|c| c.id == note_id)
+        .unwrap()
+        .pos;
+    assert_eq!(
+        after_undo_pos, orig_pos,
+        "position must be restored after undo"
+    );
+
+    // Status echo shows "Undid:".
+    let echo = h.state().state.status_echo.as_ref().map(|(s, _)| s.clone());
+    assert!(
+        echo.as_deref()
+            .map(|s| s.contains("Undid:"))
+            .unwrap_or(false),
+        "status_echo must contain 'Undid:' after undo, got: {:?}",
+        echo
+    );
+}
+
+/// After undo, Ctrl+Y → card re-moved.
+#[test]
+fn app_redo_re_applies_move() {
+    let (_v, mut h, note_id, desk_id) = app_with_placed_card();
+
+    let orig_pos = h.state().state.session.desks[0]
+        .cards
+        .iter()
+        .find(|c| c.id == note_id)
+        .unwrap()
+        .pos;
+
+    let new_pos = Vec2 {
+        x: orig_pos.x + 100.0,
+        y: orig_pos.y + 100.0,
+    };
+    {
+        h.state_mut().apply_session(
+            SessionOp::Move {
+                desk: desk_id,
+                id: note_id,
+                from: orig_pos,
+                to: new_pos,
+            },
+            Some("Move card"),
+        );
+    }
+    h.run_ok();
+
+    // Undo.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_ok();
+    let after_undo = h.state().state.session.desks[0]
+        .cards
+        .iter()
+        .find(|c| c.id == note_id)
+        .unwrap()
+        .pos;
+    assert_eq!(after_undo, orig_pos, "position restored after undo");
+
+    // Redo with Ctrl+Y.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Y);
+    h.run_ok();
+
+    let after_redo = h.state().state.session.desks[0]
+        .cards
+        .iter()
+        .find(|c| c.id == note_id)
+        .unwrap()
+        .pos;
+    assert_eq!(
+        after_redo, new_pos,
+        "position should be back to moved pos after redo"
+    );
+
+    // Status echo shows "Redid:".
+    let echo = h.state().state.status_echo.as_ref().map(|(s, _)| s.clone());
+    assert!(
+        echo.as_deref()
+            .map(|s| s.contains("Redid:"))
+            .unwrap_or(false),
+        "status_echo must contain 'Redid:' after redo, got: {:?}",
+        echo
+    );
+}
+
+/// Toss a fleeting card, then undo → card back in index.
+#[test]
+fn app_toss_then_undo_restores() {
+    let (_v, mut h, ids) = app_with_staggered_fleeting();
+    let id = ids[0];
+
+    // Toss the card.
+    {
+        use jd_app::surfaces::inbox::InboxEvent;
+        h.state_mut().apply_inbox_event(InboxEvent::Toss(id));
+    }
+
+    // Wait for toss to complete.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id).is_none()
+        },
+        200,
+        "toss to complete",
+    );
+
+    // Note gone.
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert!(idx.get(id).is_none(), "note must be gone after toss");
+    }
+
+    // Press Ctrl+Z (editor is not open).
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_ok();
+
+    // Wait for undo to complete (vault op async).
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id).is_some()
+        },
+        200,
+        "undo toss: note back in index",
+    );
+
+    // Verify note is back.
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert!(
+            idx.get(id).is_some(),
+            "note must be back in index after undo"
+        );
+    }
+
+    // Status echo shows "Undid:".
+    let echo = h.state().state.status_echo.as_ref().map(|(s, _)| s.clone());
+    assert!(
+        echo.as_deref()
+            .map(|s| s.contains("Undid:"))
+            .unwrap_or(false),
+        "status_echo must contain 'Undid:' after undo, got: {:?}",
+        echo
+    );
+}
+
+/// Move card to desk via CardDroppedOnDesk, undo → card ONLY on source desk.
+#[test]
+fn sessions_composite_undo_card_on_source_desk() {
+    let (_v, mut h, note_id, source_desk_id) = app_with_placed_card();
+
+    // Create a second desk.
+    h.get_by_label("Add desk").click();
+    h.run_ok();
+    let target_desk_id = h.state().state.session.desks[1].id;
+
+    let old_pos = h.state().state.session.desks[0]
+        .cards
+        .iter()
+        .find(|c| c.id == note_id)
+        .unwrap()
+        .pos;
+
+    // Drop card on target desk.
+    {
+        use jd_app::rail::RailEvent;
+        h.state_mut()
+            .apply_rail_event(RailEvent::CardDroppedOnDesk {
+                target_desk: target_desk_id,
+                id: note_id,
+                source_desk: source_desk_id,
+                was_at: old_pos,
+            });
+    }
+    h.run_ok();
+
+    // Card is on target desk.
+    assert!(
+        h.state().state.session.desks[1]
+            .cards
+            .iter()
+            .any(|c| c.id == note_id),
+        "card must be on target desk after drop"
+    );
+
+    // Press Ctrl+Z.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_ok();
+
+    // Card must be on source desk only.
+    assert!(
+        h.state().state.session.desks[0]
+            .cards
+            .iter()
+            .any(|c| c.id == note_id),
+        "card must be on source desk after undo"
+    );
+    assert!(
+        !h.state().state.session.desks[1]
+            .cards
+            .iter()
+            .any(|c| c.id == note_id),
+        "card must NOT be on target desk after undo"
+    );
+}
+
+/// Switch to Inbox surface, Ctrl+Z a desk-move → surface switches to the source desk.
+#[test]
+fn view_travel_switches_surface() {
+    let (_v, mut h, note_id, source_desk_id) = app_with_placed_card();
+
+    // The journal entry is pushed with context.desk = source_desk_id.
+    h.state_mut().state.session.current_surface = Some(SurfaceId::Desk(source_desk_id));
+    h.run_ok();
+
+    // Create a second desk and drop the card there.
+    h.get_by_label("Add desk").click();
+    h.run_ok();
+    let target_desk_id = h.state().state.session.desks[1].id;
+
+    let old_pos = h.state().state.session.desks[0]
+        .cards
+        .iter()
+        .find(|c| c.id == note_id)
+        .unwrap()
+        .pos;
+
+    {
+        use jd_app::rail::RailEvent;
+        h.state_mut()
+            .apply_rail_event(RailEvent::CardDroppedOnDesk {
+                target_desk: target_desk_id,
+                id: note_id,
+                source_desk: source_desk_id,
+                was_at: old_pos,
+            });
+    }
+    h.run_ok();
+
+    // Switch to Inbox surface.
+    h.state_mut().state.session.current_surface = Some(SurfaceId::Inbox);
+    h.run_ok();
+    assert_eq!(
+        h.state().state.session.current_surface,
+        Some(SurfaceId::Inbox),
+        "must be on Inbox before undo"
+    );
+
+    // Press Ctrl+Z → surface should travel to source desk.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_ok();
+
+    // Surface must have switched to the source desk.
+    assert_eq!(
+        h.state().state.session.current_surface,
+        Some(SurfaceId::Desk(source_desk_id)),
+        "view travel must switch to source desk after undo"
+    );
+
+    // Status echo must be present.
+    let echo = h.state().state.status_echo.as_ref().map(|(s, _)| s.clone());
+    assert!(
+        echo.as_deref()
+            .map(|s| s.contains("Undid:"))
+            .unwrap_or(false),
+        "status_echo must contain 'Undid:' after undo, got: {:?}",
+        echo
+    );
+}
+
+/// Promote via Task 4 path (close editor with pending_promotion), then ONE Ctrl+Z
+/// → note back in inbox, still fleeting.
+#[test]
+fn promotion_single_ctrl_z_full_reversal() {
+    let (_v, mut h, ids) = app_with_staggered_fleeting();
+    let id = ids[0];
+
+    // Open editor with pending_promotion=true.
+    {
+        use jd_app::surfaces::inbox::InboxEvent;
+        h.state_mut().apply_inbox_event(InboxEvent::Promote(id));
+    }
+
+    // Wait for editor to open.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_some(),
+        200,
+        "editor opens after Promote",
+    );
+
+    // Close with Esc → dispatch Batch([SaveBody, Promote]).
+    h.key_press(egui::Key::Escape);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_none(),
+        100,
+        "editor closes",
+    );
+
+    // Wait for promotion to complete.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id)
+                .map(|m| m.status == jd_core::note::Status::Permanent)
+                .unwrap_or(false)
+        },
+        200,
+        "note promoted",
+    );
+
+    // Press Ctrl+Z → single undo should reverse the entire Batch.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_ok();
+
+    // Wait for undo to complete (async vault op).
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id)
+                .map(|m| m.status == jd_core::note::Status::Fleeting)
+                .unwrap_or(false)
+        },
+        200,
+        "note back to fleeting after undo",
+    );
+
+    // Note is fleeting again.
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let meta = idx.get(id).expect("note must be in index after undo");
+        assert_eq!(
+            meta.status,
+            jd_core::note::Status::Fleeting,
+            "note must be fleeting after undoing promotion"
+        );
+    }
+
+    // Status echo shows "Undid:".
+    let echo = h.state().state.status_echo.as_ref().map(|(s, _)| s.clone());
+    assert!(
+        echo.as_deref()
+            .map(|s| s.contains("Undid:"))
+            .unwrap_or(false),
+        "status_echo must contain 'Undid:' after undo, got: {:?}",
+        echo
+    );
+}
