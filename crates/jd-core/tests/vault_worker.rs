@@ -635,6 +635,153 @@ fn batch_rolls_back_on_member_failure() {
 }
 
 #[test]
+fn rename_title_rewrites_referrers_and_inverts() {
+    let t = TempDir::new();
+    let (h, _) = boot(&t);
+    drain_until(&h, |e| {
+        matches!(e, VaultEvent::ScanComplete { .. }).then_some(())
+    });
+    let target = send_op(
+        &h,
+        VaultOp::Create {
+            seed: perm("# Old Name\nbody\n"),
+            dest: Dest::Notes,
+        },
+    )
+    .created[0];
+    let referrer = send_op(
+        &h,
+        VaultOp::Create {
+            seed: perm("# Referrer\nsee [[Old Name]] and [[old name|shown]]\n"),
+            dest: Dest::Notes,
+        },
+    )
+    .created[0];
+
+    let renamed = send_op(
+        &h,
+        VaultOp::RenameTitle {
+            id: target,
+            new_title: "New Name".into(),
+        },
+    );
+    let tmeta = h.index.read().unwrap().get(target).cloned().unwrap();
+    assert_eq!(tmeta.title.as_deref(), Some("New Name"));
+    assert!(tmeta.rel_path.to_string_lossy().contains("New Name"));
+    let ref_body = std::fs::read_to_string(
+        t.path()
+            .join(&h.index.read().unwrap().get(referrer).unwrap().rel_path),
+    )
+    .unwrap();
+    assert!(ref_body.contains("[[New Name]]"), "{ref_body}");
+    assert!(
+        ref_body.contains("[[New Name|shown]]"),
+        "display preserved: {ref_body}"
+    );
+    assert_eq!(
+        h.index.read().unwrap().backlinks(target),
+        vec![referrer],
+        "links stay resolved"
+    );
+
+    send_op(&h, renamed.inverse.unwrap());
+    let tmeta = h.index.read().unwrap().get(target).cloned().unwrap();
+    assert_eq!(tmeta.title.as_deref(), Some("Old Name"));
+}
+
+#[test]
+fn rename_untitled_fails_cleanly() {
+    let t = TempDir::new();
+    let (h, _) = boot(&t);
+    drain_until(&h, |e| {
+        matches!(e, VaultEvent::ScanComplete { .. }).then_some(())
+    });
+    let id = send_op(
+        &h,
+        VaultOp::Create {
+            seed: scrap("no heading here\n"),
+            dest: Dest::Inbox,
+        },
+    )
+    .created[0];
+    h.commands
+        .send(VaultCommand::Op {
+            op: VaultOp::RenameTitle {
+                id,
+                new_title: "X".into(),
+            },
+            source: OpSource::User,
+        })
+        .unwrap();
+    drain_until(&h, |e| {
+        matches!(e, VaultEvent::OpFailed { .. }).then_some(())
+    });
+}
+
+#[test]
+fn split_creates_linked_note_and_inverse_unsplits() {
+    let t = TempDir::new();
+    let (h, _) = boot(&t);
+    drain_until(&h, |e| {
+        matches!(e, VaultEvent::ScanComplete { .. }).then_some(())
+    });
+    let body = "# Host\nintro text\n# Second Idea\ntail text\n";
+    let id = send_op(
+        &h,
+        VaultOp::Create {
+            seed: perm(body),
+            dest: Dest::Notes,
+        },
+    )
+    .created[0];
+    let at = body.find("# Second Idea").unwrap();
+
+    let split = send_op(&h, VaultOp::Split { id, at_byte: at });
+    assert_eq!(split.created.len(), 1);
+    let new_id = split.created[0];
+    let new_meta = h.index.read().unwrap().get(new_id).cloned().unwrap();
+    assert_eq!(new_meta.title.as_deref(), Some("Second Idea"));
+    assert_eq!(new_meta.status, Status::Permanent);
+    let host_body = read_body(&h, id);
+    assert!(host_body.contains("[[Second Idea]]"), "{host_body}");
+    assert!(!host_body.contains("tail text"));
+
+    send_op(&h, split.inverse.unwrap()); // Batch: restore body + delete new note
+    assert_eq!(read_body(&h, id), body);
+    assert!(h.index.read().unwrap().get(new_id).is_none());
+}
+
+#[test]
+fn split_of_untitled_tail_makes_a_scrap() {
+    let t = TempDir::new();
+    let (h, _) = boot(&t);
+    drain_until(&h, |e| {
+        matches!(e, VaultEvent::ScanComplete { .. }).then_some(())
+    });
+    let body = "# Host\nkeep this\nand split from here onward\n";
+    let id = send_op(
+        &h,
+        VaultOp::Create {
+            seed: perm(body),
+            dest: Dest::Notes,
+        },
+    )
+    .created[0];
+    let at = body.find("and split").unwrap();
+    let split = send_op(&h, VaultOp::Split { id, at_byte: at });
+    let new_meta = h
+        .index
+        .read()
+        .unwrap()
+        .get(split.created[0])
+        .cloned()
+        .unwrap();
+    assert_eq!(new_meta.status, Status::Fleeting);
+    assert!(new_meta.rel_path.starts_with("inbox"));
+    assert!(read_body(&h, id).contains("[[and split from here onward]]"));
+}
+
+#[test]
 fn external_edit_preserves_created_timestamp() {
     let t = TempDir::new();
     let (h, _) = boot(&t);

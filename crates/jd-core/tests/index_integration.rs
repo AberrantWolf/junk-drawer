@@ -189,6 +189,54 @@ fn remove_cleans_everything() {
 }
 
 #[test]
+fn replace_at_path_is_atomic_and_relinks() {
+    let mut ix = Index::new();
+    // A links to B ("Old Title")
+    ix.upsert(
+        meta(
+            1,
+            Some("Alpha"),
+            Status::Permanent,
+            &[],
+            "see [[Old Title]]",
+        ),
+        "see [[Old Title]]",
+    );
+    ix.upsert(meta(2, Some("Old Title"), Status::Permanent, &[], ""), "");
+    // Confirm A resolves to B
+    assert_eq!(ix.outlinks(nid(1))[0].1, Some(nid(2)));
+    let count_before = ix.count();
+
+    // Replace B (nid(2)) with a new-id meta at the same path, new title
+    let new_meta = NoteMeta {
+        id: nid(99),
+        rel_path: "notes/2.md".into(),
+        title: Some("New Title".to_owned()),
+        first_line: "New Title".to_owned(),
+        status: Status::Permanent,
+        kind: Kind::Note,
+        source: None,
+        created: Timestamp(2000),
+        modified: Timestamp(4000),
+        tags: std::collections::BTreeSet::new(),
+        links_out: vec![],
+        word_count: 0,
+    };
+    ix.replace_at_path(nid(2), new_meta, "");
+
+    // Count is stable
+    assert_eq!(ix.count(), count_before);
+    // Old id gone
+    assert!(ix.get(nid(2)).is_none());
+    // New id present with new title
+    assert_eq!(ix.get(nid(99)).unwrap().title.as_deref(), Some("New Title"));
+    // A's link to "Old Title" no longer resolves (title changed)
+    assert_eq!(ix.outlinks(nid(1))[0].1, None);
+    // "New Title" resolves to nid(99)
+    assert_eq!(ix.resolve_title("new title"), Some(nid(99)));
+}
+
+#[test]
 fn similar_delegates() {
     let mut ix = Index::new();
     ix.upsert(

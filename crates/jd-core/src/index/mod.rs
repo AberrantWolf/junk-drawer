@@ -66,6 +66,14 @@ impl Index {
         self.search.add_doc(id, &search_text);
     }
 
+    /// Atomic remove-old + upsert-new under a single `&mut self`.
+    /// Used when a file at the same path is replaced with a new identity
+    /// (e.g. the watcher's path-reuse case, or `RenameTitle`).
+    pub fn replace_at_path(&mut self, old_id: NoteId, meta: NoteMeta, body: &str) {
+        self.remove(old_id);
+        self.upsert(meta, body);
+    }
+
     pub fn remove(&mut self, id: NoteId) {
         self.unwire(id);
         if let Some(meta) = self.notes.remove(&id)

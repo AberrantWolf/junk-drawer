@@ -8,7 +8,7 @@ use std::sync::{Mutex, mpsc};
 use std::time::SystemTime;
 
 use crate::command::{Dest, OpResult, OpSource, VaultOp, label_display, op_label};
-use crate::doc::NoteDoc;
+use crate::doc::{NoteDoc, extract_links, extract_title};
 use crate::error::CoreError;
 use crate::frontmatter::FrontmatterDoc;
 use crate::id::{IdGen, NoteId};
@@ -739,11 +739,278 @@ fn execute_op(
             }
         }
 
-        VaultOp::RenameTitle { .. } => {
-            Err(("Rename note".to_string(), "not yet implemented".to_string()))
+        VaultOp::RenameTitle { id, new_title } => {
+            let meta = index.read().unwrap().get(id).cloned().ok_or_else(|| {
+                (
+                    "Rename card".to_string(),
+                    format!("note {id} not found in index"),
+                )
+            })?;
+
+            let old_title = meta.title.clone().ok_or_else(|| {
+                let display = label_display(&meta.first_line);
+                (
+                    op_label("Rename", meta.status == Status::Fleeting, &display),
+                    "cannot rename an untitled note".to_string(),
+                )
+            })?;
+
+            let is_fleeting = meta.status == Status::Fleeting;
+            let display = label_display(&old_title);
+            let label = op_label("Rename", is_fleeting, &display);
+
+            let old_rel = meta.rel_path.clone();
+            let old_abs = vault.abs(&old_rel);
+            let old_dir = old_abs
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_owned();
+
+            // Read the file and rewrite the heading line
+            let content = std::fs::read_to_string(&old_abs)
+                .map_err(|e| (label.clone(), format!("rename read: {e}")))?;
+            let doc = NoteDoc::parse(&content);
+            let body = doc.body.clone();
+
+            let new_body = if let Some((_title_text, span)) = extract_title(&body) {
+                // Replace just the title text within the heading line
+                let mut b = body.clone();
+                b.replace_range(span, &new_title);
+                b
+            } else {
+                // No heading — should have been caught above, but handle gracefully
+                return Err((label, "no heading found to rename".to_string()));
+            };
+
+            // Determine new file path
+            let new_abs = filename_for(&new_title, id, &old_dir);
+            let new_rel = vault.rel(&new_abs).unwrap_or_else(|| new_abs.clone());
+
+            // Write new content to new path
+            let mut new_doc = NoteDoc::parse(&content);
+            new_doc.body = new_body;
+            new_doc.fm.set_modified(Timestamp::now());
+            let new_content = new_doc.serialize();
+
+            atomic_save(&new_abs, &new_content)
+                .map_err(|e| (label.clone(), format!("rename write: {e}")))?;
+
+            // Remove old file if path changed
+            if old_abs != new_abs {
+                std::fs::remove_file(&old_abs)
+                    .map_err(|e| (label.clone(), format!("rename remove old: {e}")))?;
+            }
+
+            // Ledger: remove old, add new
+            ledger.remove(&old_rel);
+            if let Some(s) = stat(&new_abs) {
+                ledger.insert(new_rel.clone(), s);
+            }
+
+            // Capture referrers BEFORE modifying the index (backlinks will be cleared by remove)
+            let referrers = index.read().unwrap().backlinks(id);
+            let old_title_lower = old_title.to_lowercase();
+
+            // Re-upsert self in index
+            match parse_note_file(vault, &new_rel) {
+                Ok((new_meta, new_body_parsed)) => {
+                    let mut ix = index.write().unwrap();
+                    ix.remove(id);
+                    ix.upsert(new_meta, &new_body_parsed);
+                }
+                Err(e) => return Err((label, format!("rename index self: {e}"))),
+            }
+
+            for ref_id in referrers {
+                let ref_meta = match index.read().unwrap().get(ref_id).cloned() {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let ref_rel = ref_meta.rel_path.clone();
+                let ref_abs = vault.abs(&ref_rel);
+
+                let ref_content = match std::fs::read_to_string(&ref_abs) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let ref_doc = NoteDoc::parse(&ref_content);
+                let ref_body = ref_doc.body.clone();
+
+                // Rewrite [[old_title]] → [[new_title]] and [[old_title|x]] → [[new_title|x]]
+                // We do this by rebuilding the body, replacing link spans from right to left
+                // to preserve byte offsets.
+                let links = extract_links(&ref_body);
+                let mut new_ref_body = ref_body.clone();
+                // Process links in reverse order to preserve byte offsets
+                let mut matching_links: Vec<_> = links
+                    .iter()
+                    .filter(|l| l.target.to_lowercase() == old_title_lower)
+                    .collect();
+                matching_links.sort_by_key(|l| std::cmp::Reverse(l.span.start));
+
+                for link in matching_links {
+                    let replacement = match &link.display {
+                        Some(d) => format!("[[{}|{}]]", new_title, d),
+                        None => format!("[[{}]]", new_title),
+                    };
+                    new_ref_body.replace_range(link.span.clone(), &replacement);
+                }
+
+                if new_ref_body == ref_body {
+                    continue; // nothing changed
+                }
+
+                let mut new_ref_doc = NoteDoc::parse(&ref_content);
+                new_ref_doc.body = new_ref_body;
+                new_ref_doc.fm.set_modified(Timestamp::now());
+                let new_ref_content = new_ref_doc.serialize();
+
+                if let Err(e) = atomic_save(&ref_abs, &new_ref_content) {
+                    return Err((label, format!("rename rewrite referrer: {e}")));
+                }
+                if let Some(s) = stat(&ref_abs) {
+                    ledger.insert(ref_rel.clone(), s);
+                }
+                if let Ok((rm, rb)) = parse_note_file(vault, &ref_rel) {
+                    index.write().unwrap().upsert(rm, &rb);
+                }
+            }
+
+            Ok(OpResult {
+                inverse: Some(VaultOp::RenameTitle {
+                    id,
+                    new_title: old_title,
+                }),
+                label,
+                created: vec![],
+            })
         }
 
-        VaultOp::Split { .. } => Err(("Split note".to_string(), "not yet implemented".to_string())),
+        VaultOp::Split { id, at_byte } => {
+            let meta = index.read().unwrap().get(id).cloned().ok_or_else(|| {
+                (
+                    "Split note".to_string(),
+                    format!("note {id} not found in index"),
+                )
+            })?;
+
+            let is_fleeting = meta.status == Status::Fleeting;
+            let display = label_display(meta.title.as_deref().unwrap_or(&meta.first_line));
+            let label = op_label("Split", is_fleeting, &display);
+
+            let rel = meta.rel_path.clone();
+            let abs = vault.abs(&rel);
+
+            let content = std::fs::read_to_string(&abs)
+                .map_err(|e| (label.clone(), format!("split read: {e}")))?;
+            let doc = NoteDoc::parse(&content);
+            let old_body = doc.body.clone();
+
+            // Validate at_byte
+            if at_byte > old_body.len() {
+                return Err((
+                    label,
+                    format!(
+                        "split at_byte {at_byte} out of range (body len {})",
+                        old_body.len()
+                    ),
+                ));
+            }
+            if !old_body.is_char_boundary(at_byte) {
+                return Err((
+                    label,
+                    format!("split at_byte {at_byte} is not on a char boundary"),
+                ));
+            }
+            let tail = &old_body[at_byte..];
+            if tail.trim().is_empty() {
+                return Err((label, "split tail is empty after trim".to_string()));
+            }
+
+            // Determine new note type and display ref
+            let tail_trimmed = tail.trim_start();
+            let (new_status, new_dest_dir, link_text) = if tail_trimmed.starts_with("# ") {
+                // Extract title from heading
+                let title = extract_title(tail_trimmed)
+                    .map(|(t, _)| t)
+                    .unwrap_or_else(|| "Untitled".to_string());
+                let dir = vault.abs(Path::new("notes"));
+                (Status::Permanent, dir, title)
+            } else {
+                // Use first non-empty line as link text
+                let first = tail_trimmed
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("Untitled")
+                    .trim()
+                    .to_string();
+                let dir = vault.abs(Path::new("inbox"));
+                (Status::Fleeting, dir, first)
+            };
+
+            // Generate new note id and path
+            let new_id = NoteId::generate(id_gen);
+            let now = Timestamp::now();
+            let new_abs = filename_for(&link_text, new_id, &new_dest_dir);
+            let new_rel = vault.rel(&new_abs).unwrap_or_else(|| new_abs.clone());
+
+            // Build new note content
+            let mut new_fm = FrontmatterDoc::synthesize(new_id, now, new_status);
+            new_fm.set_modified(now);
+            let new_doc = NoteDoc {
+                fm: new_fm,
+                body: tail.to_string(),
+            };
+            let new_content = new_doc.serialize();
+
+            atomic_save(&new_abs, &new_content)
+                .map_err(|e| (label.clone(), format!("split write new: {e}")))?;
+            if let Some(s) = stat(&new_abs) {
+                ledger.insert(new_rel.clone(), s);
+            }
+
+            // Index the new note
+            match parse_note_file(vault, &new_rel) {
+                Ok((nm, nb)) => {
+                    index.write().unwrap().upsert(nm, &nb);
+                }
+                Err(e) => return Err((label, format!("split index new: {e}"))),
+            }
+
+            // Rewrite host body: body[..at_byte] + [[link_text]] + \n
+            let new_host_body = format!("{}[[{}]]\n", &old_body[..at_byte], link_text);
+
+            let mut new_host_doc = NoteDoc::parse(&content);
+            new_host_doc.body = new_host_body;
+            new_host_doc.fm.set_modified(now);
+            let new_host_content = new_host_doc.serialize();
+
+            atomic_save(&abs, &new_host_content)
+                .map_err(|e| (label.clone(), format!("split write host: {e}")))?;
+            if let Some(s) = stat(&abs) {
+                ledger.insert(rel.clone(), s);
+            }
+
+            // Re-upsert host in index
+            match parse_note_file(vault, &rel) {
+                Ok((hm, hb)) => {
+                    index.write().unwrap().upsert(hm, &hb);
+                }
+                Err(e) => return Err((label, format!("split index host: {e}"))),
+            }
+
+            Ok(OpResult {
+                inverse: Some(VaultOp::Batch(vec![
+                    VaultOp::SaveBody {
+                        id,
+                        content: old_body,
+                    },
+                    VaultOp::Delete { id: new_id },
+                ])),
+                label,
+                created: vec![new_id],
+            })
+        }
 
         VaultOp::Batch(ops) => {
             let mut done_inverses: Vec<VaultOp> = Vec::new();
