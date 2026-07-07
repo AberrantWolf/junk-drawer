@@ -437,6 +437,8 @@ impl JdUi {
 
         // 3. Global shortcut dispatch.
         //    If editor is open → only editor keys (Task 10).
+        //    If confirm modal is pending → only modal Enter/Esc (below); all
+        //    other shortcuts (Ctrl+N, Del, surface keys) are suppressed.
         //    Otherwise: Ctrl+N → create a new fleeting scrap in Inbox.
         if self.state.editor.is_none() {
             let ctrl_n = ui.input(|i| {
@@ -452,7 +454,7 @@ impl JdUi {
                     )
                 })
             });
-            if ctrl_n {
+            if ctrl_n && self.state.pending_confirm.is_none() {
                 // Determine where to place the new card: pointer world pos if
                 // the pointer is over the panel, otherwise panel center.
                 let place_at = self
@@ -540,8 +542,13 @@ impl JdUi {
             // Runs whenever pending_confirm is Some, regardless of surface.
             // ------------------------------------------------------------------
             if let Some(confirm_id) = self.state.pending_confirm {
-                let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                // consume_key prevents Enter/Esc from leaking to surface handlers
+                // (desk_ui, inbox_ui) in the same frame — defense in depth on top
+                // of the confirm_pending gate in those surfaces.
+                let enter_pressed =
+                    ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                let esc_pressed =
+                    ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
                 if enter_pressed {
                     self.state.pending_confirm = None;
                     let _ = self.vault.commands.send(VaultCommand::Op {
@@ -685,6 +692,7 @@ impl JdUi {
                             face_metas: &face_metas,
                             drag: &mut self.drag,
                             editor_open: self.state.editor.is_some(),
+                            confirm_pending: self.state.pending_confirm.is_some(),
                         };
                         let evts = crate::surfaces::desk::desk_ui(ui, &desk, &mut deps);
                         self.apply_desk_events(evts, desk.id, &face_metas);
@@ -716,6 +724,7 @@ impl JdUi {
                         session: &self.state.session,
                         ordered_ids: &ordered_ids,
                         editor_open: self.state.editor.is_some(),
+                        confirm_pending: self.state.pending_confirm.is_some(),
                     };
                     let evts = crate::surfaces::inbox::inbox_ui(ui, &mut deps);
                     self.apply_inbox_events(evts);
@@ -816,12 +825,8 @@ impl JdUi {
             let title = {
                 let idx = self.vault.index.read().unwrap();
                 idx.get(confirm_id)
-                    .and_then(|m| m.title.clone())
-                    .unwrap_or_else(|| {
-                        idx.get(confirm_id)
-                            .map(|m| m.first_line.clone())
-                            .unwrap_or_default()
-                    })
+                    .map(|m| m.title.clone().unwrap_or_else(|| m.first_line.clone()))
+                    .unwrap_or_default()
             };
             let modal =
                 egui::Modal::new(egui::Id::new("delete_confirm_modal")).show(ui.ctx(), |ui| {

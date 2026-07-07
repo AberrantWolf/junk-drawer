@@ -1222,3 +1222,169 @@ fn trash_surface_shows_retention_notice() {
     h.run_ok();
     h.get_by_label_contains("30 days");
 }
+
+/// Task 5 regression: Del on permanent → Enter confirms delete AND editor does NOT open.
+/// Verifies that the Enter that confirms the delete-confirm modal does NOT also
+/// fire DeskEvent::OpenCard for the card being deleted (double-handling bug).
+#[test]
+fn del_permanent_enter_confirms_delete_editor_not_opened() {
+    let (_vault, mut h, note_id, _desk_id) = app_with_permanent_card();
+
+    // Press Delete → confirm modal opens.
+    h.key_press(egui::Key::Delete);
+    h.run_ok();
+    assert_eq!(
+        h.state().state.pending_confirm,
+        Some(note_id),
+        "Del must set pending_confirm"
+    );
+
+    // Press Enter → confirm delete.
+    h.key_press(egui::Key::Enter);
+    h.run_ok();
+
+    // pending_confirm must be cleared.
+    assert!(
+        h.state().state.pending_confirm.is_none(),
+        "Enter must clear pending_confirm"
+    );
+
+    // CRITICAL: editor must NOT have opened for the card being deleted.
+    assert!(
+        h.state().state.editor.is_none(),
+        "Enter in delete-confirm modal must NOT open the editor for the deleted card"
+    );
+    assert!(
+        h.state().state.session.open_card.is_none(),
+        "open_card must be None after confirm delete (Enter must not fire OpenCard)"
+    );
+
+    // Note must be deleted (gone from index).
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(note_id).is_none()
+        },
+        200,
+        "delete to complete after Del+Enter",
+    );
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert!(
+            idx.get(note_id).is_none(),
+            "deleted note must be gone from index"
+        );
+    }
+}
+
+/// Task 5 regression: Ctrl+N while delete-confirm modal is open must NOT create a new card.
+#[test]
+fn ctrl_n_suppressed_while_confirm_modal_open() {
+    let (_vault, mut h, note_id, _desk_id) = app_with_permanent_card();
+
+    // Press Delete → confirm modal opens.
+    h.key_press(egui::Key::Delete);
+    h.run_ok();
+    assert_eq!(h.state().state.pending_confirm, Some(note_id));
+
+    // Press Ctrl+N while modal is open → must be suppressed.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+    h.run_ok();
+
+    // pending_create must NOT have been set.
+    assert!(
+        h.state().state.pending_create.is_none(),
+        "Ctrl+N while confirm modal open must not create a new card"
+    );
+}
+
+/// Task 5 regression (Fix 4): inbox Del key drives the toss leg of the trash round-trip.
+/// Extends toss_scrap_appears_in_trash_restore_back_in_inbox by pressing Del via
+/// the keyboard shortcut rather than dispatching InboxEvent::Toss directly.
+#[test]
+fn inbox_del_key_tosses_and_trash_restore_round_trip() {
+    let (_v, mut h, ids) = app_with_staggered_fleeting();
+    let id = ids[0];
+
+    // Focus the first scrap (Inbox surface is already active).
+    {
+        let app = h.state_mut();
+        app.state.focus = Some(id);
+    }
+    h.run_ok();
+
+    // Before: 3 fleeting notes.
+    assert_eq!(
+        {
+            let idx = h.state().vault.index.read().unwrap();
+            idx.fleeting().len()
+        },
+        3
+    );
+
+    // Press Delete — drives the inbox_ui keyboard path (not direct event dispatch).
+    h.key_press(egui::Key::Delete);
+    h.run_ok();
+
+    // Wait for toss to complete.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id).is_none()
+        },
+        200,
+        "toss via keyboard Del to complete",
+    );
+
+    // Note gone from fleeting list.
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert!(
+            !idx.fleeting().contains(&id),
+            "inbox Del-tossed note must not be in fleeting"
+        );
+        assert!(
+            idx.get(id).is_none(),
+            "inbox Del-tossed note must be gone from index"
+        );
+    }
+
+    // Switch to Trash surface: tossed card row must be visible.
+    h.state_mut().state.session.current_surface = Some(SurfaceId::Trash);
+    h.run_ok();
+    h.get_by_label_contains("Trashed:");
+
+    // Restore via TrashEvent::Restore.
+    {
+        use jd_app::surfaces::trash::TrashEvent;
+        h.state_mut().apply_trash_event(TrashEvent::Restore(id));
+    }
+
+    // Wait for Restore to complete: note back in index.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id).is_some()
+        },
+        200,
+        "restore after inbox Del-toss to complete",
+    );
+
+    // Note is back in the fleeting index (status preserved).
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let meta = idx.get(id).expect("restored note must be in index");
+        assert_eq!(
+            meta.status,
+            jd_core::note::Status::Fleeting,
+            "restored note must still be Fleeting"
+        );
+        assert!(
+            idx.fleeting().contains(&id),
+            "restored note must be in fleeting list after restore"
+        );
+    }
+}

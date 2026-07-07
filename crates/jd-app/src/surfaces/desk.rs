@@ -235,6 +235,9 @@ pub struct DeskUiDeps<'a> {
     pub face_metas: &'a [FaceMeta],
     pub drag: &'a mut Option<DragState>,
     pub editor_open: bool,
+    /// True while a delete-confirm modal is pending; suppresses all surface
+    /// keyboard handling so the modal's Enter/Esc are the only consumers.
+    pub confirm_pending: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -259,9 +262,9 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
     let card_positions: Vec<(NoteId, Vec2)> = desk.cards.iter().map(|c| (c.id, c.pos)).collect();
 
     // ------------------------------------------------------------------
-    // 2. Keyboard handling (only when editor is closed)
+    // 2. Keyboard handling (only when editor is closed and no confirm modal)
     // ------------------------------------------------------------------
-    if !state.editor_open {
+    if !state.editor_open && !state.confirm_pending {
         for (key, dir) in [
             (egui::Key::ArrowLeft, FocusDir::Left),
             (egui::Key::ArrowRight, FocusDir::Right),

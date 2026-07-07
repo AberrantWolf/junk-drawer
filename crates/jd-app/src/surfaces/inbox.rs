@@ -57,6 +57,9 @@ pub struct InboxUiDeps<'a> {
     /// Ordered list of fleeting note ids (oldest-first, by `created`).
     pub ordered_ids: &'a [NoteId],
     pub editor_open: bool,
+    /// True while a delete-confirm modal is pending; suppresses all surface
+    /// keyboard handling so the modal's Enter/Esc are the only consumers.
+    pub confirm_pending: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +161,7 @@ pub fn inbox_ui(ui: &mut egui::Ui, deps: &mut InboxUiDeps<'_>) -> Vec<InboxEvent
         .memory(|m| m.data.get_temp::<PickerState>(picker_state_id()))
         .is_some_and(|p| p.open);
 
-    if !deps.editor_open && !picker_open {
+    if !deps.editor_open && !picker_open && !deps.confirm_pending {
         // Up/Down/Left/Right: linear navigation
         let go_prev =
             ui.input(|i| i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowLeft));
