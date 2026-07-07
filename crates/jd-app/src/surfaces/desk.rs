@@ -1,8 +1,11 @@
 //! The desk surface. This file owns spatial focus order (Spike B) and,
 //! from Task 8, the pannable canvas itself.
 
+use eframe::egui;
 use jd_core::geom::Vec2;
 use jd_core::id::NoteId;
+use jd_core::note::NoteMeta;
+use jd_core::session::{Desk, DeskId, SessionOp};
 
 /// 0.6 × index-card height (200.0). Rounded y-bands make reading order
 /// stable under small drags (architecture §3, spec §12).
@@ -91,6 +94,455 @@ pub fn card_a11y_label(
     let l = if links == 1 { "link" } else { "links" };
     let t = if tags == 1 { "tag" } else { "tags" };
     format!("Card: '{title}', {links} {l}, {tags} {t}")
+}
+
+// ===========================================================================
+// Task 8: pannable desk canvas
+// ===========================================================================
+
+pub const ZOOM_MIN: f32 = 0.5;
+pub const ZOOM_MAX: f32 = 2.0;
+
+/// Desk-space → screen-space: screen = (world - viewport.center) * zoom + panel_center.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeskCamera {
+    pub center: egui::Vec2,
+    pub zoom: f32,
+}
+
+impl DeskCamera {
+    pub fn to_screen(&self, panel: egui::Rect, world: egui::Pos2) -> egui::Pos2 {
+        let panel_center = panel.center();
+        let world_v = egui::vec2(world.x, world.y);
+        let offset = (world_v - self.center) * self.zoom;
+        panel_center + offset
+    }
+
+    pub fn to_world(&self, panel: egui::Rect, screen: egui::Pos2) -> egui::Pos2 {
+        let panel_center = panel.center();
+        let offset = screen - panel_center;
+        let world_v = self.center + offset / self.zoom;
+        egui::pos2(world_v.x, world_v.y)
+    }
+
+    /// Zoom and pan so all placed cards fit within `panel` with some padding.
+    pub fn zoom_to_fit(&mut self, cards: &[(NoteId, Vec2)], panel: egui::Rect) {
+        if cards.is_empty() {
+            self.center = egui::Vec2::ZERO;
+            self.zoom = 1.0;
+            return;
+        }
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        // Include card extent (use a nominal 300×200 size for all shapes)
+        let card_w = 300.0_f32;
+        let card_h = 200.0_f32;
+        for (_, p) in cards {
+            min_x = min_x.min(p.x);
+            min_y = min_y.min(p.y);
+            max_x = max_x.max(p.x + card_w);
+            max_y = max_y.max(p.y + card_h);
+        }
+        let content_w = (max_x - min_x).max(1.0);
+        let content_h = (max_y - min_y).max(1.0);
+        let pad = 60.0;
+        let zoom_x = (panel.width() - pad * 2.0) / content_w;
+        let zoom_y = (panel.height() - pad * 2.0) / content_h;
+        // zoom_to_fit uses a wider range than interactive zoom — we want to see all cards
+        // even if they span a large area. Minimum is 0.01 (very far out), max is ZOOM_MAX.
+        self.zoom = zoom_x.min(zoom_y).clamp(0.01, ZOOM_MAX);
+        // Center is the world-space midpoint of all content.
+        self.center = egui::vec2((min_x + max_x) / 2.0, (min_y + max_y) / 2.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prefetched face metadata (ONE index read lock per frame in app.rs)
+// ---------------------------------------------------------------------------
+
+/// Per-card metadata prefetched from the index under a single read lock.
+pub struct FaceMeta {
+    pub id: NoteId,
+    pub title: String,
+    pub first_line: String,
+    pub links: usize,
+    pub tags: usize,
+    pub is_scrap: bool,
+    pub source: Option<String>,
+    pub status: jd_core::note::Status,
+    pub kind: jd_core::note::Kind,
+}
+
+impl FaceMeta {
+    pub fn from_note_meta(meta: &NoteMeta, index: &jd_core::index::Index) -> FaceMeta {
+        let links = index.outlinks(meta.id).len();
+        FaceMeta {
+            id: meta.id,
+            title: meta.title.clone().unwrap_or_default(),
+            first_line: meta.first_line.clone(),
+            links,
+            tags: meta.tags.len(),
+            is_scrap: meta.title.is_none(),
+            source: meta.source.clone(),
+            status: meta.status,
+            kind: meta.kind,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drag state
+// ---------------------------------------------------------------------------
+
+pub struct DragState {
+    pub id: NoteId,
+    pub grab_offset: egui::Vec2,
+    /// World position at drag start (for Move op).
+    pub from: Vec2,
+    /// Total pixel drag distance (to gate click vs move).
+    pub total_delta: f32,
+}
+
+// ---------------------------------------------------------------------------
+// DeskEvent
+// ---------------------------------------------------------------------------
+
+/// Events emitted by `desk_ui` for `app.rs` to apply.
+#[derive(Debug)]
+pub enum DeskEvent {
+    OpenCard(NoteId),
+    SessionOp(SessionOp),
+    FocusChanged(Option<NoteId>),
+    /// Camera moved/zoomed — NOT journaled; just marks `session_dirty_at`.
+    ViewportMoved {
+        desk: DeskId,
+        cam: DeskCamera,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// DeskUiDeps
+// ---------------------------------------------------------------------------
+
+pub struct DeskUiDeps<'a> {
+    pub focus: &'a mut Option<NoteId>,
+    pub bodies: &'a mut crate::state::BodyCache,
+    pub commands: &'a std::sync::mpsc::Sender<jd_core::worker::VaultCommand>,
+    pub theme: &'a crate::theme::Theme,
+    pub line_cache: &'a mut crate::editor::LineCache,
+    pub face_metas: &'a [FaceMeta],
+    pub drag: &'a mut Option<DragState>,
+    pub editor_open: bool,
+}
+
+// ---------------------------------------------------------------------------
+// desk_ui
+// ---------------------------------------------------------------------------
+
+/// Render the active desk; returns events for app.rs to apply (desk itself
+/// never touches SessionState directly — one mutation site, in app.rs).
+pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Vec<DeskEvent> {
+    let mut events: Vec<DeskEvent> = Vec::new();
+    let panel = ui.max_rect();
+
+    // Build camera from the desk's viewport.
+    let mut cam = DeskCamera {
+        center: egui::vec2(desk.viewport.center.x, desk.viewport.center.y),
+        zoom: desk.viewport.zoom,
+    };
+
+    // ------------------------------------------------------------------
+    // 1. Build card positions for focus/reading-order
+    // ------------------------------------------------------------------
+    let card_positions: Vec<(NoteId, Vec2)> = desk.cards.iter().map(|c| (c.id, c.pos)).collect();
+
+    // ------------------------------------------------------------------
+    // 2. Keyboard handling (only when editor is closed)
+    // ------------------------------------------------------------------
+    if !state.editor_open {
+        for (key, dir) in [
+            (egui::Key::ArrowLeft, FocusDir::Left),
+            (egui::Key::ArrowRight, FocusDir::Right),
+            (egui::Key::ArrowUp, FocusDir::Up),
+            (egui::Key::ArrowDown, FocusDir::Down),
+        ] {
+            if ui.input(|i| i.key_pressed(key)) {
+                let next = next_focus(&card_positions, *state.focus, dir);
+                if next != *state.focus {
+                    *state.focus = next;
+                    events.push(DeskEvent::FocusChanged(*state.focus));
+                }
+            }
+        }
+
+        // Enter → open focused card
+        if ui.input(|i| i.key_pressed(egui::Key::Enter))
+            && let Some(id) = *state.focus
+        {
+            events.push(DeskEvent::OpenCard(id));
+        }
+
+        // Backspace → put away focused card
+        if ui.input(|i| i.key_pressed(egui::Key::Backspace))
+            && let Some(id) = *state.focus
+            && let Some(card) = desk.cards.iter().find(|c| c.id == id)
+        {
+            let was_at = card.pos;
+            // Advance focus before removal
+            let next = next_focus(&card_positions, Some(id), FocusDir::Right)
+                .or_else(|| next_focus(&card_positions, Some(id), FocusDir::Left));
+            *state.focus = next;
+            events.push(DeskEvent::FocusChanged(*state.focus));
+            events.push(DeskEvent::SessionOp(SessionOp::PutAway {
+                desk: desk.id,
+                id,
+                was_at,
+            }));
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Pan and zoom via scroll
+    // ------------------------------------------------------------------
+    // egui maps Ctrl+scroll → zoom_delta (>1 or <1) and plain/shift scroll
+    // → smooth_scroll_delta (shift handled by egui's horizontal_scroll_modifier).
+    let scroll = ui.input(|i| i.smooth_scroll_delta);
+    let zoom_factor = ui.input(|i| i.zoom_delta());
+    let mut viewport_changed = false;
+
+    // Zoom: zoom_delta() != 1.0 means Ctrl+scroll was active.
+    if (zoom_factor - 1.0).abs() > 1e-6 {
+        let ptr_screen = ui
+            .input(|i| i.pointer.latest_pos())
+            .unwrap_or(panel.center());
+        let ptr_world = cam.to_world(panel, ptr_screen);
+        let new_zoom = (cam.zoom * zoom_factor).clamp(ZOOM_MIN, ZOOM_MAX);
+        // Anchor invariant: ptr_world stays at ptr_screen.
+        // new_center = ptr_world - (ptr_screen - panel_center) / new_zoom
+        let new_center =
+            egui::vec2(ptr_world.x, ptr_world.y) - (ptr_screen - panel.center()) / new_zoom;
+        cam.zoom = new_zoom;
+        cam.center = new_center;
+        viewport_changed = true;
+    }
+
+    // Pan: plain scroll (y = vertical, x = horizontal with Shift).
+    if scroll != egui::Vec2::ZERO {
+        cam.center -= scroll / cam.zoom;
+        viewport_changed = true;
+    }
+
+    // Middle-mouse drag → pan
+    let mid_delta = ui.input(|i| {
+        if i.pointer.button_down(egui::PointerButton::Middle) {
+            i.pointer.delta()
+        } else {
+            egui::Vec2::ZERO
+        }
+    });
+    if mid_delta != egui::Vec2::ZERO {
+        cam.center -= mid_delta / cam.zoom;
+        viewport_changed = true;
+    }
+
+    if viewport_changed {
+        events.push(DeskEvent::ViewportMoved { desk: desk.id, cam });
+    }
+
+    // ------------------------------------------------------------------
+    // 4. Pointer state for drag
+    // ------------------------------------------------------------------
+    let pointer_pos = ui.input(|i| i.pointer.latest_pos());
+    let primary_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+    let primary_released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+    let pointer_delta = ui.input(|i| i.pointer.delta());
+
+    // Hit-test which card the pointer is over (for drag/focus).
+    let pointer_over_card: Option<NoteId> = pointer_pos.and_then(|pos| {
+        desk.cards.iter().find_map(|card| {
+            let screen_min = cam.to_screen(panel, egui::pos2(card.pos.x, card.pos.y));
+            let rect = egui::Rect::from_min_size(screen_min, egui::vec2(300.0, 208.0) * cam.zoom);
+            if rect.contains(pos) {
+                Some(card.id)
+            } else {
+                None
+            }
+        })
+    });
+
+    // Drag start
+    if primary_pressed
+        && let Some(id) = pointer_over_card
+        && let Some(card) = desk.cards.iter().find(|c| c.id == id)
+    {
+        let card_screen = cam.to_screen(panel, egui::pos2(card.pos.x, card.pos.y));
+        let grab_offset = pointer_pos.unwrap_or(card_screen) - card_screen;
+        *state.drag = Some(DragState {
+            id,
+            grab_offset,
+            from: card.pos,
+            total_delta: 0.0,
+        });
+        if *state.focus != Some(id) {
+            *state.focus = Some(id);
+            events.push(DeskEvent::FocusChanged(*state.focus));
+        }
+    }
+
+    // Drag motion
+    if let Some(ref mut drag) = *state.drag {
+        drag.total_delta += pointer_delta.length();
+    }
+
+    // Drag release → emit Move if beyond threshold
+    #[allow(clippy::collapsible_if)]
+    if primary_released && let Some(drag) = state.drag.take() {
+        if drag.total_delta >= 4.0
+            && let Some(ptr) = pointer_pos
+        {
+            let new_screen = ptr - drag.grab_offset;
+            let new_world = cam.to_world(panel, new_screen);
+            let to = Vec2 {
+                x: new_world.x,
+                y: new_world.y,
+            };
+            events.push(DeskEvent::SessionOp(SessionOp::Move {
+                desk: desk.id,
+                id: drag.id,
+                from: drag.from,
+                to,
+            }));
+        }
+        // else: tiny drag = click, focus already set on press
+    }
+
+    // Background drag → pan (pointer on empty background)
+    if pointer_over_card.is_none()
+        && ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
+        && pointer_delta != egui::Vec2::ZERO
+    {
+        cam.center -= pointer_delta / cam.zoom;
+        events.push(DeskEvent::ViewportMoved { desk: desk.id, cam });
+    }
+
+    // ------------------------------------------------------------------
+    // 5. Render card faces (with culling)
+    // ------------------------------------------------------------------
+    let cull_rect = panel.expand(100.0);
+
+    // Live drag position for the card being dragged
+    let dragged_id = state.drag.as_ref().map(|d| d.id);
+    let live_drag_screen: Option<egui::Pos2> = if let Some(ref drag) = *state.drag {
+        pointer_pos.map(|ptr| ptr - drag.grab_offset)
+    } else {
+        None
+    };
+
+    for card in &desk.cards {
+        let card_screen_min = if dragged_id == Some(card.id) {
+            live_drag_screen
+                .unwrap_or_else(|| cam.to_screen(panel, egui::pos2(card.pos.x, card.pos.y)))
+        } else {
+            cam.to_screen(panel, egui::pos2(card.pos.x, card.pos.y))
+        };
+
+        let meta_opt = state.face_metas.iter().find(|m| m.id == card.id);
+        let card_world_size = if let Some(meta) = meta_opt {
+            crate::card::shape::card_size(crate::card::shape::shape_for(meta.status, meta.kind))
+        } else {
+            egui::vec2(300.0, 200.0)
+        };
+        // Scale card size by zoom to get screen-space dimensions.
+        let card_screen_size = card_world_size * cam.zoom;
+        let card_screen_rect = egui::Rect::from_min_size(card_screen_min, card_screen_size);
+
+        // Culling — skip cards fully outside the expanded panel
+        if !cull_rect.intersects(card_screen_rect) {
+            continue;
+        }
+
+        let is_focused = *state.focus == Some(card.id);
+
+        let (title, _first_line, links, tags, _is_scrap, source, shape, style) =
+            if let Some(meta) = meta_opt {
+                let shape = crate::card::shape::shape_for(meta.status, meta.kind);
+                (
+                    meta.title.as_str(),
+                    meta.first_line.as_str(),
+                    meta.links,
+                    meta.tags,
+                    meta.is_scrap,
+                    meta.source.as_deref(),
+                    shape,
+                    crate::card::shape::CardStyle::Paper,
+                )
+            } else {
+                (
+                    "",
+                    "",
+                    0usize,
+                    0usize,
+                    true,
+                    None,
+                    crate::card::shape::CardShape::Scrap,
+                    crate::card::shape::CardStyle::Paper,
+                )
+            };
+
+        let body = state
+            .bodies
+            .get_or_request(card.id, state.commands)
+            .map(|b| b.text.as_str());
+
+        let face = crate::card::CardFace {
+            id: card.id,
+            title,
+            body,
+            shape,
+            style,
+            lines: crate::card::shape::RuledLines::Natural,
+            source,
+            links,
+            tags,
+            focused: is_focused,
+        };
+
+        let resp =
+            crate::card::card_face(ui, card_screen_rect, &face, state.theme, state.line_cache);
+
+        if resp.clicked() && *state.focus != Some(card.id) {
+            *state.focus = Some(card.id);
+            events.push(DeskEvent::FocusChanged(*state.focus));
+        }
+        if resp.double_clicked() {
+            events.push(DeskEvent::OpenCard(card.id));
+        }
+        if is_focused {
+            resp.request_focus();
+        }
+    }
+
+    events
+}
+
+/// Pan viewport to reveal `id` if it is currently off-screen.
+pub fn reveal(desk: &Desk, id: NoteId, panel: egui::Rect) -> Option<DeskCamera> {
+    let card = desk.cards.iter().find(|c| c.id == id)?;
+    let cam = DeskCamera {
+        center: egui::vec2(desk.viewport.center.x, desk.viewport.center.y),
+        zoom: desk.viewport.zoom,
+    };
+    let screen_min = cam.to_screen(panel, egui::pos2(card.pos.x, card.pos.y));
+    let card_screen = egui::Rect::from_min_size(screen_min, egui::vec2(300.0, 200.0));
+    if panel.contains_rect(card_screen) {
+        return None; // already visible
+    }
+    // Center viewport on the card.
+    let mut new_cam = cam;
+    new_cam.center = egui::vec2(card.pos.x + 150.0, card.pos.y + 100.0);
+    Some(new_cam)
 }
 
 #[cfg(test)]

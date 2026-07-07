@@ -53,3 +53,14 @@ pub fn pump<S>(
 pub fn temp_vault() -> TempDir {
     TempDir::new()
 }
+
+/// Construct a `NewNote` seed for use in `VaultOp::Create`.
+pub fn new_note(title: &str, body: &str) -> jd_core::note::NewNote {
+    jd_core::note::NewNote {
+        body: format!("# {title}\n{body}"),
+        status: jd_core::note::Status::Permanent,
+        kind: jd_core::note::Kind::Note,
+        source: None,
+        tags: Vec::new(),
+    }
+}
