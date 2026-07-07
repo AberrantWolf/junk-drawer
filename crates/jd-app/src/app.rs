@@ -5,9 +5,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
-use jd_core::command::OpSource;
+use jd_core::command::{OpSource, VaultOp};
 use jd_core::error::CoreError;
-use jd_core::id::IdGen;
+use jd_core::id::{IdGen, NoteId};
 use jd_core::journal::{InverseAction, JournalEntry, OpContext};
 use jd_core::session::{DeskId, SessionOp, SessionState, SurfaceId};
 use jd_core::vault::Vault;
@@ -76,17 +76,12 @@ impl JdUi {
                     // First-run: create a default desk if none exist.
                     if self.state.session.desks.is_empty() {
                         let desk_id = DeskId::generate(&mut self.id_gen);
-                        let inv = self.state.session.apply(&SessionOp::CreateDesk {
+                        // Bootstrap desk is a system act, not undoable — do not journal.
+                        let _inv = self.state.session.apply(&SessionOp::CreateDesk {
                             id: desk_id,
                             name: "Desk".into(),
                         });
                         self.state.session.current_surface = Some(SurfaceId::Desk(desk_id));
-                        // Journal the creation so it can be undone.
-                        self.state.journal.push(JournalEntry {
-                            label: "Create desk 'Desk'".into(),
-                            inverse: InverseAction::Session(inv),
-                            context: OpContext::default(),
-                        });
                     }
                 }
                 VaultEvent::Body { id, content } => {
@@ -105,9 +100,19 @@ impl JdUi {
                     }
                 }
                 VaultEvent::OpDone { result, source } => {
-                    // Invalidate bodies for created notes and any id in the result.
+                    // Invalidate bodies for created notes.
                     for id in &result.created {
                         self.state.bodies.invalidate(*id);
+                    }
+                    // Invalidate bodies for notes mutated by the op (SaveBody,
+                    // RenameTitle, Toss, etc.) — extracted from the inverse op so
+                    // ops that carry no subject id (Create) contribute nothing.
+                    if let Some(ref inv_op) = result.inverse {
+                        let mut subject_ids: Vec<NoteId> = Vec::new();
+                        op_subject_ids(inv_op, &mut subject_ids);
+                        for id in subject_ids {
+                            self.state.bodies.invalidate(id);
+                        }
                     }
                     // Push to journal only for user-originated ops.
                     if source == OpSource::User
@@ -158,11 +163,122 @@ impl JdUi {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Collect every `NoteId` that `op` acts on as a *subject* (i.e. an existing
+/// note that may have been mutated).  `Create` produces a brand-new id, so it
+/// contributes nothing here — callers handle `OpResult::created` separately.
+///
+/// The match is exhaustive (no `_` arm) so that adding a new `VaultOp` variant
+/// forces a compile error until this function is updated.
+pub fn op_subject_ids(op: &VaultOp, out: &mut Vec<NoteId>) {
+    match op {
+        VaultOp::Create { .. } => {
+            // New id — no pre-existing subject to invalidate.
+        }
+        VaultOp::SaveBody { id, .. }
+        | VaultOp::RenameTitle { id, .. }
+        | VaultOp::Promote { id }
+        | VaultOp::Demote { id }
+        | VaultOp::SetKind { id, .. }
+        | VaultOp::SetSource { id, .. }
+        | VaultOp::SetTags { id, .. }
+        | VaultOp::Toss { id }
+        | VaultOp::Delete { id }
+        | VaultOp::Restore { id }
+        | VaultOp::Split { id, .. } => {
+            out.push(*id);
+        }
+        VaultOp::Batch(ops) => {
+            for inner in ops {
+                op_subject_ids(inner, out);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 /// The eframe shell. Owns nothing but JdUi.
 pub struct JdApp(pub JdUi);
 
 impl eframe::App for JdApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.0.ui(ui);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jd_core::command::VaultOp;
+
+    fn nid(n: u8) -> NoteId {
+        let s = format!("01ARZ3NDEKTSV4RRFFQ69G5F{n:02}");
+        NoteId::parse(&s).unwrap()
+    }
+
+    #[test]
+    fn op_subject_ids_save_body() {
+        let op = VaultOp::SaveBody {
+            id: nid(1),
+            content: "hello".into(),
+        };
+        let mut out = Vec::new();
+        op_subject_ids(&op, &mut out);
+        assert_eq!(out, vec![nid(1)]);
+    }
+
+    #[test]
+    fn op_subject_ids_rename_title() {
+        let op = VaultOp::RenameTitle {
+            id: nid(2),
+            new_title: "new name".into(),
+        };
+        let mut out = Vec::new();
+        op_subject_ids(&op, &mut out);
+        assert_eq!(out, vec![nid(2)]);
+    }
+
+    #[test]
+    fn op_subject_ids_batch_collects_all() {
+        let op = VaultOp::Batch(vec![
+            VaultOp::SaveBody {
+                id: nid(3),
+                content: "body".into(),
+            },
+            VaultOp::RenameTitle {
+                id: nid(4),
+                new_title: "title".into(),
+            },
+        ]);
+        let mut out = Vec::new();
+        op_subject_ids(&op, &mut out);
+        assert_eq!(out, vec![nid(3), nid(4)]);
+    }
+
+    #[test]
+    fn op_subject_ids_create_contributes_nothing() {
+        use jd_core::command::Dest;
+        use jd_core::note::{Kind, NewNote, Status};
+        let op = VaultOp::Create {
+            seed: NewNote {
+                body: String::new(),
+                status: Status::Fleeting,
+                kind: Kind::Note,
+                source: None,
+                tags: Vec::new(),
+            },
+            dest: Dest::Inbox,
+        };
+        let mut out = Vec::new();
+        op_subject_ids(&op, &mut out);
+        assert!(out.is_empty());
     }
 }
