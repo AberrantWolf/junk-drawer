@@ -138,20 +138,28 @@ pub enum SessionOp {
 // ---------------------------------------------------------------------------
 
 impl SessionState {
-    /// Apply an op and return its inverse.
-    ///
-    /// Lenient semantics for card ops:
-    /// - Move: if card is found, moves it; if absent, inserts it at `to`
-    ///   (upsert). The inverse is Move when found, PutAway when inserted.
-    /// - PutAway: toggles — removes if present, inserts at `was_at` if absent.
-    ///   This is its own inverse, enabling the round-trip contract.
-    ///
-    /// DeleteDesk is self-inverse: removes if present, inserts (restoring
-    /// full desk+cards) if absent. Unknown desk ids are no-ops.
+    /// Applies the op and returns its inverse. Inverse pairs: Place↔PutAway
+    /// (PutAway's inverse is Place at the card's actual position), Move swaps
+    /// from/to, CreateDesk↔DeleteDesk, Rename/Reorder swap their fields.
+    /// Unknown desk/card ids are STRICT no-ops returning an inverse that is
+    /// also a no-op — never generative (a PutAway on an absent card must not
+    /// conjure it; the undo stack depends on this).
     pub fn apply(&mut self, op: &SessionOp) -> SessionOp {
         match op {
             SessionOp::Place { desk, id, pos } => {
                 if let Some(d) = self.desks.iter_mut().find(|d| d.id == *desk) {
+                    if let Some(card) = d.cards.iter_mut().find(|c| c.id == *id) {
+                        // Card already present: treat as a positional update.
+                        // Inverse is Place back at the old position.
+                        let old = card.pos;
+                        card.pos = *pos;
+                        return SessionOp::Place {
+                            desk: *desk,
+                            id: *id,
+                            pos: old,
+                        };
+                    }
+                    // Card absent: insert it. Inverse is PutAway.
                     d.cards.push(PlacedCard { id: *id, pos: *pos });
                 }
                 SessionOp::PutAway {
@@ -167,43 +175,38 @@ impl SessionState {
                 from: _,
                 to,
             } => {
-                if let Some(d) = self.desks.iter_mut().find(|d| d.id == *desk) {
-                    if let Some(card) = d.cards.iter_mut().find(|c| c.id == *id) {
-                        // Card exists: move it; inverse is Move back.
-                        let old = card.pos;
-                        card.pos = *to;
-                        return SessionOp::Move {
-                            desk: *desk,
-                            id: *id,
-                            from: *to,
-                            to: old,
-                        };
-                    } else {
-                        // Card absent: insert at `to`; inverse is PutAway.
-                        d.cards.push(PlacedCard { id: *id, pos: *to });
-                    }
+                if let Some(d) = self.desks.iter_mut().find(|d| d.id == *desk)
+                    && let Some(card) = d.cards.iter_mut().find(|c| c.id == *id)
+                {
+                    // Card present: move it; inverse is Move back.
+                    let old = card.pos;
+                    card.pos = *to;
+                    return SessionOp::Move {
+                        desk: *desk,
+                        id: *id,
+                        from: *to,
+                        to: old,
+                    };
                 }
-                SessionOp::PutAway {
-                    desk: *desk,
-                    id: *id,
-                    was_at: *to,
-                }
+                // Card absent: strict no-op; inverse is also a no-op.
+                op.clone()
             }
 
             SessionOp::PutAway { desk, id, was_at } => {
-                if let Some(d) = self.desks.iter_mut().find(|d| d.id == *desk) {
-                    if let Some(idx) = d.cards.iter().position(|c| c.id == *id) {
-                        // Card present: remove it (forward direction).
-                        d.cards.remove(idx);
-                    } else {
-                        // Card absent: insert at `was_at` (inverse/restore direction).
-                        d.cards.push(PlacedCard {
-                            id: *id,
-                            pos: *was_at,
-                        });
-                    }
+                if let Some(d) = self.desks.iter_mut().find(|d| d.id == *desk)
+                    && let Some(idx) = d.cards.iter().position(|c| c.id == *id)
+                {
+                    // Card present: remove it; inverse is Place at actual position.
+                    let actual_pos = d.cards[idx].pos;
+                    d.cards.remove(idx);
+                    return SessionOp::Place {
+                        desk: *desk,
+                        id: *id,
+                        pos: actual_pos,
+                    };
                 }
-                // PutAway is its own inverse.
+                // Card absent: strict no-op; inverse is also a no-op.
+                // Preserve was_at so the op round-trips as itself.
                 SessionOp::PutAway {
                     desk: *desk,
                     id: *id,
@@ -490,7 +493,10 @@ mod tests {
     }
 
     #[test]
-    fn every_session_op_inverts_exactly() {
+    fn op_stack_unwinds_exactly() {
+        // Forward pass accumulates state (no mid-loop inversion — each op runs
+        // against the state its predecessor left); the unwind pass then proves
+        // every inverse restores its exact before-state, LIFO.
         let mut r#gen = IdGen::new();
         let (mut s, desk) = desk_with(&mut r#gen, "Work");
         let ops = vec![
@@ -516,12 +522,44 @@ mod tests {
                 was_at: Vec2 { x: 50.0, y: 60.0 },
             },
         ];
+        let mut stack = Vec::new();
         for op in ops {
             let before = s.clone();
             let inverse = s.apply(&op);
             assert_ne!(s, before, "op must change state: {op:?}");
+            stack.push((before, inverse));
+        }
+        while let Some((before, inverse)) = stack.pop() {
             s.apply(&inverse);
-            assert_eq!(s, before, "inverse must restore state for {op:?}");
+            assert_eq!(s, before, "inverse must restore state for {inverse:?}");
+        }
+    }
+
+    #[test]
+    fn ops_on_absent_cards_are_no_ops() {
+        // Leniency contract: session ops on unknown cards/desks change nothing
+        // and return an inverse that also changes nothing. Never generative.
+        let mut r#gen = IdGen::new();
+        let (mut s, desk) = desk_with(&mut r#gen, "Work");
+        let absent = nid(99);
+        for op in [
+            SessionOp::Move {
+                desk,
+                id: absent,
+                from: Vec2::default(),
+                to: Vec2 { x: 5.0, y: 5.0 },
+            },
+            SessionOp::PutAway {
+                desk,
+                id: absent,
+                was_at: Vec2 { x: 5.0, y: 5.0 },
+            },
+        ] {
+            let before = s.clone();
+            let inverse = s.apply(&op);
+            assert_eq!(s, before, "op on absent card must be a no-op: {op:?}");
+            s.apply(&inverse);
+            assert_eq!(s, before, "its inverse must also be a no-op: {inverse:?}");
         }
     }
 
