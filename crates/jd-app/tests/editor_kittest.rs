@@ -540,3 +540,126 @@ fn url_paste_over_selection_makes_md_link() {
         buf
     );
 }
+
+/// Undo stack survives editor close and reopen within the session.
+/// Type "alpha beta", close (Esc), reopen the same card, Ctrl+Z → buffer "alpha ".
+#[test]
+fn text_undo_survives_close_and_reopen() {
+    let (_vault, mut h, id) = app_with_one_card("");
+
+    // Open editor and type "alpha beta" char by char so the word-boundary
+    // grouping can fire (each char is a separate Event::Text frame).
+    open_editor(&mut h, id);
+    for ch in "alpha beta".chars() {
+        h.event(egui::Event::Text(ch.to_string()));
+        h.step();
+        h.run_ok();
+    }
+
+    // Verify buffer matches.
+    let buf = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(
+        buf.contains("alpha beta"),
+        "buffer must contain 'alpha beta' after typing, got: {:?}",
+        buf
+    );
+
+    // Close with Esc — the editor is dirty so it sends SaveBody to the worker.
+    h.key_press(egui::Key::Escape);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_none(),
+        100,
+        "editor closes on Esc",
+    );
+    assert!(h.state().state.editor.is_none(), "editor must be closed");
+
+    // Undo stack must be preserved in the text_undo map.
+    assert!(
+        h.state().state.text_undo.contains_key(&id),
+        "text_undo map must preserve stack for the closed card"
+    );
+
+    // Wait for the worker to write the body to disk so reopen sees the new content.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    h.run_ok();
+
+    // Open the card again: set open_card (as if user pressed Enter on card).
+    // Bodies.get_or_request will fire a ReadBody if not cached; drain_events will
+    // open the editor when the Body event arrives.
+    h.state_mut().state.bodies.invalidate(id);
+    h.state_mut().state.session.open_card = Some(id);
+
+    // Pump until the editor opens again.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_some(),
+        200,
+        "editor reopens",
+    );
+    // Settle focus.
+    for _ in 0..3 {
+        h.step();
+    }
+
+    let buf_after_reopen = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(
+        buf_after_reopen.contains("alpha beta"),
+        "editor must reopen with saved body 'alpha beta', got: {:?}",
+        buf_after_reopen
+    );
+
+    // Press Ctrl+Z — the surviving undo stack should revert to "alpha "
+    // (the first word group, before "beta" was typed).
+    h.event(egui::Event::Key {
+        key: egui::Key::Z,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    });
+    h.step();
+    h.run_ok();
+
+    let buf_after_undo = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(
+        buf_after_undo.contains("alpha ") && !buf_after_undo.contains("beta"),
+        "Ctrl+Z after reopen must undo 'beta' → buffer 'alpha ', got: {:?}",
+        buf_after_undo
+    );
+}
+
+/// Ctrl+Z in the editor must never push to the app journal.
+#[test]
+fn ctrl_z_in_editor_never_touches_the_app_journal() {
+    let (_vault, mut h, id) = app_with_one_card("");
+
+    open_editor(&mut h, id);
+    let node = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+    node.type_text("hello");
+    h.step();
+    h.run_ok();
+
+    // Record journal length AFTER typing (typing itself may or may not add entries,
+    // but Ctrl+Z must not add any new ones from that point).
+    let journal_len_before = h.state().state.journal.len();
+
+    // Press Ctrl+Z multiple times.
+    for _ in 0..3 {
+        h.event(egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        h.step();
+        h.run_ok();
+    }
+
+    let journal_len_after = h.state().state.journal.len();
+    assert_eq!(
+        journal_len_before, journal_len_after,
+        "Ctrl+Z in editor must not push to the app journal (was {journal_len_before}, now {journal_len_after})"
+    );
+}

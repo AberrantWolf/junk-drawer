@@ -160,8 +160,14 @@ pub struct EditorState {
 
 impl EditorState {
     /// Open a new editor for `id` pre-loaded with `body` (body-only, no frontmatter).
-    pub fn open(id: NoteId, body: String) -> EditorState {
-        let undo = crate::text_undo::TextUndo::new(&body);
+    /// `saved_undo` is the undo stack from the previous session (if any); when
+    /// `None` a fresh stack is created from `body`.
+    pub fn open(
+        id: NoteId,
+        body: String,
+        saved_undo: Option<crate::text_undo::TextUndo>,
+    ) -> EditorState {
+        let undo = saved_undo.unwrap_or_else(|| crate::text_undo::TextUndo::new(&body));
         EditorState {
             id,
             buffer: body,
@@ -500,15 +506,48 @@ pub fn editor_ui(
         ui.set_min_size(egui::vec2(540.0, 440.0));
         ui.set_max_size(egui::vec2(540.0, 440.0));
 
-        // --- Pre-TextEdit interception (Task 11) ---
+        // --- Pre-TextEdit interception (Task 11 + 12) ---
         // Everything that must win over TextEdit's own key handling happens
         // HERE, before `te.show` — consumed events never reach the widget.
         // Positions come from last frame's cursor; the buffer cannot have
         // changed since, so it is current when this frame's input arrives.
         let te_id = egui::Id::new("editor_te");
+
+        // Task 12: Ctrl+Z (undo) and Ctrl+Shift+Z / Ctrl+Y (redo) are consumed
+        // here so egui's built-in TextEdit undoer never sees them.
+        // `now_ms` from ui.input(|i| i.time) keeps TextUndo free of Instant.
+        let now_ms = ui.input(|i| (i.time * 1000.0) as u64);
+        let do_undo = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
+        let do_redo = ui.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::Z,
+            ) || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+        });
+        if do_undo
+            && let Some(snap) = ed.undo.undo(&ed.buffer)
+        {
+            ed.buffer = snap.text;
+            set_cursor_char(ui.ctx(), te_id, snap.cursor);
+            ed.dirty = true;
+            ed.last_edit = Some(Instant::now());
+        }
+        if do_redo
+            && let Some(snap) = ed.undo.redo()
+        {
+            ed.buffer = snap.text;
+            set_cursor_char(ui.ctx(), te_id, snap.cursor);
+            ed.dirty = true;
+            ed.last_edit = Some(Instant::now());
+        }
         let has_focus = ui.ctx().memory(|m| m.has_focus(te_id));
         let cursor_char = ed.prev_cursor.map(|cr| cr.primary.index.0);
         let cursor_byte = cursor_char.map(|c| char_idx_to_byte(&ed.buffer, c));
+
+        // Task 12: snapshot buffer length at the start of this frame so we can
+        // detect any buffer change (from pre-show code OR from TextEdit itself)
+        // and call record() once at the end.
+        let buffer_at_frame_start = ed.buffer.clone();
 
         // URL paste over a selection → [selection](url). No other paste transform.
         if let Some(prev_cr) = ed.prev_cursor {
@@ -676,6 +715,20 @@ pub fn editor_ui(
                 });
                 ed.last_journaled = Some(Instant::now());
             }
+        }
+
+        // Task 12: record any buffer change (from TextEdit OR from pre-show code)
+        // into the undo stack. The cursor after the edit is whichever the TextEdit
+        // reports for this frame (te_out.cursor_range), falling back to prev_cursor.
+        // This single record() call covers regular typing, autocomplete accept,
+        // Enter continuation, URL paste, and indent/outdent uniformly.
+        if ed.buffer != buffer_at_frame_start {
+            let post_cursor = te_out
+                .cursor_range
+                .map(|cr| cr.primary.index.0)
+                .or(cursor_char)
+                .unwrap_or(0);
+            ed.undo.record(&ed.buffer, post_cursor, now_ms);
         }
 
         // --- Autocomplete popup rendering (anchored at the caret) ---

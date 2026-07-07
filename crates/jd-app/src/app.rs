@@ -176,8 +176,12 @@ impl JdUi {
                     // in the architecture: OpenCard fires get_or_request; when the body
                     // lands here the editor is created.
                     if self.state.session.open_card == Some(id) && self.state.editor.is_none() {
-                        self.state.editor =
-                            Some(crate::editor::EditorState::open(id, content.clone()));
+                        let saved_undo = self.state.text_undo.remove(&id);
+                        self.state.editor = Some(crate::editor::EditorState::open(
+                            id,
+                            content.clone(),
+                            saved_undo,
+                        ));
                     }
                     self.state.bodies.insert(id, content);
                 }
@@ -415,7 +419,7 @@ impl JdUi {
         });
 
         // 4b. Editor modal overlay (Task 10).
-        if let Some(ed) = &mut self.state.editor {
+        let close_editor = if let Some(ed) = &mut self.state.editor {
             let mut deps = crate::editor::EditorDeps {
                 theme: &self.theme,
                 commands: &self.vault.commands,
@@ -423,26 +427,31 @@ impl JdUi {
                 reduced_motion: false,
             };
             let ev = crate::editor::editor_ui(ui, ed, &mut deps);
-            if matches!(ev, crate::editor::EditorEvent::CloseAndSave) {
-                // Only save when the buffer was actually modified.  A clean
-                // open→close must not write the file (which would invalidate
-                // the body cache via the watcher echo and push a phantom undo
-                // entry with label "Save body").
-                if ed.dirty {
-                    let _ = self.vault.commands.send(VaultCommand::Op {
-                        op: jd_core::command::VaultOp::SaveBody {
-                            id: ed.id,
-                            content: ed.buffer.clone(),
-                        },
-                        source: jd_core::command::OpSource::User,
-                    });
-                }
-                self.state.editor = None;
-                self.state.session.open_card = None;
-                self.state.session_dirty_at = Some(std::time::Instant::now());
-                // Return focus to the desk card by clearing the focused-widget memory.
-                ui.ctx().memory_mut(|mem| mem.stop_text_input());
+            matches!(ev, crate::editor::EditorEvent::CloseAndSave)
+        } else {
+            false
+        };
+        if close_editor {
+            // Only save when the buffer was actually modified.  A clean
+            // open→close must not write the file (which would invalidate
+            // the body cache via the watcher echo and push a phantom undo
+            // entry with label "Save body").
+            let editor = self.state.editor.take().unwrap();
+            if editor.dirty {
+                let _ = self.vault.commands.send(VaultCommand::Op {
+                    op: jd_core::command::VaultOp::SaveBody {
+                        id: editor.id,
+                        content: editor.buffer.clone(),
+                    },
+                    source: jd_core::command::OpSource::User,
+                });
             }
+            // Task 12: stash the undo stack so it survives close/reopen.
+            self.state.text_undo.insert(editor.id, editor.undo);
+            self.state.session.open_card = None;
+            self.state.session_dirty_at = Some(std::time::Instant::now());
+            // Return focus to the desk card by clearing the focused-widget memory.
+            ui.ctx().memory_mut(|mem| mem.stop_text_input());
         }
 
         // 5. Debounced saves: if session_dirty_at elapsed > 1s → save and clear.
@@ -472,8 +481,12 @@ impl JdUi {
                     if let Some(cached) = self.state.bodies.get_or_request(id, &self.vault.commands)
                         && self.state.editor.is_none()
                     {
-                        self.state.editor =
-                            Some(crate::editor::EditorState::open(id, cached.text.clone()));
+                        let saved_undo = self.state.text_undo.remove(&id);
+                        self.state.editor = Some(crate::editor::EditorState::open(
+                            id,
+                            cached.text.clone(),
+                            saved_undo,
+                        ));
                     }
                 }
                 DeskEvent::FocusChanged(id) => {

@@ -102,6 +102,8 @@ pub struct UiState {
     pub scan_done: bool,
     pub last_error: Option<String>,
     pub pending_create: Option<PendingCreate>,
+    /// Per-card undo stacks that survive editor close/reopen within the session.
+    pub text_undo: HashMap<NoteId, crate::text_undo::TextUndo>,
 }
 
 impl Default for UiState {
@@ -116,6 +118,7 @@ impl Default for UiState {
             scan_done: false,
             last_error: None,
             pending_create: None,
+            text_undo: HashMap::new(),
         }
     }
 }
