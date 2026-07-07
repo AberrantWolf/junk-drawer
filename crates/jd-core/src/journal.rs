@@ -10,6 +10,9 @@ use crate::session::{DeskId, SessionOp};
 pub enum InverseAction {
     Vault(VaultOp),
     Session(SessionOp),
+    /// A multi-step session inverse applied in order; produced by app-level composite acts
+    /// (e.g. move-card-to-desk). The redo entry is the reverse-ordered inverses of applying these.
+    Sessions(Vec<SessionOp>),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -139,6 +142,37 @@ mod tests {
         assert_eq!(j.redo_label(), Some("two"));
         j.push(entry("three"));
         assert!(j.redo_label().is_none(), "new op clears redo");
+    }
+
+    #[test]
+    fn sessions_variant_round_trips() {
+        use crate::geom::Vec2;
+        use crate::session::{DeskId, SessionOp};
+        let desk_id = DeskId(NoteId([2; 16]));
+        let id = NoteId([3; 16]);
+        let ops = vec![
+            SessionOp::PutAway {
+                desk: desk_id,
+                id,
+                was_at: Vec2 { x: 1.0, y: 2.0 },
+            },
+            SessionOp::Place {
+                desk: desk_id,
+                id,
+                pos: Vec2 { x: 0.0, y: 0.0 },
+            },
+        ];
+        let mut j = Journal::new();
+        j.push(JournalEntry {
+            label: "Move card to desk 'Target'".to_owned(),
+            inverse: InverseAction::Sessions(ops.clone()),
+            context: OpContext::default(),
+        });
+        let e = j.pop_undo().unwrap();
+        assert!(
+            matches!(e.inverse, InverseAction::Sessions(ref v) if v.len() == 2),
+            "Sessions variant must round-trip with correct op count"
+        );
     }
 
     #[test]

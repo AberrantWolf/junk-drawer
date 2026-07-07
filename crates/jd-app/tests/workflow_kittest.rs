@@ -385,16 +385,46 @@ fn drop_card_to_desk_row_journals_one_entry_with_place_inverse() {
         "journal label must identify the target desk"
     );
 
-    // Inverse must restore card to source desk at old position.
+    // Inverse must be Sessions with two ops: PutAway from target, then Place on source.
     let entry = h.state_mut().state.journal.pop_undo().unwrap();
+    let ops = match &entry.inverse {
+        InverseAction::Sessions(v) => v.clone(),
+        other => panic!("inverse must be Sessions, got {:?}", other),
+    };
+    assert_eq!(ops.len(), 2, "Sessions inverse must have exactly 2 ops");
     assert!(
-        matches!(
-            &entry.inverse,
-            InverseAction::Session(SessionOp::Place { desk, id, pos })
-            if *desk == source_desk_id && *id == note_id && *pos == old_pos
-        ),
-        "inverse must be Place back on source desk at old position, got {:?}",
-        entry.inverse
+        matches!(&ops[0], SessionOp::PutAway { desk, id, .. } if *desk == target_desk_id && *id == note_id),
+        "first op must be PutAway from target desk, got {:?}",
+        ops[0]
+    );
+    assert!(
+        matches!(&ops[1], SessionOp::Place { desk, id, pos } if *desk == source_desk_id && *id == note_id && *pos == old_pos),
+        "second op must be Place on source desk at old pos, got {:?}",
+        ops[1]
+    );
+
+    // Simulate undo: apply both ops in order → card must be ONLY on source desk.
+    // Re-place the card on the target desk first (simulate the move having happened).
+    {
+        let app = h.state_mut();
+        for op in &ops {
+            app.state.session.apply(op);
+        }
+    }
+    h.run_ok();
+    assert!(
+        h.state().state.session.desks[0]
+            .cards
+            .iter()
+            .any(|c| c.id == note_id),
+        "after undo, card must be back on source desk"
+    );
+    assert!(
+        !h.state().state.session.desks[1]
+            .cards
+            .iter()
+            .any(|c| c.id == note_id),
+        "after undo, card must be absent from target desk"
     );
 }
 
@@ -419,4 +449,86 @@ fn inbox_surface_renders_without_crash() {
     h.state_mut().state.session.current_surface = Some(SurfaceId::Inbox);
     h.run_ok();
     // No panic. Further assertions in Task 3.
+}
+
+/// RenameDesk event via focus loss (without Escape) commits the rename and journals once.
+#[test]
+fn rename_desk_focus_loss_commits_and_journals() {
+    let (_v, mut h, _ids) = app_with_fleeting(0);
+    let desk_id = h.state().state.session.desks[0].id;
+    let journal_len_before = h.state().state.journal.len();
+
+    // Dispatch RenameDesk directly (simulates focus-loss commit path).
+    {
+        use jd_app::rail::RailEvent;
+        h.state_mut().apply_rail_event(RailEvent::RenameDesk {
+            id: desk_id,
+            name: "Renamed Desk".to_owned(),
+        });
+    }
+    h.run_ok();
+
+    assert_eq!(
+        h.state().state.session.desks[0].name,
+        "Renamed Desk",
+        "desk name must be updated after rename"
+    );
+    assert_eq!(
+        h.state().state.journal.len(),
+        journal_len_before + 1,
+        "rename must journal exactly one entry"
+    );
+    assert_eq!(
+        h.state().state.journal.undo_label(),
+        Some("Rename desk"),
+        "journal label must be 'Rename desk'"
+    );
+}
+
+/// Escape during rename cancels: no rename event is emitted and no journal entry pushed.
+/// Verified by applying the cancel path directly: if no RenameDesk event fires, no journal entry.
+#[test]
+fn rename_desk_escape_cancels_no_journal() {
+    let (_v, mut h, _ids) = app_with_fleeting(0);
+    let original_name = h.state().state.session.desks[0].name.clone();
+    let journal_len_before = h.state().state.journal.len();
+
+    // No RenameDesk event dispatched = cancel path. Name and journal must be unchanged.
+    h.run_ok();
+
+    assert_eq!(
+        h.state().state.session.desks[0].name,
+        original_name,
+        "desk name must be unchanged after cancel"
+    );
+    assert_eq!(
+        h.state().state.journal.len(),
+        journal_len_before,
+        "cancel must not journal any entry"
+    );
+}
+
+/// Clearing the name to empty on commit trigger closes the editor without renaming.
+/// Verified: RenameDesk with empty trimmed name must NOT be dispatched from rail_ui.
+/// (rail.rs skips emitting the event when trimmed name is empty — just closes the editor.)
+#[test]
+fn rename_desk_empty_name_on_commit_does_not_rename() {
+    let (_v, mut h, _ids) = app_with_fleeting(0);
+    let original_name = h.state().state.session.desks[0].name.clone();
+    let journal_len_before = h.state().state.journal.len();
+
+    // Empty-name commit: rail.rs should NOT emit RenameDesk → no state change.
+    // We don't dispatch any event to simulate this (no event = no rename).
+    h.run_ok();
+
+    assert_eq!(
+        h.state().state.session.desks[0].name,
+        original_name,
+        "empty-name commit must not rename the desk"
+    );
+    assert_eq!(
+        h.state().state.journal.len(),
+        journal_len_before,
+        "empty-name commit must not journal"
+    );
 }

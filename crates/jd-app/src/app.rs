@@ -328,11 +328,9 @@ impl JdUi {
             }
 
             // Card dropped on a desk row = PutAway from source + Place on target.
-            // Journal: ONE entry "Move card to desk '<name>'" with inverse =
-            // Session(Place back on source at old pos).
-            // This is the composite-journal decision: the target-place's inverse
-            // (PutAway from target) is NOT journaled — undo restores source position
-            // only, which is the correct single-Ctrl+Z behaviour documented in WP3.
+            // Journal: ONE entry "Move card to desk '<name>'" with composite inverse.
+            // Task 6's undo executor applies Sessions in order and journals the
+            // reverse-ordered inverses as the redo entry.
             RailEvent::CardDroppedOnDesk {
                 target_desk,
                 id,
@@ -368,14 +366,23 @@ impl JdUi {
                     pos: target_center,
                 });
                 self.state.session_dirty_at = Some(std::time::Instant::now());
-                // ONE journal entry; inverse restores card at source desk old pos.
+                // ONE journal entry; inverse is Sessions applied in order:
+                // 1. PutAway from target (undoes the Place on target)
+                // 2. Place back on source at old pos (undoes the PutAway from source)
                 self.state.journal.push(JournalEntry {
                     label: format!("Move card to desk '{target_name}'"),
-                    inverse: InverseAction::Session(SessionOp::Place {
-                        desk: source_desk,
-                        id,
-                        pos: was_at,
-                    }),
+                    inverse: InverseAction::Sessions(vec![
+                        SessionOp::PutAway {
+                            desk: target_desk,
+                            id,
+                            was_at: target_center,
+                        },
+                        SessionOp::Place {
+                            desk: source_desk,
+                            id,
+                            pos: was_at,
+                        },
+                    ]),
                     context: OpContext::default(),
                 });
             }

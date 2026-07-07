@@ -113,19 +113,25 @@ pub fn rail_ui(ui: &mut egui::Ui, deps: &mut RailUiDeps<'_>) -> Vec<RailEvent> {
             });
             let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
             let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
-            let confirmed = resp.lost_focus() && enter_pressed;
-            let cancelled = resp.lost_focus() && (esc_pressed || !enter_pressed);
-            if confirmed && !buf.trim().is_empty() {
-                let new_name = buf.trim().to_owned();
-                events.push(RailEvent::RenameDesk {
-                    id: *desk_id,
-                    name: new_name,
-                });
+            // Escape → cancel (discard).
+            // Enter OR lost_focus (without Escape) → commit if name is non-empty and changed.
+            // Empty name on commit trigger → cancel (close editor, revert).
+            let cancelled = esc_pressed;
+            let commit_trigger = !cancelled && (enter_pressed || resp.lost_focus());
+            if cancelled {
                 ui.memory_mut(|m| {
                     m.data
                         .insert_temp(rename_state_id(), RenameState::default())
                 });
-            } else if cancelled {
+            } else if commit_trigger {
+                let trimmed = buf.trim().to_owned();
+                if !trimmed.is_empty() && trimmed != *desk_name {
+                    events.push(RailEvent::RenameDesk {
+                        id: *desk_id,
+                        name: trimmed,
+                    });
+                }
+                // Close editor whether or not we committed (empty or same-name = revert).
                 ui.memory_mut(|m| {
                     m.data
                         .insert_temp(rename_state_id(), RenameState::default())
