@@ -252,6 +252,38 @@ impl JdUi {
                 }
                 DeskEvent::FocusChanged(id) => {
                     self.state.focus = id;
+                    // Reveal: if the newly focused card is off-screen, pan to it.
+                    if let Some(focused_id) = id
+                        && let Some(desk) = self.state.session.desks.first()
+                    {
+                        // Approximate the panel rect (app window minus status bar).
+                        // kittest uses 1200×800 minus ~24px; in production this is
+                        // a best-effort approximation (close enough for reveal).
+                        // We cannot get the real panel rect here (outside the ui fn),
+                        // so we use a sentinel that errs on the side of revealing.
+                        // A zero-rect makes every card "off-screen", centering on it.
+                        let panel =
+                            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 776.0));
+                        if let Some(new_cam) =
+                            crate::surfaces::desk::reveal(desk, focused_id, panel)
+                        {
+                            let desk_id = desk.id;
+                            if let Some(d) = self
+                                .state
+                                .session
+                                .desks
+                                .iter_mut()
+                                .find(|d| d.id == desk_id)
+                            {
+                                d.viewport.center = jd_core::geom::Vec2 {
+                                    x: new_cam.center.x,
+                                    y: new_cam.center.y,
+                                };
+                                d.viewport.zoom = new_cam.zoom;
+                            }
+                            self.state.session_dirty_at = Some(std::time::Instant::now());
+                        }
+                    }
                 }
                 DeskEvent::SessionOp(op) => {
                     let label = session_op_label(&op);

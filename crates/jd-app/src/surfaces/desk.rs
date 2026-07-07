@@ -306,14 +306,41 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
     // ------------------------------------------------------------------
     // 3. Pan and zoom via scroll
     // ------------------------------------------------------------------
-    // egui maps Ctrl+scroll → zoom_delta (>1 or <1) and plain/shift scroll
-    // → smooth_scroll_delta (shift handled by egui's horizontal_scroll_modifier).
+    // Plain/shift scroll → smooth_scroll_delta; Ctrl+scroll → raw y delta used
+    // with spec formula 1.0015^delta for precise, spec-compliant zoom speed.
     let scroll = ui.input(|i| i.smooth_scroll_delta);
-    let zoom_factor = ui.input(|i| i.zoom_delta());
+    // Read Ctrl+scroll raw delta for spec-formula zoom (not zoom_delta() which
+    // uses egui's own formula). Sum all MouseWheel events with Ctrl held this frame.
+    // Line unit default: egui uses 50px/line; Page unit: use panel height.
+    let panel_h = panel.height();
+    let ctrl_scroll_delta = ui.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|ev| {
+                if let egui::Event::MouseWheel {
+                    delta,
+                    modifiers,
+                    unit,
+                    ..
+                } = ev
+                    && modifiers.command
+                {
+                    let y = match unit {
+                        egui::MouseWheelUnit::Point => delta.y,
+                        egui::MouseWheelUnit::Line => delta.y * 50.0,
+                        egui::MouseWheelUnit::Page => delta.y * panel_h,
+                    };
+                    return Some(y);
+                }
+                None
+            })
+            .sum::<f32>()
+    });
     let mut viewport_changed = false;
 
-    // Zoom: zoom_delta() != 1.0 means Ctrl+scroll was active.
-    if (zoom_factor - 1.0).abs() > 1e-6 {
+    // Zoom: spec formula 1.0015^scroll_delta_points.
+    if ctrl_scroll_delta.abs() > 1e-6 {
+        let zoom_factor = 1.0015_f32.powf(ctrl_scroll_delta);
         let ptr_screen = ui
             .input(|i| i.pointer.latest_pos())
             .unwrap_or(panel.center());
@@ -360,10 +387,15 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
     let pointer_delta = ui.input(|i| i.pointer.delta());
 
     // Hit-test which card the pointer is over (for drag/focus).
+    // Use per-shape card_size so the hit rect matches the rendered outline.
     let pointer_over_card: Option<NoteId> = pointer_pos.and_then(|pos| {
         desk.cards.iter().find_map(|card| {
             let screen_min = cam.to_screen(panel, egui::pos2(card.pos.x, card.pos.y));
-            let rect = egui::Rect::from_min_size(screen_min, egui::vec2(300.0, 208.0) * cam.zoom);
+            let meta_size = state.face_metas.iter().find(|m| m.id == card.id).map(|m| {
+                crate::card::shape::card_size(crate::card::shape::shape_for(m.status, m.kind))
+            });
+            let world_size = meta_size.unwrap_or_else(|| egui::vec2(300.0, 200.0));
+            let rect = egui::Rect::from_min_size(screen_min, world_size * cam.zoom);
             if rect.contains(pos) {
                 Some(card.id)
             } else {
@@ -418,8 +450,9 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
         // else: tiny drag = click, focus already set on press
     }
 
-    // Background drag → pan (pointer on empty background)
-    if pointer_over_card.is_none()
+    // Background drag → pan (pointer on empty background, no card drag active)
+    if state.drag.is_none()
+        && pointer_over_card.is_none()
         && ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
         && pointer_delta != egui::Vec2::ZERO
     {

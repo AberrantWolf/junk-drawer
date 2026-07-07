@@ -144,6 +144,55 @@ fn drag_moves_a_card_and_survives_in_session_state() {
     assert_eq!(h.state().state.journal.undo_label(), Some("Move card"));
 }
 
+/// Dragging a card to empty background space must NOT pan the viewport.
+/// (Regression guard for fix 1: `state.drag.is_none()` in the background-pan guard.)
+#[test]
+fn drag_to_empty_space_does_not_pan() {
+    // Use 1 card placed at (0,0); drag destination at +(0,250) which is below
+    // it and over empty canvas (no card sits there).
+    let (_v, mut h, ids) = app_with_cards(1);
+    let from = card_center_on_screen(&h, ids[0]);
+    let to = from + egui::vec2(0.0, 250.0);
+
+    // Capture viewport center before drag.
+    let before_center = h.state().state.session.desks[0].viewport.center;
+
+    h.drag_at(from);
+    h.run_ok();
+    h.hover_at(to);
+    h.run_ok();
+    h.drop_at(to);
+    h.run_ok();
+
+    let desk = &h.state().state.session.desks[0];
+
+    // (a) Card moved by approximately the drag delta (zoom=1.0 so px ≈ world units).
+    // Card started at (0,0); drag was +250 in y, 0 in x.
+    let placed = desk
+        .cards
+        .iter()
+        .find(|c| c.id == ids[0])
+        .expect("card still on desk after drag");
+    assert!(
+        placed.pos.x.abs() < 8.0,
+        "card x should be unchanged (drag was vertical), got x={:.1}",
+        placed.pos.x
+    );
+    assert!(
+        (placed.pos.y - 250.0).abs() < 8.0,
+        "card should move ≈250 world units down, got y={:.1}",
+        placed.pos.y
+    );
+
+    // (b) Viewport center UNCHANGED — no pan fired during the card drag.
+    let after_center = desk.viewport.center;
+    assert!(
+        (after_center.x - before_center.x).abs() < 2.0
+            && (after_center.y - before_center.y).abs() < 2.0,
+        "viewport must not pan during card drag; before={before_center:?} after={after_center:?}"
+    );
+}
+
 #[test]
 fn pan_and_zoom_change_the_camera_and_clamp() {
     let (_v, mut h, _ids) = app_with_cards(1);
@@ -234,6 +283,86 @@ fn offscreen_cards_are_culled_from_the_accesskit_tree() {
     h.get_by_label("Fit").click();
     h.run_ok();
     assert!(h.query_by_label_contains("Card: 'Far card'").is_some());
+}
+
+/// Arrow-key navigation to an off-screen card triggers reveal(), centering the
+/// viewport on it so it is no longer culled (Fix 3: wire reveal in app.rs).
+#[test]
+fn arrowkey_to_offscreen_card_reveals_it() {
+    // Start with 1 card at (0,0); place a far card very far to the right.
+    let (_v, mut h, ids) = app_with_cards(1);
+    let desk_id = h.state().state.session.desks[0].id;
+
+    let seed = common::new_note("Reveal target", "body");
+    h.state_mut()
+        .vault
+        .commands
+        .send(VaultCommand::Op {
+            op: VaultOp::Create {
+                seed,
+                dest: Dest::Notes,
+            },
+            source: OpSource::User,
+        })
+        .unwrap();
+    let far_id;
+    loop {
+        match h
+            .state_mut()
+            .vault
+            .events
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("OpDone for reveal target")
+        {
+            VaultEvent::OpDone { result, .. } => {
+                far_id = result
+                    .created
+                    .into_iter()
+                    .next()
+                    .expect("Create yields an id");
+                break;
+            }
+            _ => continue,
+        }
+    }
+
+    // Place it far off to the right — culled from the initial viewport.
+    let _ = h.state_mut().state.session.apply(&SessionOp::Place {
+        desk: desk_id,
+        id: far_id,
+        pos: Vec2 {
+            x: 50_000.0,
+            y: 0.0,
+        },
+    });
+    let _ = &ids;
+    h.run_ok();
+
+    // Verify it's culled before reveal.
+    assert!(
+        h.query_by_label_contains("Card: 'Reveal target'").is_none(),
+        "far card must be culled before reveal"
+    );
+
+    // ArrowRight until focus lands on the far card (reading order: Card 1 then Reveal target).
+    // First ArrowRight selects the first card; second selects far card.
+    h.key_press(egui::Key::ArrowRight);
+    h.run_ok();
+    h.key_press(egui::Key::ArrowRight);
+    h.run_ok();
+
+    // Focus should now be on far_id.
+    assert_eq!(
+        h.state().state.focus,
+        Some(far_id),
+        "focus should have moved to the far card"
+    );
+
+    // reveal() was called → viewport centered on far card → no longer culled.
+    assert!(
+        h.query_by_label_contains("Card: 'Reveal target'").is_some(),
+        "after reveal, far card AccessKit node must exist (not culled)"
+    );
 }
 
 #[test]
