@@ -55,6 +55,11 @@ pub struct CardMenuCtx<'a> {
     pub desks: &'a [(DeskId, &'a str)],
     /// True when this card is currently placed on any desk (Put Away enabled).
     pub on_desk: bool,
+    /// True while the card editor overlay is open.  When set, the menu must
+    /// not be interactive — return None immediately so no events are emitted.
+    pub editor_open: bool,
+    /// True while a delete-confirm modal is pending.  Same guard as editor_open.
+    pub confirm_pending: bool,
 }
 
 /// Render the 9 card-menu items inside the calling `ui` (which may be a
@@ -63,6 +68,15 @@ pub struct CardMenuCtx<'a> {
 /// Returns `Some(CardMenuEvent)` if an item was clicked, `None` otherwise.
 /// The caller is responsible for closing the menu/popup after dispatching.
 pub fn card_menu_items(ui: &mut egui::Ui, ctx: &CardMenuCtx<'_>) -> Option<CardMenuEvent> {
+    // Modal stacking guard: if the editor or delete-confirm modal is open,
+    // the context menu must not emit any actions.  This prevents a right-click
+    // menu opened on the card before the modal appeared from being acted on
+    // while the modal is in front.
+    if ctx.editor_open || ctx.confirm_pending {
+        ui.close();
+        return None;
+    }
+
     let mut event: Option<CardMenuEvent> = None;
 
     // ── Promote ─────────────────────────────────────────────────────────────

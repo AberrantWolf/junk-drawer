@@ -269,9 +269,26 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
     let card_positions: Vec<(NoteId, Vec2)> = desk.cards.iter().map(|c| (c.id, c.pos)).collect();
 
     // ------------------------------------------------------------------
-    // 2. Keyboard handling (only when editor is closed and no confirm modal)
+    // 2. Keyboard handling (only when editor is closed, no confirm modal,
+    //    and no card context-menu popup is open).
+    //
+    //    Read the per-card popup flag for the currently focused card.  When
+    //    the popup is open, Enter must NOT open the card editor — it should
+    //    be handled (or ignored) by the popup itself.  Same for all other
+    //    surface keys (arrows, Backspace, Shift+F10).
     // ------------------------------------------------------------------
-    if !state.editor_open && !state.confirm_pending {
+    let card_popup_open: bool = state
+        .focus
+        .map(|id| {
+            ui.memory(|m| {
+                m.data
+                    .get_temp::<bool>(card_popup_open_id(id))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+
+    if !state.editor_open && !state.confirm_pending && !card_popup_open {
         for (key, dir) in [
             (egui::Key::ArrowLeft, FocusDir::Left),
             (egui::Key::ArrowRight, FocusDir::Right),
@@ -621,6 +638,8 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
             },
             desks: &desk_refs,
             on_desk: true, // card is on a desk surface
+            editor_open: state.editor_open,
+            confirm_pending: state.confirm_pending,
         };
 
         // Right-click context menu via Response::context_menu.
@@ -667,7 +686,9 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
                     });
 
                 // Check if popup should close (click outside or Esc).
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                // consume_key prevents Esc from leaking to surface handlers or
+                // other modals in the same frame (defense in depth).
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                     ui.memory_mut(|m| {
                         m.data.insert_temp(card_popup_open_id(card.id), false);
                     });
@@ -685,7 +706,7 @@ pub fn context_menu_open_id() -> egui::Id {
 }
 
 /// egui memory key for a specific card's keyboard-popup open state.
-fn card_popup_open_id(id: NoteId) -> egui::Id {
+pub fn card_popup_open_id(id: NoteId) -> egui::Id {
     egui::Id::new("desk_card_popup_open").with(id)
 }
 

@@ -2229,3 +2229,102 @@ fn card_menu_promote_disabled_for_permanent() {
         "Promote item must be disabled (can_promote=false) for a permanent card"
     );
 }
+
+/// Regression: Enter must NOT open the card editor while the Shift+F10 context
+/// menu popup is open.  Before the fix, the keyboard section ran regardless of
+/// popup state, so Enter would fire DeskEvent::OpenCard.
+#[test]
+fn enter_does_not_open_editor_while_popup_open() {
+    let (_v, mut h, note_id, _desk_id) = app_with_permanent_card_on_desk();
+
+    // Open the popup programmatically by setting the egui memory flag.
+    h.state_mut().state.focus = Some(note_id);
+    {
+        use jd_app::surfaces::desk::card_popup_open_id;
+        h.ctx
+            .memory_mut(|m| m.data.insert_temp(card_popup_open_id(note_id), true));
+    }
+    // One render so the popup open flag is live.
+    h.step();
+
+    // Press Enter — must NOT open the editor.
+    h.key_press(egui::Key::Enter);
+    h.step();
+
+    // Editor must not be open — the popup intercepted (or suppressed) Enter.
+    assert!(
+        h.state().state.editor.is_none(),
+        "Enter while popup is open must not open the card editor"
+    );
+
+    // open_card must remain None.
+    assert!(
+        h.state().state.session.open_card.is_none(),
+        "open_card must remain None when Enter is pressed while popup is open"
+    );
+}
+
+/// Regression: card_menu_items returns None (no events emitted) when the editor
+/// is open or a confirm modal is pending — prevents menu actions while a modal
+/// is in front (modal stacking / accidental interaction).
+#[test]
+fn card_menu_items_blocked_while_editor_or_confirm_open() {
+    use egui_kittest::Harness;
+    use jd_app::menus::{CardMenuCtx, card_menu_items};
+    use jd_core::id::NoteId;
+    use jd_core::note::{Kind, Status};
+    use jd_core::session::DeskId;
+
+    fn make_id(n: u8) -> NoteId {
+        let s = format!("01ARZ3NDEKTSV4RRFFQ69G5F{n:02}");
+        NoteId::parse(&s).unwrap()
+    }
+
+    fn make_desk_id() -> DeskId {
+        use jd_core::id::IdGen;
+        DeskId::generate(&mut IdGen::new())
+    }
+
+    let desk_id = make_desk_id();
+    let desk_list = vec![(desk_id, "Desk")];
+
+    // editor_open = true → None
+    let mut harness = Harness::new_ui(|ui| {
+        let ctx = CardMenuCtx {
+            id: make_id(1),
+            status: Status::Permanent,
+            kind: Kind::Note,
+            title: "Test Card",
+            desks: &desk_list,
+            on_desk: true,
+            editor_open: true,
+            confirm_pending: false,
+        };
+        let result = card_menu_items(ui, &ctx);
+        assert!(
+            result.is_none(),
+            "card_menu_items must return None when editor_open=true"
+        );
+    });
+    harness.run_ok();
+
+    // confirm_pending = true → None
+    let mut harness2 = Harness::new_ui(|ui| {
+        let ctx = CardMenuCtx {
+            id: make_id(2),
+            status: Status::Permanent,
+            kind: Kind::Note,
+            title: "Test Card",
+            desks: &desk_list,
+            on_desk: true,
+            editor_open: false,
+            confirm_pending: true,
+        };
+        let result = card_menu_items(ui, &ctx);
+        assert!(
+            result.is_none(),
+            "card_menu_items must return None when confirm_pending=true"
+        );
+    });
+    harness2.run_ok();
+}

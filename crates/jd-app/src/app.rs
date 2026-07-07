@@ -1587,7 +1587,7 @@ impl Drop for JdUi {
 // ---------------------------------------------------------------------------
 
 /// Launch the platform file manager to reveal `path`.
-/// macOS: `open -R <path>`; Windows: `explorer /select,<path>`;
+/// macOS: `open -R <path>`; Windows: `explorer /select,"<path>"` (raw arg);
 /// Linux/other: `xdg-open <parent-dir>`.
 /// Spawns and detaches (non-blocking).  Returns `Err` if spawn fails.
 fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), String> {
@@ -1601,8 +1601,13 @@ fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        // `/select,"<path>"` must be ONE raw token passed to CreateProcess.
+        // Using .arg() would quote the whole argument as a separate token,
+        // breaking paths with spaces (Windows Shell parses `/select,` prefix
+        // directly from the raw command line).
         std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
+            .raw_arg(explorer_select_arg(path))
             .spawn()
             .map_err(|e| e.to_string())?;
     }
@@ -1615,6 +1620,15 @@ fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Build the raw `/select,"<path>"` argument string for Windows explorer.
+/// Extracted as a pure function so its string construction can be unit-tested
+/// cross-platform (the cfg(windows) CommandExt::raw_arg call is not, but the
+/// argument form it receives is pinned by this test).
+#[allow(dead_code)] // used only on cfg(windows), but tested on all platforms
+fn explorer_select_arg(path: &std::path::Path) -> String {
+    format!("/select,\"{}\"", path.display())
 }
 
 /// If a vault undo/redo op fails, clear the in-flight guard and restore the
@@ -1825,6 +1839,40 @@ mod tests {
         assert!(state.pending_undo_redo.is_none());
         assert!(state.pending_undo_entry.is_none());
         assert!(state.journal.undo_label().is_none());
+    }
+
+    /// Pin the raw argument form used for Windows explorer /select,.
+    /// The raw_arg call receives this string verbatim; spaces in the path must
+    /// be inside the quotes so Windows Shell parses /select, as a single token.
+    #[test]
+    fn explorer_select_arg_quotes_path() {
+        use std::path::Path;
+        let simple = Path::new(r"C:\notes\file.md");
+        let result = explorer_select_arg(simple);
+        assert!(
+            result.starts_with("/select,\""),
+            "must start with /select,\": {result}"
+        );
+        assert!(
+            result.ends_with('"'),
+            "must end with closing quote: {result}"
+        );
+        assert!(
+            result.contains("file.md"),
+            "must contain the filename: {result}"
+        );
+
+        let with_spaces = Path::new(r"C:\my notes\my file.md");
+        let result2 = explorer_select_arg(with_spaces);
+        // The whole path is quoted as one token; spaces inside quotes are OK.
+        assert!(
+            result2.starts_with("/select,\""),
+            "spaced path must start with /select,\": {result2}"
+        );
+        assert!(
+            result2.contains("my notes"),
+            "spaced path must contain directory: {result2}"
+        );
     }
 
     /// View-travel must skip the surface switch if the desk has been deleted since
