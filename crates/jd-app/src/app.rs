@@ -15,6 +15,7 @@ use jd_core::session::{DeskId, SessionOp, SessionState, SurfaceId};
 use jd_core::vault::Vault;
 use jd_core::worker::{self, VaultCommand, VaultEvent, VaultHandle};
 
+use crate::rail::{RailEvent, RailUiDeps};
 use crate::state::UiState;
 use crate::surfaces::desk::{DeskEvent, DeskUiDeps, DragState, FaceMeta};
 
@@ -239,6 +240,148 @@ impl JdUi {
         }
     }
 
+    /// Apply a single `RailEvent` — public so kitests can dispatch events directly.
+    pub fn apply_rail_event(&mut self, ev: RailEvent) {
+        match ev {
+            RailEvent::Switch(surface) => {
+                // Navigation is not undoable (like viewport moves).
+                self.state.session.current_surface = Some(surface);
+                self.state.session_dirty_at = Some(std::time::Instant::now());
+            }
+
+            RailEvent::CreateDesk => {
+                let id = DeskId::generate(&mut self.id_gen);
+                let n = self.state.session.desks.len() + 1;
+                self.apply_session(
+                    SessionOp::CreateDesk {
+                        id,
+                        name: format!("Desk {n}"),
+                    },
+                    Some("Create desk"),
+                );
+                // Switch to the new desk.
+                self.state.session.current_surface = Some(SurfaceId::Desk(id));
+            }
+
+            RailEvent::RenameDesk { id, name } => {
+                // `from` = current name (apply_session reads it from the desk).
+                let from = self
+                    .state
+                    .session
+                    .desks
+                    .iter()
+                    .find(|d| d.id == id)
+                    .map(|d| d.name.clone())
+                    .unwrap_or_default();
+                self.apply_session(
+                    SessionOp::RenameDesk { id, from, to: name },
+                    Some("Rename desk"),
+                );
+            }
+
+            RailEvent::ReorderDesk { id, to } => {
+                let from_index = self
+                    .state
+                    .session
+                    .desks
+                    .iter()
+                    .position(|d| d.id == id)
+                    .unwrap_or(0);
+                self.apply_session(
+                    SessionOp::ReorderDesk {
+                        id,
+                        from_index,
+                        to_index: to,
+                    },
+                    Some("Reorder desk"),
+                );
+            }
+
+            // ── Card-drop events ────────────────────────────────────────────
+
+            // Card dropped on Inbox row = PutAway from source desk.
+            // Journal: ONE entry "Put card away" with inverse =
+            // Session(Place{desk: source, id, pos: was_at}).
+            RailEvent::CardDroppedOnInbox {
+                id,
+                source_desk,
+                was_at,
+            } => {
+                // Apply PutAway WITHOUT going through apply_session so we can
+                // build a custom journal entry with a Place inverse.
+                let _inverse = self.state.session.apply(&SessionOp::PutAway {
+                    desk: source_desk,
+                    id,
+                    was_at,
+                });
+                self.state.session_dirty_at = Some(std::time::Instant::now());
+                // ONE journal entry; inverse restores the card at its old position.
+                self.state.journal.push(JournalEntry {
+                    label: "Put card away".to_owned(),
+                    inverse: InverseAction::Session(SessionOp::Place {
+                        desk: source_desk,
+                        id,
+                        pos: was_at,
+                    }),
+                    context: OpContext::default(),
+                });
+            }
+
+            // Card dropped on a desk row = PutAway from source + Place on target.
+            // Journal: ONE entry "Move card to desk '<name>'" with inverse =
+            // Session(Place back on source at old pos).
+            // This is the composite-journal decision: the target-place's inverse
+            // (PutAway from target) is NOT journaled — undo restores source position
+            // only, which is the correct single-Ctrl+Z behaviour documented in WP3.
+            RailEvent::CardDroppedOnDesk {
+                target_desk,
+                id,
+                source_desk,
+                was_at,
+            } => {
+                let target_name = self
+                    .state
+                    .session
+                    .desks
+                    .iter()
+                    .find(|d| d.id == target_desk)
+                    .map(|d| d.name.clone())
+                    .unwrap_or_default();
+                // PutAway from source (no journal).
+                let _put_away_inverse = self.state.session.apply(&SessionOp::PutAway {
+                    desk: source_desk,
+                    id,
+                    was_at,
+                });
+                // Place on target at target viewport center.
+                let target_center = self
+                    .state
+                    .session
+                    .desks
+                    .iter()
+                    .find(|d| d.id == target_desk)
+                    .map(|d| d.viewport.center)
+                    .unwrap_or_default();
+                let _place_inverse = self.state.session.apply(&SessionOp::Place {
+                    desk: target_desk,
+                    id,
+                    pos: target_center,
+                });
+                self.state.session_dirty_at = Some(std::time::Instant::now());
+                // ONE journal entry; inverse restores card at source desk old pos.
+                self.state.journal.push(JournalEntry {
+                    label: format!("Move card to desk '{target_name}'"),
+                    inverse: InverseAction::Session(SessionOp::Place {
+                        desk: source_desk,
+                        id,
+                        pos: was_at,
+                    }),
+                    context: OpContext::default(),
+                });
+            }
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         if !self.fonts_installed {
             crate::theme::install_fonts(ui.ctx());
@@ -329,18 +472,21 @@ impl JdUi {
             }
         }
 
-        // 4. Render: central desk + status line; editor overlay when open (Task 10).
+        // 4. Render: left rail + central surface + status line; editor overlay (Task 10).
 
         // ------------------------------------------------------------------
-        // Status line (bottom)
+        // Status line (bottom) — must be added before SidePanel and CentralPanel.
         // ------------------------------------------------------------------
         let fit_clicked = egui::Panel::bottom("status_line")
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Junk Drawer");
                     let fit = ui.button("Fit");
-                    // Zoom %
-                    if let Some(desk) = self.state.session.desks.first() {
+                    // Zoom % — show for the active desk surface only.
+                    if let Some(SurfaceId::Desk(desk_id)) = self.state.session.current_surface
+                        && let Some(desk) =
+                            self.state.session.desks.iter().find(|d| d.id == desk_id)
+                    {
                         ui.label(format!("{:.0}%", desk.viewport.zoom * 100.0));
                     }
                     if let Some(err) = &self.state.last_error {
@@ -353,68 +499,125 @@ impl JdUi {
             .inner;
 
         // ------------------------------------------------------------------
-        // Central panel: current desk
+        // Left rail (always visible).
+        // Inbox count: computed once per frame under a single index read lock,
+        // mirroring the FaceMeta lock pattern established in WP2.
+        // ------------------------------------------------------------------
+        let inbox_count = {
+            let idx = self.vault.index.read().unwrap();
+            idx.fleeting().len()
+        };
+        let rail_events = egui::Panel::left("rail")
+            .resizable(false)
+            .exact_size(160.0)
+            .show(ui, |ui| {
+                let mut deps = RailUiDeps {
+                    session: &self.state.session,
+                    inbox_count,
+                    id_gen: &mut self.id_gen,
+                };
+                crate::rail::rail_ui(ui, &mut deps)
+            })
+            .inner;
+        self.apply_rail_events(rail_events);
+
+        // ------------------------------------------------------------------
+        // Central panel: route to the active surface.
         // ------------------------------------------------------------------
         egui::CentralPanel::default().show(ui, |ui| {
-            // Prefetch FaceMeta for all placed cards under ONE index read lock.
-            let face_metas: Vec<FaceMeta> = {
-                if let Some(desk) = self.state.session.desks.first() {
-                    let idx = self.vault.index.read().unwrap();
-                    desk.cards
-                        .iter()
-                        .filter_map(|c| idx.get(c.id).map(|m| FaceMeta::from_note_meta(m, &idx)))
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            };
-
-            // Handle Fit button
-            if fit_clicked && let Some(desk) = self.state.session.desks.first() {
-                let panel = ui.max_rect();
-                let positions: Vec<(NoteId, CoreVec2)> =
-                    desk.cards.iter().map(|c| (c.id, c.pos)).collect();
-                let mut cam = crate::surfaces::desk::DeskCamera {
-                    center: egui::vec2(desk.viewport.center.x, desk.viewport.center.y),
-                    zoom: desk.viewport.zoom,
-                };
-                cam.zoom_to_fit(&positions, panel);
-                let desk_id = desk.id;
-                if let Some(d) = self
-                    .state
-                    .session
-                    .desks
-                    .iter_mut()
-                    .find(|d| d.id == desk_id)
-                {
-                    d.viewport.center = CoreVec2 {
-                        x: cam.center.x,
-                        y: cam.center.y,
+            match self.state.session.current_surface {
+                Some(SurfaceId::Desk(desk_id)) => {
+                    // Prefetch FaceMeta for all placed cards under ONE index read lock.
+                    let face_metas: Vec<FaceMeta> = {
+                        let idx = self.vault.index.read().unwrap();
+                        self.state
+                            .session
+                            .desks
+                            .iter()
+                            .find(|d| d.id == desk_id)
+                            .map(|desk| {
+                                desk.cards
+                                    .iter()
+                                    .filter_map(|c| {
+                                        idx.get(c.id).map(|m| FaceMeta::from_note_meta(m, &idx))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
                     };
-                    d.viewport.zoom = cam.zoom;
+
+                    // Handle Fit button for this desk.
+                    if fit_clicked
+                        && let Some(desk) = self
+                            .state
+                            .session
+                            .desks
+                            .iter()
+                            .find(|d| d.id == desk_id)
+                            .cloned()
+                    {
+                        let panel = ui.max_rect();
+                        let positions: Vec<(NoteId, CoreVec2)> =
+                            desk.cards.iter().map(|c| (c.id, c.pos)).collect();
+                        let mut cam = crate::surfaces::desk::DeskCamera {
+                            center: egui::vec2(desk.viewport.center.x, desk.viewport.center.y),
+                            zoom: desk.viewport.zoom,
+                        };
+                        cam.zoom_to_fit(&positions, panel);
+                        if let Some(d) = self
+                            .state
+                            .session
+                            .desks
+                            .iter_mut()
+                            .find(|d| d.id == desk_id)
+                        {
+                            d.viewport.center = CoreVec2 {
+                                x: cam.center.x,
+                                y: cam.center.y,
+                            };
+                            d.viewport.zoom = cam.zoom;
+                        }
+                        self.state.session_dirty_at = Some(std::time::Instant::now());
+                    }
+
+                    if let Some(desk) = self
+                        .state
+                        .session
+                        .desks
+                        .iter()
+                        .find(|d| d.id == desk_id)
+                        .cloned()
+                    {
+                        // Capture the real panel rect before desk_ui runs so that
+                        // reveal() in apply_desk_events (FocusChanged) uses the actual
+                        // desk area rather than a hardcoded sentinel.  One frame of
+                        // staleness is acceptable.
+                        self.last_panel_rect = Some(ui.max_rect());
+
+                        let mut deps = DeskUiDeps {
+                            focus: &mut self.state.focus,
+                            bodies: &mut self.state.bodies,
+                            commands: &self.vault.commands,
+                            theme: &self.theme,
+                            line_cache: &mut self.line_cache,
+                            face_metas: &face_metas,
+                            drag: &mut self.drag,
+                            editor_open: self.state.editor.is_some(),
+                        };
+                        let evts = crate::surfaces::desk::desk_ui(ui, &desk, &mut deps);
+                        self.apply_desk_events(evts, desk.id, &face_metas);
+                    }
                 }
-                self.state.session_dirty_at = Some(std::time::Instant::now());
-            }
 
-            if let Some(desk) = self.state.session.desks.first().cloned() {
-                // Capture the real panel rect before desk_ui runs so that
-                // reveal() in apply_desk_events (FocusChanged) uses the actual
-                // desk area rather than a hardcoded sentinel.  One frame of
-                // staleness is acceptable.
-                self.last_panel_rect = Some(ui.max_rect());
+                // Tasks 3/5 not yet implemented — show placeholder until they land.
+                Some(SurfaceId::Inbox) | Some(SurfaceId::Trash) | None => {
+                    crate::surfaces::placeholder::placeholder_ui(ui);
+                }
 
-                let mut deps = DeskUiDeps {
-                    focus: &mut self.state.focus,
-                    bodies: &mut self.state.bodies,
-                    commands: &self.vault.commands,
-                    theme: &self.theme,
-                    line_cache: &mut self.line_cache,
-                    face_metas: &face_metas,
-                    drag: &mut self.drag,
-                    editor_open: self.state.editor.is_some(),
-                };
-                let evts = crate::surfaces::desk::desk_ui(ui, &desk, &mut deps);
-                self.apply_desk_events(evts, desk.id, &face_metas);
+                // Drawer (WP4) and Map (WP5) — placeholder per scope boundaries.
+                Some(SurfaceId::Drawer) | Some(SurfaceId::Map) => {
+                    crate::surfaces::placeholder::placeholder_ui(ui);
+                }
             }
         });
 
@@ -540,6 +743,20 @@ impl JdUi {
                     self.state.session_dirty_at = Some(std::time::Instant::now());
                 }
             }
+        }
+    }
+
+    /// Apply `RailEvent`s emitted by `rail_ui`.
+    ///
+    /// Switch: sets `current_surface` directly + marks `session_dirty_at`
+    ///   (navigation is not undoable, like viewport).
+    /// CreateDesk / RenameDesk / ReorderDesk: journaled SessionOps.
+    /// CardDroppedOnInbox: PutAway from source desk, ONE journal entry.
+    /// CardDroppedOnDesk: PutAway from source + Place on target, ONE journal entry
+    ///   whose inverse is Session(Place back on source at old pos).
+    fn apply_rail_events(&mut self, events: Vec<RailEvent>) {
+        for ev in events {
+            self.apply_rail_event(ev);
         }
     }
 }
