@@ -1,6 +1,7 @@
 //! Junk Drawer core: vault I/O, parsers, index, search, undo journal.
 //! No egui dependency — fully testable headless.
 
+pub mod command;
 pub mod doc;
 pub mod error;
 pub mod frontmatter;

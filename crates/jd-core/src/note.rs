@@ -93,7 +93,7 @@ pub struct NoteMeta {
 }
 
 /// Seed for creating a note (capture paths, palette "New scrap", split).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NewNote {
     pub body: String,
     pub status: Status,
