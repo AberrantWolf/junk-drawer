@@ -524,17 +524,13 @@ pub fn editor_ui(
                 egui::Key::Z,
             ) || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
         });
-        if do_undo
-            && let Some(snap) = ed.undo.undo(&ed.buffer)
-        {
+        if do_undo && let Some(snap) = ed.undo.undo(&ed.buffer) {
             ed.buffer = snap.text;
             set_cursor_char(ui.ctx(), te_id, snap.cursor);
             ed.dirty = true;
             ed.last_edit = Some(Instant::now());
         }
-        if do_redo
-            && let Some(snap) = ed.undo.redo()
-        {
+        if do_redo && let Some(snap) = ed.undo.redo() {
             ed.buffer = snap.text;
             set_cursor_char(ui.ctx(), te_id, snap.cursor);
             ed.dirty = true;

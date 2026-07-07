@@ -825,6 +825,14 @@ WP1b/WP1c parallelize after WP1a. WP5 needs only WP2's surfaces scaffolding + WP
 - Body-derived filenames make some undo paths rel_path-unstable (untitled-note Batch case; RenameTitle-undo when the old name got re-claimed) — decide: accept-and-document, or carry paths in inverses.
 - Undo of Split leaves the split-off note in trash (consistent with Create-undo; document in undo UX copy).
 
+**WP2 → WP3 handoffs:**
+- Face checkbox ☐/☑ glyph substitution + click-to-toggle (needs face-only text transform; editor must keep raw source — TODO(WP3) in theme.rs).
+- Ctrl+Enter promotion hook: editor_ui returns EditorEvent; promotion branches there.
+- Stale pending_create if a Create's OpDone precedes ScanComplete (comment at consumption site in app.rs); consider a ScanComplete sweep.
+- ac_dismissed persists for the whole [[ context after Esc — consider re-showing on query change.
+- Editor autosave/debounce tests use one real sleep each — watch for CI flake; #[ignore] escape hatch documented.
+- jd-core worker sets `modified` on every SaveBody — frontmatter is deliberately NOT byte-identical after a dirty save (the round-trip law's one sanctioned field change; don't "fix" set_modified).
+
 **Files:** `jd-app/src/surfaces/{inbox, trash}.rs`, `rail.rs`, promotion logic in `editor.rs`, journal wiring in `app.rs`, `menus.rs` (Edit-menu subset + Card context menu); kittest scenarios.
 
 **Requirements:**
@@ -937,3 +945,5 @@ WP1b/WP1c parallelize after WP1a. WP5 needs only WP2's surfaces scaffolding + WP
 10. **SearchHit carries matched terms, not snippets** — snippets need bodies, bodies aren't in the index, and query() runs on the UI thread. `make_snippet(body, terms, radius)` is a pure helper the app calls after loading bodies via the worker (visible rows only).
 11. **Lexer span semantics** — emphasis spans include their delimiters, no nesting; heading rest is a single `Heading(n)` span (no inline styling in headings, v1); token positions in search postings are token indices (phrase adjacency), not byte offsets.
 12. **Title collisions in the index** — `titles` maps lowercased title → the most recently upserted note; duplicate titles are legal on disk (filename suffixing handles files), and links resolve to the latest holder.
+13. **Mixed-size layouter PROVEN (Spike A, WP2, 2026-07-07):** real heading sizes (24/20/17 on 15pt body, JetBrains Mono 14) inside one editable TextEdit galley. Mechanism: one LayoutJob tiling every buffer byte (per-line lex cache keyed on (line-hash, fence-entry-state), 8KB per-line lex cap, explicit '\n' appends); egui's cursor/selection/IME machinery handles mixed row heights natively. Heading-marker spans derive their level from leading '#' count at layout time (SpanStyle::HeadingMarker carries none). Unresolved wikilinks: text_weak color + solid underline (egui has no dashed) vs accent+underline for resolved. Exit criteria (taller row, cursor-exact typing across the boundary, boundary-spanning select-all) are pinned as tests in jd-app/tests/spike_layouter.rs.
+14. **AccessKit spatial focus on a free-form canvas PROVEN (Spike B, WP2, 2026-07-07):** `ui.allocate_rect(rect, Sense::click_and_drag())` + `response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label))` yields fully queryable/actionable AccessKit nodes at arbitrary canvas positions — no framework workaround needed. Reading order = (y-band rounded at BAND_HEIGHT 120px = 0.6×card-height, then x, then NoteId); Left/Right walk the reading order globally across bands; Up/Down seek nearest |Δx| outward band-by-band; no wrap at the true ends. Culled (offscreen) cards get no nodes; focusing one auto-reveals (viewport centers via the cached real panel rect). Labels per spec §12, singular/plural correct.
