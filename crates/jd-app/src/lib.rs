@@ -2,3 +2,4 @@
 //! integration tests (egui_kittest) can drive the real UI headless.
 pub mod app;
 pub mod editor;
+pub mod surfaces;
