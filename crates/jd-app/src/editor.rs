@@ -1,6 +1,9 @@
 //! Editor internals. This task: the mixed-size layouter (Spike A).
 //! The floating editor window, behaviors, autocomplete arrive in Tasks 10-12.
 
+/// Placeholder for Task 10. State.rs references this type now so it compiles.
+pub struct EditorState;
+
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
