@@ -156,6 +156,11 @@ pub struct UiState {
     /// Split undo trashes the split-off and the undo of the SaveBody restores
     /// the original body, so placement is part of the same user act).
     pub pending_split: Option<jd_core::id::NoteId>,
+    /// WP3 Task 9: orphaned Create OpDone that arrived before ScanComplete.
+    /// When pending_create is set and a Create OpDone arrives but no desk exists
+    /// yet, the new note's id is buffered here instead of being lost. On
+    /// ScanComplete, after the bootstrap desk is created, this id is placed on it.
+    pub orphaned_create_id: Option<jd_core::id::NoteId>,
 }
 
 impl Default for UiState {
@@ -180,6 +185,7 @@ impl Default for UiState {
             pending_set_source: None,
             pending_copy_text: None,
             pending_split: None,
+            orphaned_create_id: None,
         }
     }
 }

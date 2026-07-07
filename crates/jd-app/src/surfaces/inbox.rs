@@ -447,7 +447,10 @@ pub fn inbox_ui(ui: &mut egui::Ui, deps: &mut InboxUiDeps<'_>) -> Vec<InboxEvent
             focused: is_focused,
         };
 
-        let resp = crate::card::card_face(ui, rect, &face, deps.theme, deps.line_cache);
+        let (resp, _checkbox_ordinal) =
+            crate::card::card_face(ui, rect, &face, deps.theme, deps.line_cache);
+        // Inbox face: checkbox click-to-toggle not supported (no VaultOp channel here);
+        // ignore toggled_ordinal — cards in the inbox are edited via the editor instead.
 
         if resp.clicked() && *deps.focus != Some(id) {
             *deps.focus = Some(id);

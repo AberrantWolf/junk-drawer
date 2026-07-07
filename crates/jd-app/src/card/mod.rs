@@ -31,8 +31,102 @@ pub struct CardFace<'a> {
 // card_face
 // ---------------------------------------------------------------------------
 
+/// Transform task box markers for face-side display only.
+///
+/// Replaces `"- [ ] "` with `"- ☐ "` and `"- [x] "` / `"- [X] "` with `"- ☑ "`
+/// in each line. Returns the transformed text and, for each task box, the
+/// 0-based char offset of the `☐`/`☑` glyph within the returned string.
+/// The raw source body is NOT modified.
+pub fn face_body_with_checkbox_glyphs(raw: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(raw.len());
+    let mut glyph_char_offsets: Vec<usize> = Vec::new();
+    let mut char_count = 0usize;
+    for (i, line) in raw.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+            char_count += 1;
+        }
+        // Check for "- [ ] " or "- [x] " / "- [X] " prefix (after optional leading whitespace).
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if trimmed.starts_with("- [ ] ")
+            || trimmed.starts_with("- [x] ")
+            || trimmed.starts_with("- [X] ")
+        {
+            // "- " (2 bytes) + "[ ]" or "[x]" (3 bytes) + " " (1 byte) = "- [ ] " (6 bytes)
+            let is_checked = !trimmed.starts_with("- [ ] ");
+            // Write indent + "- " (ListMarker part, preserved byte-for-byte)
+            out.push_str(&line[..indent]);
+            out.push_str("- ");
+            char_count += indent + 2; // indent chars (ascii) + "- "
+            // Record char offset of the glyph.
+            glyph_char_offsets.push(char_count);
+            // Write the glyph.
+            let glyph = if is_checked { "☑" } else { "☐" };
+            out.push_str(glyph);
+            char_count += 1; // one char for the glyph
+            // Write the rest after the task box marker ("[ ] " or "[x] " = 4 bytes from trimmed[2..6]).
+            let rest = &trimmed[6..]; // skip "[ ] " or "[x] " (4 bytes after "- ")
+            out.push(' ');
+            out.push_str(rest);
+            char_count += 1 + rest.chars().count();
+        } else {
+            out.push_str(line);
+            char_count += line.chars().count();
+        }
+    }
+    (out, glyph_char_offsets)
+}
+
+/// Toggle the Nth (0-based ordinal) task box in the raw body string.
+/// Returns the new body with `"- [ ]"` ↔ `"- [x]"` toggled.
+/// If the ordinal is out of range, returns the body unchanged.
+pub fn toggle_task_box(raw: &str, ordinal: usize) -> String {
+    let mut count = 0usize;
+    let mut result = String::with_capacity(raw.len());
+    let mut last_end = 0usize;
+    // Find each "- [" occurrence and check for "- [ ] " or "- [x] " / "- [X] ".
+    let bytes = raw.as_bytes();
+    let mut i = 0usize;
+    while i + 5 <= bytes.len() {
+        // Look for "- [" at position i (after any leading whitespace, at start of trimmed line).
+        // We scan for "- [ ] " or "- [x] " / "- [X] ".
+        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b' ' {
+            // Could be a list item. Check if bytes[i+2..i+6] is "[ ] " or "[x] " or "[X] ".
+            if i + 6 <= bytes.len() {
+                let pat = &bytes[i + 2..i + 6];
+                let is_unchecked = pat == b"[ ] ";
+                let is_checked = pat == b"[x] " || pat == b"[X] ";
+                if is_unchecked || is_checked {
+                    if count == ordinal {
+                        // Toggle this box.
+                        result.push_str(&raw[last_end..i + 2]); // up to and including "- "
+                        if is_unchecked {
+                            result.push_str("[x] "); // toggle to checked
+                        } else {
+                            result.push_str("[ ] "); // toggle to unchecked
+                        }
+                        last_end = i + 6; // skip "[ ] " or "[x] "
+                        // Append the rest.
+                        result.push_str(&raw[last_end..]);
+                        return result;
+                    }
+                    count += 1;
+                    i += 6;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    // Ordinal not found; return unchanged.
+    raw.to_owned()
+}
+
 /// Render a card face at `rect` (desk-space; caller has already applied any
-/// viewport transform).  Returns the egui Response for click/drag/focus.
+/// viewport transform).  Returns `(response, toggled_ordinal)` where
+/// `toggled_ordinal` is `Some(n)` when the user clicked the Nth face-side
+/// checkbox (0-based), and `None` otherwise.
 ///
 /// Rendering order:
 ///   1. Shadow (3 px offset)
@@ -48,7 +142,7 @@ pub fn card_face(
     face: &CardFace<'_>,
     th: &Theme,
     cache: &mut LineCache,
-) -> egui::Response {
+) -> (egui::Response, Option<usize>) {
     // -----------------------------------------------------------------------
     // AccessKit / interaction response
     // -----------------------------------------------------------------------
@@ -199,6 +293,7 @@ pub fn card_face(
     // -----------------------------------------------------------------------
     // 6. Body galley
     // -----------------------------------------------------------------------
+    let mut toggled_ordinal: Option<usize> = None;
     if let Some(body_text) = face.body {
         // For IndexCard/Literature the body galley starts near the top — the
         // first heading line IS the title, rendered large/bold by layout_body.
@@ -215,46 +310,68 @@ pub fn card_face(
         // heading line from the body before rendering to avoid duplication.
         // (The shared layouter must keep the raw source byte-exact for the
         // editor's cursor mapping; we do the strip here, face-side only.)
-        let body_for_layout: &str;
-        let stripped_body: String;
-        if face.shape == CardShape::Divider && !face.title.is_empty() {
-            let first_line_end = body_text
-                .find('\n')
-                .map(|i| i + 1)
-                .unwrap_or(body_text.len());
-            let first_line = body_text[..first_line_end]
-                .trim_end_matches('\n')
-                .trim_start_matches('#')
-                .trim();
-            if first_line == face.title {
-                stripped_body = body_text[first_line_end..].to_owned();
-                body_for_layout = &stripped_body;
+        let divider_stripped: Option<String> =
+            if face.shape == CardShape::Divider && !face.title.is_empty() {
+                let first_line_end = body_text
+                    .find('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(body_text.len());
+                let first_line = body_text[..first_line_end]
+                    .trim_end_matches('\n')
+                    .trim_start_matches('#')
+                    .trim();
+                if first_line == face.title {
+                    Some(body_text[first_line_end..].to_owned())
+                } else {
+                    None
+                }
             } else {
-                body_for_layout = body_text;
-            }
-        } else {
-            body_for_layout = body_text;
-        }
+                None
+            };
+        let after_divider_strip: &str = divider_stripped.as_deref().unwrap_or(body_text);
+
+        // Face-side text transform: replace "- [ ]" / "- [x]" with ☐ / ☑.
+        // Presentation only; the editor and the raw body are unaffected.
+        let (face_body, checkbox_char_offsets) =
+            face_body_with_checkbox_glyphs(after_divider_strip);
 
         let wrap_width = rect.width() - 20.0;
-        let galley = layout_body(
-            ui,
-            body_for_layout,
-            wrap_width,
-            cache,
-            &|_| false,
-            th,
-            false,
-        );
+        let galley = layout_body(ui, &face_body, wrap_width, cache, &|_| false, th, false);
 
-        let clip_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.min.x + 10.0, content_top),
-            egui::pos2(rect.max.x - 10.0, content_bottom),
-        );
+        let galley_pos = egui::pos2(rect.min.x + 10.0, content_top);
+        let clip_rect =
+            egui::Rect::from_min_max(galley_pos, egui::pos2(rect.max.x - 10.0, content_bottom));
 
         // Paint with clipping
         let painter_clipped = ui.painter().with_clip_rect(clip_rect);
-        painter_clipped.galley(egui::pos2(rect.min.x + 10.0, content_top), galley, th.text);
+        painter_clipped.galley(galley_pos, galley.clone(), th.text);
+
+        // Click-to-toggle: if the card was clicked, check if the pointer is
+        // over a checkbox glyph row, using ordinal matching.
+        // Only handle clicks (not drags); use the raw pointer position since
+        // card_face already has the click registered on `resp`.
+        if resp.clicked()
+            && !checkbox_char_offsets.is_empty()
+            && let Some(ptr) = ui.input(|i| i.pointer.interact_pos())
+        {
+            // Convert screen pointer to galley-local position.
+            let local = ptr - galley_pos.to_vec2();
+            for (ordinal, &char_off) in checkbox_char_offsets.iter().enumerate() {
+                // Find the cursor rect for the checkbox glyph in galley-local space.
+                let cursor = egui::text::CCursor::new(char_off);
+                let cursor_rect = galley.pos_from_cursor(cursor);
+                // Expand the cursor rect to the full row height for easy hitting.
+                let row_h = cursor_rect.height().max(18.0);
+                let hit_rect = egui::Rect::from_min_max(
+                    egui::pos2(cursor_rect.min.x, cursor_rect.min.y - row_h * 0.1),
+                    egui::pos2(cursor_rect.min.x + row_h, cursor_rect.max.y + row_h * 0.1),
+                );
+                if hit_rect.contains(egui::pos2(local.x, local.y)) {
+                    toggled_ordinal = Some(ordinal);
+                    break;
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -269,5 +386,79 @@ pub fn card_face(
         );
     }
 
-    resp
+    (resp, toggled_ordinal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn face_body_replaces_task_boxes_with_glyphs() {
+        let raw = "# Title\n- [ ] unchecked\n- [x] checked\n- [X] also checked\n- plain item";
+        let (face, offsets) = face_body_with_checkbox_glyphs(raw);
+        // Glyph replacements
+        assert!(face.contains("☐"), "must contain ☐ for unchecked");
+        assert!(face.contains("☑"), "must contain ☑ for checked");
+        // Raw markers must not appear in the face body
+        assert!(
+            !face.contains("- [ ]"),
+            "raw unchecked marker must not appear in face body"
+        );
+        assert!(
+            !face.contains("- [x]"),
+            "raw checked marker must not appear in face body"
+        );
+        // Three task boxes
+        assert_eq!(offsets.len(), 3, "must have 3 checkbox char offsets");
+        // Non-task lines are unchanged
+        assert!(face.contains("plain item"), "non-task lines preserved");
+        assert!(face.contains("# Title"), "heading preserved");
+    }
+
+    #[test]
+    fn toggle_task_box_unchecked_to_checked() {
+        let raw = "- [ ] task one\n- [ ] task two\n- [x] task three";
+        let result = toggle_task_box(raw, 0);
+        assert!(
+            result.contains("- [x] task one"),
+            "first box must be checked, got: {result:?}"
+        );
+        assert!(
+            result.contains("- [ ] task two"),
+            "second box unchanged, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_task_box_checked_to_unchecked() {
+        let raw = "- [ ] task one\n- [x] task two";
+        let result = toggle_task_box(raw, 1);
+        assert!(
+            result.contains("- [ ] task two"),
+            "second box (checked→unchecked), got: {result:?}"
+        );
+        assert!(
+            result.contains("- [ ] task one"),
+            "first box unchanged, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_task_box_ordinal_out_of_range_returns_unchanged() {
+        let raw = "- [ ] only one box";
+        let result = toggle_task_box(raw, 5);
+        assert_eq!(
+            result, raw,
+            "out-of-range ordinal must return body unchanged"
+        );
+    }
+
+    #[test]
+    fn face_body_preserves_non_task_content() {
+        let raw = "# Heading\nplain text\n**bold**";
+        let (face, offsets) = face_body_with_checkbox_glyphs(raw);
+        assert_eq!(face, raw, "no task boxes: face body must equal raw");
+        assert!(offsets.is_empty(), "no checkbox offsets for task-free body");
+    }
 }

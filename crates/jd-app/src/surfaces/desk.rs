@@ -225,6 +225,13 @@ pub enum DeskEvent {
     /// Card was dragged onto a rail row (Inbox or a desk row).
     /// app.rs handles this as CardDroppedOnInbox / CardDroppedOnDesk.
     CardDroppedOnRail(crate::rail::RailEvent),
+    /// Face-side click on the Nth (0-based ordinal) task checkbox of `id`.
+    /// app.rs toggles the raw body byte ([ ]↔[x]) and dispatches VaultOp::SaveBody.
+    ToggleTaskBox {
+        id: NoteId,
+        /// 0-based ordinal of the clicked task box in the raw body.
+        ordinal: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -652,10 +659,17 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
             focused: is_focused,
         };
 
-        let resp =
+        let (resp, checkbox_ordinal) =
             crate::card::card_face(ui, card_screen_rect, &face, state.theme, state.line_cache);
 
-        if resp.clicked() && *state.focus != Some(card.id) {
+        // Checkbox click-to-toggle: if the face detected a checkbox click, emit
+        // the toggle event (ordinal identifies the Nth task box in the raw body).
+        if let Some(ordinal) = checkbox_ordinal {
+            events.push(DeskEvent::ToggleTaskBox {
+                id: card.id,
+                ordinal,
+            });
+        } else if resp.clicked() && *state.focus != Some(card.id) {
             *state.focus = Some(card.id);
             events.push(DeskEvent::FocusChanged(*state.focus));
         }
@@ -741,17 +755,36 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
                                 m.data.insert_temp(card_popup_open_id(card.id), false);
                             });
                         }
-                        // Close on click outside (egui handles this via Popup's focus rules).
                     });
 
-                // Check if popup should close (click outside or Esc).
-                // consume_key prevents Esc from leaking to surface handlers or
-                // other modals in the same frame (defense in depth).
+                // Close on click outside the popup (resp.clicked_elsewhere() fires when
+                // the user clicks anywhere other than on this card's response area).
+                if resp.clicked_elsewhere() {
+                    ui.memory_mut(|m| {
+                        m.data.insert_temp(card_popup_open_id(card.id), false);
+                    });
+                }
+
+                // Close on Esc. consume_key prevents Esc from leaking to surface
+                // handlers or other modals in the same frame (defense in depth).
                 if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                     ui.memory_mut(|m| {
                         m.data.insert_temp(card_popup_open_id(card.id), false);
                     });
                 }
+            }
+        } else {
+            // Focus moved off this card — clear any stale popup flag so a later
+            // refocus does not silently reopen the popup.
+            let stale: bool = ui.memory(|m| {
+                m.data
+                    .get_temp(card_popup_open_id(card.id))
+                    .unwrap_or(false)
+            });
+            if stale {
+                ui.memory_mut(|m| {
+                    m.data.insert_temp(card_popup_open_id(card.id), false);
+                });
             }
         }
     }

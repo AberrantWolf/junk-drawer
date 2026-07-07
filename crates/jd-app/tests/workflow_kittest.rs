@@ -804,25 +804,25 @@ fn ctrl_enter_promotes_not_opens_editor() {
 // Task 4: Inbox Ctrl+Enter → open promoting editor
 // ===========================================================================
 
-/// Finding 3: drain_events clears pending_label on OpFailed so it cannot leak
-/// onto the next successful op's journal entry.
+/// Exercises pending_label consumption via a successful op (OpDone path).
+///
+/// The pending_label is set before dispatching, then a Toss op completes
+/// (OpDone arrives; drain_events consumes the label via take()). This verifies
+/// the label does not leak across op boundaries on the success path.
+///
+/// NOTE: The OpFailed guard (pending_label = None on OpFailed) was added as a
+/// WP3 Task 4 review finding and verified by code inspection — VaultEvent::OpFailed
+/// cannot be injected from the outside without a mock worker, so it is not directly
+/// exercised here. This test covers the consumption-via-successful-op path only.
 #[test]
-fn op_failed_clears_pending_label() {
+fn pending_label_consumed_by_successful_opdone() {
     let (_v, mut h, ids) = app_with_staggered_fleeting();
     let id = ids[0];
 
     // Set a pending_label to simulate a compound Batch dispatch in flight.
     h.state_mut().state.pending_label = Some("Promote scrap 'test'".to_owned());
 
-    // Dispatch Toss to provoke a real OpDone so we verify the label is gone
-    // *without* an OpFailed injection. To test OpFailed specifically, inject
-    // the state directly: set pending_label and manually call drain_events after
-    // pumping a no-op frame — verifying that a prior pending_label set before
-    // any op does NOT escape across an OpFailed path. Since we can't inject
-    // VaultEvent::OpFailed directly (events is a Receiver), we verify the guard
-    // fires by dispatching the Toss op (OpDone arrives; pending_label is consumed
-    // cleanly because source==User and we see it cleared by take()).
-    // Then we set it again and verify a fresh op clears it.
+    // Dispatch Toss to provoke a real OpDone so we verify the label is consumed.
     {
         use jd_app::surfaces::inbox::InboxEvent;
         h.state_mut().apply_inbox_event(InboxEvent::Toss(id));
@@ -843,11 +843,6 @@ fn op_failed_clears_pending_label() {
         h.state().state.pending_label.is_none(),
         "pending_label must be None after an OpDone clears it"
     );
-
-    // Verify last_error is cleared (no error from a successful Toss).
-    // (We can't force OpFailed from the outside, but the code path clears
-    // pending_label on OpFailed; the guard in drain_events is tested here
-    // by confirming the label doesn't persist across a successful op cycle.)
 }
 
 /// Inbox Ctrl+Enter (InboxEvent::Promote) opens the editor with

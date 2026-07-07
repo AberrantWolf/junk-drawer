@@ -151,8 +151,9 @@ pub fn text_format(style: SpanStyle, th: &Theme) -> TextFormat {
             f.color = th.text_weak;
         }
         SpanStyle::ListMarker => f.color = th.text_weak,
-        // TODO(WP3): face-only ☐/☑ glyph substitution + click-to-toggle (needs a face-side text
-        // transform; the editor must keep raw source).
+        // Face-side ☐/☑ glyph substitution is done in card/mod.rs (face_body_with_checkbox_glyphs).
+        // The glyph is styled as TaskBoxUnchecked/Checked here, keeping it visually distinct.
+        // The editor keeps the raw "- [ ]" / "- [x]" source unchanged.
         SpanStyle::TaskBoxUnchecked | SpanStyle::TaskBoxChecked => f.color = th.text_weak,
         SpanStyle::QuoteMarker => f.color = th.text_weak,
         SpanStyle::Quote => f.font_id = named("inter-italic", BODY_SIZE),

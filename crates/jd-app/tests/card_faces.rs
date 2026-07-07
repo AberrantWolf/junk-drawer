@@ -4,7 +4,7 @@ use eframe::egui;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use jd_app::card::shape::{CardShape, CardStyle, RuledLines};
-use jd_app::card::{CardFace, card_face};
+use jd_app::card::{CardFace, card_face, face_body_with_checkbox_glyphs};
 use jd_app::theme::Theme;
 
 fn nid(n: u8) -> jd_core::id::NoteId {
@@ -86,7 +86,7 @@ impl eframe::App for FaceApp {
             egui::pos2(24.0, 24.0),
             jd_app::card::shape::card_size(self.face.shape),
         );
-        card_face(ui, rect, &self.face.borrow(), &th, &mut self.cache);
+        let _ = card_face(ui, rect, &self.face.borrow(), &th, &mut self.cache);
     }
 }
 
@@ -201,6 +201,40 @@ fn face_carries_the_spec_announcement() {
     ));
     h.run_ok();
     h.get_by_label_contains("Card: 'Ideas want linking'");
+}
+
+/// Snapshot: task-list card face shows ☐/☑ glyphs instead of raw "- [ ]"/"- [x]".
+#[test]
+fn snapshot_task_list_card_face_glyphs() {
+    let face = OwnedFace {
+        id: nid(99),
+        title: "Task card".to_string(),
+        body: Some("# Task card\n- [ ] buy milk\n- [x] write tests\n- [ ] ship it".to_string()),
+        source: None,
+        shape: CardShape::IndexCard,
+        style: CardStyle::Paper,
+        lines: RuledLines::None,
+        links: 0,
+        tags: 0,
+        focused: false,
+        dark: false,
+    };
+    let mut h = face_harness(face);
+    h.run_ok();
+
+    // Verify the face body transform produces glyph characters.
+    let raw = "# Task card\n- [ ] buy milk\n- [x] write tests\n- [ ] ship it";
+    let (face_body, offsets) = face_body_with_checkbox_glyphs(raw);
+    assert!(face_body.contains("☐"), "face body must contain ☐");
+    assert!(face_body.contains("☑"), "face body must contain ☑");
+    assert!(!face_body.contains("- [ ]"), "raw marker must be gone");
+    assert_eq!(
+        offsets.len(),
+        3,
+        "must have 3 checkbox offsets (2 unchecked + 1 checked)"
+    );
+
+    h.snapshot("task_list_glyphs");
 }
 
 #[test]

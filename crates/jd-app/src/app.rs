@@ -166,8 +166,13 @@ impl JdUi {
                 // session_dirty_at already set by place_card → apply_session; no reset needed.
             }
         } else {
-            // No desk yet — restore pending_create (unlikely race; best-effort).
+            // No desk yet (OpDone arrived before ScanComplete). Buffer the created
+            // id so ScanComplete can place the card once the bootstrap desk exists.
+            // Keep pending_create alive (put it back) so ScanComplete can read the
+            // placement position (`at`) and open_editor flag.
             self.state.pending_create = Some(pending);
+            // Single-writer: only the first orphaned id is kept.
+            self.state.orphaned_create_id.get_or_insert(new_id);
         }
     }
 
@@ -193,6 +198,18 @@ impl JdUi {
                             None,
                         );
                         self.state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+                    }
+                    // Consume any Create OpDone that arrived before this ScanComplete
+                    // (reversed-order race: Ctrl+N → worker writes note → OpDone →
+                    // ScanComplete). The bootstrap desk now exists, so place the card.
+                    if let Some(orphan_id) = self.state.orphaned_create_id.take()
+                        && let Some(pending) = self.state.pending_create.take()
+                        && let Some(desk_id) = self.state.session.desks.first().map(|d| d.id)
+                    {
+                        self.place_card(desk_id, orphan_id, pending.at);
+                        if pending.open_editor {
+                            self.state.session.open_card = Some(orphan_id);
+                        }
                     }
                 }
                 VaultEvent::Body { id, content } => {
@@ -1517,6 +1534,23 @@ impl JdUi {
                     // a regular rail drop event (CardDroppedOnInbox / CardDroppedOnDesk).
                     self.apply_rail_event(rail_ev);
                 }
+                DeskEvent::ToggleTaskBox { id, ordinal } => {
+                    // Locate the cached body, toggle the Nth task box, and save.
+                    // Ordinal matching: the Nth occurrence of "- [" in the raw body.
+                    let cached_text = self.state.bodies.get_cached(id).map(|b| b.text.clone());
+                    if let Some(body) = cached_text {
+                        let toggled = crate::card::toggle_task_box(&body, ordinal);
+                        if toggled != body {
+                            let _ = self.vault.commands.send(jd_core::worker::VaultCommand::Op {
+                                op: VaultOp::SaveBody {
+                                    id,
+                                    content: toggled,
+                                },
+                                source: jd_core::command::OpSource::User,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -1530,6 +1564,12 @@ impl JdUi {
 
     /// Open the card editor for `id`, with optional immediate pending_promotion.
     /// Used by InboxEvent::Promote (Ctrl+Enter on inbox card = promote-without-typing).
+    ///
+    /// Invariant: pending_open_promotion is NON-DOWNGRADING. If a prior call set
+    /// it to `true` (e.g. Ctrl+Enter) and a subsequent call arrives with `false`
+    /// (e.g. a plain OpenCard for the same id while the body is still loading),
+    /// the stashed `true` must not be overwritten. Use `|=` so a `true` can never
+    /// be reset to `false` by a later call that passes `false`.
     fn open_card_editor_with_promotion(&mut self, id: NoteId, pending_promotion: bool) {
         // Same-id guard: if the editor is already open for this exact id (e.g. a
         // deferred-open Body event races with a second Promote dispatch for the
@@ -1543,7 +1583,9 @@ impl JdUi {
         self.state.session_dirty_at = Some(std::time::Instant::now());
         // Stash pending_promotion for the deferred-open path (drain_events Body
         // handler) in case the body hasn't arrived yet.
-        self.state.pending_open_promotion = pending_promotion;
+        // NON-DOWNGRADING: a prior `true` must survive a subsequent `false` call
+        // (e.g. InboxEvent::Promote followed by a plain OpenCard for the same card).
+        self.state.pending_open_promotion |= pending_promotion;
         if let Some(cached) = self.state.bodies.get_or_request(id, &self.vault.commands)
             && self.state.editor.is_none()
         {
@@ -1554,12 +1596,14 @@ impl JdUi {
                     .map(|m| m.status == jd_core::note::Status::Fleeting)
                     .unwrap_or(false)
             };
+            // Use the (possibly already-set) pending_open_promotion, not the local arg.
+            let effective_promotion = self.state.pending_open_promotion;
             self.state.editor = Some(crate::editor::EditorState::open(
                 id,
                 cached.text.clone(),
                 saved_undo,
                 is_fleeting,
-                pending_promotion,
+                effective_promotion,
             ));
             // Consumed — clear.
             self.state.pending_open_promotion = false;
@@ -2168,5 +2212,91 @@ mod tests {
         }
 
         panic!("Guard should have prevented reaching this point");
+    }
+
+    /// When a Create OpDone arrives before ScanComplete (reversed order), the
+    /// created id is buffered in orphaned_create_id while pending_create is kept
+    /// alive.  Once ScanComplete fires and the bootstrap desk is created, the
+    /// orphaned card must be placed on that desk.
+    ///
+    /// Simulates the state transitions directly (mirrors the logic in
+    /// handle_pending_create + drain_events ScanComplete path) without a real vault.
+    #[test]
+    fn pending_create_sweep_opdone_before_scan_complete() {
+        use crate::state::PendingCreate;
+        use jd_core::command::VaultOp;
+        use jd_core::geom::Vec2 as CoreVec2;
+        use jd_core::session::DeskId;
+
+        let mut state = UiState::default();
+        let mut id_gen = jd_core::id::IdGen::new();
+
+        // Arm pending_create (simulates Ctrl+N pressed before ScanComplete).
+        let place_at = CoreVec2 { x: 50.0, y: 50.0 };
+        state.pending_create = Some(PendingCreate {
+            at: place_at,
+            open_editor: false,
+        });
+
+        let new_id = nid(42);
+
+        // --- Step 1: handle_pending_create called with no desks (mirrors drain_events OpDone) ---
+        // Only consume pending_create for Create ops (inverse = Delete{id}).
+        let result_inverse = Some(VaultOp::Delete { id: new_id });
+        let is_create_op = matches!(result_inverse, Some(VaultOp::Delete { .. }));
+        assert!(is_create_op);
+
+        let created_id = new_id;
+        // No desk: keep pending_create alive and buffer the orphan id.
+        state.orphaned_create_id.get_or_insert(created_id);
+        // pending_create stays Some (not consumed) so ScanComplete can read the position.
+
+        assert!(
+            state.pending_create.is_some(),
+            "pending_create must stay alive when OpDone arrives before desk"
+        );
+        assert_eq!(
+            state.orphaned_create_id,
+            Some(new_id),
+            "orphaned_create_id must buffer the new note id"
+        );
+
+        // --- Step 2: ScanComplete handler: create bootstrap desk + consume orphan ---
+        state.scan_done = true;
+        let desk_id = DeskId::generate(&mut id_gen);
+        let _ = state.session.apply(&SessionOp::CreateDesk {
+            id: desk_id,
+            name: "Desk".into(),
+        });
+        state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+
+        // Mirrors drain_events ScanComplete orphan consumption.
+        if let Some(orphan_id) = state.orphaned_create_id.take()
+            && let Some(pending) = state.pending_create.take()
+            && let Some(d) = state.session.desks.first()
+        {
+            let _ = state.session.apply(&SessionOp::Place {
+                desk: d.id,
+                id: orphan_id,
+                pos: pending.at,
+            });
+        }
+
+        assert!(
+            state.orphaned_create_id.is_none(),
+            "orphaned_create_id must be consumed after ScanComplete"
+        );
+        assert!(
+            state.pending_create.is_none(),
+            "pending_create must be consumed during orphan placement"
+        );
+        assert!(
+            state
+                .session
+                .desks
+                .iter()
+                .any(|d| d.cards.iter().any(|c| c.id == new_id)),
+            "orphaned card must be placed on the bootstrap desk"
+        );
     }
 }

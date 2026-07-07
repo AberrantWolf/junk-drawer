@@ -170,8 +170,11 @@ pub struct EditorState {
     needs_focus: bool,
     /// Currently selected autocomplete index.
     pub ac_selected: usize,
-    /// Esc dismissed the popup for the current autocomplete context.
+    /// Esc dismissed the popup; stores the query string that was active when Esc was
+    /// pressed. The popup re-appears if the query differs from this stored value.
     ac_dismissed: bool,
+    /// The query string that was active when ac_dismissed was set.
+    ac_dismissed_query: String,
     /// Cursor state from the previous frame (for pre-TextEdit key interception
     /// and URL-paste-over-selection; the buffer cannot change between frames,
     /// so last frame's cursor is current when this frame's input arrives).
@@ -216,6 +219,7 @@ impl EditorState {
             needs_focus: true,
             ac_selected: 0,
             ac_dismissed: false,
+            ac_dismissed_query: String::new(),
             prev_cursor: None,
             is_fleeting,
             pending_promotion,
@@ -653,7 +657,20 @@ pub fn editor_ui(
         let ac_ctx = cursor_byte.map_or(AcContext::None, |cb| ac_context(&ed.buffer, cb));
         if matches!(ac_ctx, AcContext::None) {
             ed.ac_dismissed = false;
+            ed.ac_dismissed_query = String::new();
             ed.ac_selected = 0;
+        }
+        // Re-show the popup if the query has changed since dismissal (the user
+        // typed more characters after pressing Esc).
+        if ed.ac_dismissed {
+            let current_query = match &ac_ctx {
+                AcContext::Link { query, .. } | AcContext::Tag { query, .. } => query.as_str(),
+                AcContext::None => "",
+            };
+            if current_query != ed.ac_dismissed_query {
+                ed.ac_dismissed = false;
+                ed.ac_dismissed_query = String::new();
+            }
         }
         let ac_items = if ed.ac_dismissed {
             Vec::new()
@@ -677,6 +694,11 @@ pub fn editor_ui(
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                 // Esc dismisses the popup ONLY; consuming it here keeps it from
                 // reaching Modal::should_close, so the editor stays open.
+                // Store the current query so the popup re-appears if the user types more.
+                ed.ac_dismissed_query = match &ac_ctx {
+                    AcContext::Link { query, .. } | AcContext::Tag { query, .. } => query.clone(),
+                    AcContext::None => String::new(),
+                };
                 ed.ac_dismissed = true;
             }
             let accept = ui.input_mut(|i| {
@@ -1020,5 +1042,65 @@ mod tests {
         assert!(!is_probably_url("ftp://x"));
         assert!(!is_probably_url(""));
         assert!(!is_probably_url("file:///home/user"));
+    }
+
+    /// ac_dismissed stores the dismissed query; the popup re-appears when the
+    /// query changes (user typed more characters after pressing Esc).
+    #[test]
+    fn ac_dismissed_query_tracking() {
+        // Simulates the logic in editor_ui's ac_dismissed guard:
+        // 1. User types "[[Foo" → popup shows with query "Foo".
+        // 2. User presses Esc → dismissed=true, dismissed_query="Foo".
+        // 3. User types one more char → query becomes "Foot" ≠ "Foo" → popup re-shows.
+        // 4. User presses Esc again → dismissed=true, dismissed_query="Foot".
+        // 5. User deletes all → AcContext::None → dismissed=false, query="".
+
+        // Step 1: query "Foo"
+        let buf = "see [[Foo";
+        let ctx = ac_context(buf, buf.len());
+        let query = match &ctx {
+            AcContext::Link { query, .. } => query.as_str(),
+            _ => panic!("expected Link context"),
+        };
+        assert_eq!(query, "Foo");
+
+        // Step 2: Esc → dismissed=true, dismissed_query="Foo"
+        let mut dismissed = true;
+        let mut dismissed_query = query.to_owned();
+
+        // Step 3: user types "t" → query becomes "Foot"
+        let buf2 = "see [[Foot";
+        let ctx2 = ac_context(buf2, buf2.len());
+        let query2 = match &ctx2 {
+            AcContext::Link { query, .. } => query.as_str(),
+            _ => panic!("expected Link context"),
+        };
+        assert_eq!(query2, "Foot");
+
+        // The guard: query2 ≠ dismissed_query → clear dismissal.
+        if dismissed && query2 != dismissed_query {
+            dismissed = false;
+            dismissed_query = String::new();
+        }
+        assert!(!dismissed, "popup must re-show after query change");
+        assert!(
+            dismissed_query.is_empty(),
+            "dismissed_query must be cleared"
+        );
+
+        // Step 4: Esc again → dismissed with "Foot"
+        dismissed = true;
+        dismissed_query = query2.to_owned();
+        assert_eq!(dismissed_query, "Foot");
+
+        // Step 5: AcContext::None → dismissed=false, dismissed_query=""
+        let ctx3 = ac_context("plain text no context", 21);
+        assert!(matches!(ctx3, AcContext::None));
+        if matches!(ctx3, AcContext::None) {
+            dismissed = false;
+            dismissed_query = String::new();
+        }
+        assert!(!dismissed, "dismissed must reset when AcContext is None");
+        assert!(dismissed_query.is_empty());
     }
 }
