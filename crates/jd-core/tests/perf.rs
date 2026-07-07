@@ -25,16 +25,26 @@
 
 mod common;
 
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 use common::TempDir;
+use jd_core::doc::extract_links;
+use jd_core::id::NoteId;
 use jd_core::index::Index;
 use jd_core::index::search::parse_query;
+use jd_core::note::{Kind, NoteMeta, Status};
 use jd_core::rng::Xorshift128;
+use jd_core::time::Timestamp;
 use jd_core::vault::Vault;
 use jd_core::vault::scan::{parse_note_file, scan};
 
 const NOTES: usize = 20_000;
+
+/// Tiny dense vocabulary: every doc contains every word (df == N).
+const WORDS_DENSE: &[&str] = &[
+    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+];
 
 /// ~1500 deterministic pseudo-words; draws are zipf-ish (rank r picked with
 /// probability ∝ 1/(r+1)) so a few words are common and most are selective —
@@ -79,6 +89,42 @@ fn build_synthetic_vault() -> (TempDir, Vault, Vec<String>) {
         std::fs::write(t.path().join(format!("notes/Note {i}.md")), body).unwrap();
     }
     (t, v, vocab)
+}
+
+/// Build a minimal NoteMeta for a dense-index note.
+fn mini_meta(i: usize, body: &str) -> NoteMeta {
+    let iota = i as u64;
+    NoteMeta {
+        id: NoteId([
+            iota as u8,
+            (iota >> 8) as u8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]),
+        rel_path: format!("notes/d{i}.md").into(),
+        title: None,
+        first_line: body.lines().next().unwrap_or("").to_owned(),
+        status: Status::Permanent,
+        kind: Kind::Note,
+        source: None,
+        created: Timestamp(i as i64),
+        modified: Timestamp(i as i64),
+        tags: BTreeSet::new(),
+        links_out: extract_links(body),
+        word_count: 0,
+    }
 }
 
 fn build_index(v: &Vault) -> Index {
@@ -171,15 +217,28 @@ fn queries_under_ten_ms() {
         start.elapsed()
     );
 
-    // Deliberate stress probe: the two most-common words hit a large fraction
-    // of the corpus — the degenerate full-scan case. Budget is looser: this
-    // gates catastrophic regressions, not the realistic palette path (10ms).
-    let stress = format!("{common_a} {common_b}");
+    // Deliberate df==N stress probe: a separate small dense index where BOTH
+    // query terms appear in EVERY doc (the degenerate full-scan case the old
+    // 24-word corpus accidentally made of everything). Loose bound: this
+    // gates catastrophic regressions, not the realistic palette path above.
+    let mut dense = Index::new();
+    let mut drng = Xorshift128::new(0xDE45E);
+    for i in 0..5_000 {
+        let mut body = String::from("# D\n");
+        for _ in 0..40 {
+            body.push_str(WORDS_DENSE[drng.gen_range(0..WORDS_DENSE.len() as u64) as usize]);
+            body.push(' ');
+        }
+        let meta = mini_meta(i, &body);
+        dense.upsert(meta, &body);
+    }
+    dense.refresh_similarity_cache();
     let start = Instant::now();
-    let _ = ix.query(&parse_query(&stress), 20);
+    let hits = dense.query(&parse_query("alpha beta"), 20);
+    assert!(!hits.is_empty(), "dense corpus must actually match");
     assert!(
         start.elapsed().as_micros() < 25_000,
-        "dense stress query took {:?} (bound 25ms)",
+        "df==N stress query took {:?} (bound 25ms)",
         start.elapsed()
     );
 }
