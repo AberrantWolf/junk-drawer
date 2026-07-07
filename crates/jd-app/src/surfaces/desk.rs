@@ -327,7 +327,7 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
                 {
                     let y = match unit {
                         egui::MouseWheelUnit::Point => delta.y,
-                        egui::MouseWheelUnit::Line => delta.y * 50.0,
+                        egui::MouseWheelUnit::Line => delta.y * 40.0,
                         egui::MouseWheelUnit::Page => delta.y * panel_h,
                     };
                     return Some(y);
@@ -561,20 +561,36 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
 }
 
 /// Pan viewport to reveal `id` if it is currently off-screen.
-pub fn reveal(desk: &Desk, id: NoteId, panel: egui::Rect) -> Option<DeskCamera> {
+///
+/// `face_metas` is used to look up the per-shape card size so the visibility
+/// check matches the rendered outline exactly.  When the meta is absent the
+/// function falls back to the IndexCard size (300×200).
+pub fn reveal(
+    desk: &Desk,
+    id: NoteId,
+    panel: egui::Rect,
+    face_metas: &[FaceMeta],
+) -> Option<DeskCamera> {
     let card = desk.cards.iter().find(|c| c.id == id)?;
     let cam = DeskCamera {
         center: egui::vec2(desk.viewport.center.x, desk.viewport.center.y),
         zoom: desk.viewport.zoom,
     };
+    let card_size = face_metas
+        .iter()
+        .find(|m| m.id == id)
+        .map(|m| crate::card::shape::card_size(crate::card::shape::shape_for(m.status, m.kind)))
+        .unwrap_or_else(|| egui::vec2(300.0, 200.0));
     let screen_min = cam.to_screen(panel, egui::pos2(card.pos.x, card.pos.y));
-    let card_screen = egui::Rect::from_min_size(screen_min, egui::vec2(300.0, 200.0));
+    // Screen-space rect: scale world size by zoom, matching the hit-test path.
+    let card_screen = egui::Rect::from_min_size(screen_min, card_size * cam.zoom);
     if panel.contains_rect(card_screen) {
         return None; // already visible
     }
     // Center viewport on the card.
+    let half = card_size * 0.5;
     let mut new_cam = cam;
-    new_cam.center = egui::vec2(card.pos.x + 150.0, card.pos.y + 100.0);
+    new_cam.center = egui::vec2(card.pos.x + half.x, card.pos.y + half.y);
     Some(new_cam)
 }
 

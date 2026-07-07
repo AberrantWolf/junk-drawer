@@ -48,6 +48,10 @@ pub struct JdUi {
     line_cache: crate::editor::LineCache,
     /// Current card-drag state (None = no drag in progress).
     drag: Option<DragState>,
+    /// The desk panel rect captured from `ui.max_rect()` inside the CentralPanel
+    /// closure each frame, one frame before it is used by reveal() in FocusChanged.
+    /// None until the first frame has rendered.
+    last_panel_rect: Option<egui::Rect>,
 }
 
 impl JdUi {
@@ -71,6 +75,7 @@ impl JdUi {
             id_gen: IdGen::new(),
             line_cache: crate::editor::LineCache::default(),
             drag: None,
+            last_panel_rect: None,
         })
     }
 
@@ -226,6 +231,12 @@ impl JdUi {
             }
 
             if let Some(desk) = self.state.session.desks.first().cloned() {
+                // Capture the real panel rect before desk_ui runs so that
+                // reveal() in apply_desk_events (FocusChanged) uses the actual
+                // desk area rather than a hardcoded sentinel.  One frame of
+                // staleness is acceptable.
+                self.last_panel_rect = Some(ui.max_rect());
+
                 let mut deps = DeskUiDeps {
                     focus: &mut self.state.focus,
                     bodies: &mut self.state.bodies,
@@ -237,13 +248,18 @@ impl JdUi {
                     editor_open: self.state.editor.is_some(),
                 };
                 let evts = crate::surfaces::desk::desk_ui(ui, &desk, &mut deps);
-                self.apply_desk_events(evts, desk.id);
+                self.apply_desk_events(evts, desk.id, &face_metas);
             }
         });
     }
 
     /// Apply `DeskEvent`s emitted by `desk_ui`.
-    fn apply_desk_events(&mut self, events: Vec<DeskEvent>, _desk_id: DeskId) {
+    fn apply_desk_events(
+        &mut self,
+        events: Vec<DeskEvent>,
+        _desk_id: DeskId,
+        face_metas: &[FaceMeta],
+    ) {
         for ev in events {
             match ev {
                 DeskEvent::OpenCard(id) => {
@@ -256,16 +272,14 @@ impl JdUi {
                     if let Some(focused_id) = id
                         && let Some(desk) = self.state.session.desks.first()
                     {
-                        // Approximate the panel rect (app window minus status bar).
-                        // kittest uses 1200×800 minus ~24px; in production this is
-                        // a best-effort approximation (close enough for reveal).
-                        // We cannot get the real panel rect here (outside the ui fn),
-                        // so we use a sentinel that errs on the side of revealing.
-                        // A zero-rect makes every card "off-screen", centering on it.
-                        let panel =
-                            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 776.0));
+                        // Use the panel rect captured from ui.max_rect() during
+                        // the previous frame's CentralPanel closure.  When None
+                        // (first frame), pass an empty rect so every card appears
+                        // off-screen and reveal() always fires — erring on the
+                        // side of centering.
+                        let panel = self.last_panel_rect.unwrap_or(egui::Rect::NOTHING);
                         if let Some(new_cam) =
-                            crate::surfaces::desk::reveal(desk, focused_id, panel)
+                            crate::surfaces::desk::reveal(desk, focused_id, panel, face_metas)
                         {
                             let desk_id = desk.id;
                             if let Some(d) = self
