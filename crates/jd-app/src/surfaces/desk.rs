@@ -122,7 +122,7 @@ mod tests {
             (id(1), Vec2 { x: 0.0, y: 100.0 }),
             (id(2), Vec2 { x: 200.0, y: 130.0 }),
         ];
-        // 20px vertical wiggle does not change bands (100→0.83 rounds 1; 120→1).
+        // y=100 and y=130 share band 1; after a ±20px wiggle (y=120, y=110) they still share band 1, so reading order is unchanged.
         let after = vec![
             (id(1), Vec2 { x: 0.0, y: 120.0 }),
             (id(2), Vec2 { x: 200.0, y: 110.0 }),
@@ -137,6 +137,7 @@ mod tests {
             (id(2), Vec2 { x: 400.0, y: 0.0 }),
             (id(3), Vec2 { x: 100.0, y: 300.0 }),
         ];
+        assert_eq!(next_focus(&cards, Some(id(1)), FocusDir::Left), None); // no wrap at first
         assert_eq!(
             next_focus(&cards, Some(id(1)), FocusDir::Right),
             Some(id(2))
