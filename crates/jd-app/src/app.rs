@@ -98,13 +98,20 @@ impl JdUi {
         let inverse = self.state.session.apply(&op);
         self.state.session_dirty_at = Some(std::time::Instant::now());
         if let Some(label) = journal {
+            // Extract the subject note id from op variants that carry one.
+            let note_id = match &op {
+                SessionOp::Move { id, .. }
+                | SessionOp::Place { id, .. }
+                | SessionOp::PutAway { id, .. } => Some(*id),
+                _ => None,
+            };
             let context = jd_core::journal::OpContext {
                 desk: if let Some(SurfaceId::Desk(desk_id)) = self.state.session.current_surface {
                     Some(desk_id)
                 } else {
                     None
                 },
-                note: None,
+                note: note_id,
             };
             self.state.journal.push(JournalEntry {
                 label: label.to_owned(),
@@ -1232,6 +1239,12 @@ impl JdUi {
 
     /// Execute the top-of-undo-stack entry (Ctrl+Z).
     fn execute_undo(&mut self) {
+        // Guard: ignore while a vault undo/redo is in-flight.  Two presses
+        // before the async OpDone drains would overwrite pending_undo_entry
+        // and lose the first stashed entry.
+        if self.state.pending_undo_redo.is_some() {
+            return;
+        }
         let Some(entry) = self.state.journal.pop_undo() else {
             return;
         };
@@ -1283,6 +1296,11 @@ impl JdUi {
 
     /// Execute the top-of-redo-stack entry (Ctrl+Y / Ctrl+Shift+Z).
     fn execute_redo(&mut self) {
+        // Guard: ignore while a vault undo/redo is in-flight (same rationale as
+        // execute_undo — prevents stash overwrite before OpDone drains).
+        if self.state.pending_undo_redo.is_some() {
+            return;
+        }
         let Some(entry) = self.state.journal.pop_redo() else {
             return;
         };

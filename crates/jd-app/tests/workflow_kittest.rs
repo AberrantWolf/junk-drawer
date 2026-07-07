@@ -1393,6 +1393,47 @@ fn inbox_del_key_tosses_and_trash_restore_round_trip() {
 // Task 6: undo/redo
 // ===========================================================================
 
+/// Apply a Move session op and verify the journaled JournalEntry carries the note
+/// id in OpContext.note (Finding 1: apply_session must populate context.note).
+#[test]
+fn apply_session_move_journals_note_context() {
+    let (_v, mut h, note_id, desk_id) = app_with_placed_card();
+
+    let orig_pos = h.state().state.session.desks[0]
+        .cards
+        .iter()
+        .find(|c| c.id == note_id)
+        .unwrap()
+        .pos;
+    let new_pos = Vec2 {
+        x: orig_pos.x + 50.0,
+        y: orig_pos.y + 50.0,
+    };
+
+    h.state_mut().apply_session(
+        SessionOp::Move {
+            desk: desk_id,
+            id: note_id,
+            from: orig_pos,
+            to: new_pos,
+        },
+        Some("Move card"),
+    );
+
+    // Pop the journal entry (destructive, but we don't need the stack further).
+    let entry = h
+        .state_mut()
+        .state
+        .journal
+        .pop_undo()
+        .expect("journal must have an entry after apply_session");
+    assert_eq!(
+        entry.context.note,
+        Some(note_id),
+        "journaled Move entry must carry the note id in context.note"
+    );
+}
+
 /// Move a card (session Move op), press Ctrl+Z → position restored + status_echo shows "Undid:"
 #[test]
 fn app_undo_restores_card_position() {
@@ -1458,6 +1499,9 @@ fn app_undo_restores_card_position() {
         "status_echo must contain 'Undid:' after undo, got: {:?}",
         echo
     );
+    // Finding 3: the echo must also be queryable via the a11y tree (ui.label renders
+    // as an accessible text node with its content as the label).
+    h.get_by_label_contains("Undid:");
 }
 
 /// After undo, Ctrl+Y → card re-moved.
@@ -1794,4 +1838,89 @@ fn promotion_single_ctrl_z_full_reversal() {
         "status_echo must contain 'Undid:' after undo, got: {:?}",
         echo
     );
+}
+
+/// Toss a fleeting card (vault op), Ctrl+Z (undo → restored), Ctrl+Y (redo → tossed
+/// again), Ctrl+Z (undo again → restored).  Proves the async redo-inverse from the
+/// UndoRedo OpDone is correctly re-stacked in both directions.
+#[test]
+fn vault_undo_redo_undo_chain() {
+    let (_v, mut h, ids) = app_with_staggered_fleeting();
+    let id = ids[0];
+
+    // ── Toss ──────────────────────────────────────────────────────────────────
+    {
+        use jd_app::surfaces::inbox::InboxEvent;
+        h.state_mut().apply_inbox_event(InboxEvent::Toss(id));
+    }
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id).is_none()
+        },
+        200,
+        "toss: note gone",
+    );
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert!(idx.get(id).is_none(), "note must be gone after toss");
+    }
+
+    // ── Ctrl+Z (undo → restored) ──────────────────────────────────────────────
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_ok();
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id).is_some()
+        },
+        200,
+        "undo: note back in index",
+    );
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert!(
+            idx.get(id).is_some(),
+            "note must be back in index after first undo"
+        );
+    }
+
+    // ── Ctrl+Y (redo → tossed again) ─────────────────────────────────────────
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Y);
+    h.run_ok();
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id).is_none()
+        },
+        200,
+        "redo: note gone again",
+    );
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert!(idx.get(id).is_none(), "note must be gone again after redo");
+    }
+
+    // ── Ctrl+Z again (undo → restored a second time) ──────────────────────────
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_ok();
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id).is_some()
+        },
+        200,
+        "second undo: note back in index again",
+    );
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert!(
+            idx.get(id).is_some(),
+            "note must be back in index after second undo"
+        );
+    }
 }
