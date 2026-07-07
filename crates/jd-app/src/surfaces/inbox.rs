@@ -185,8 +185,8 @@ pub fn inbox_ui(ui: &mut egui::Ui, deps: &mut InboxUiDeps<'_>) -> Vec<InboxEvent
             }
         }
 
-        // Enter → open editor
-        if ui.input(|i| i.key_pressed(egui::Key::Enter))
+        // Enter → open editor (plain Enter, not Ctrl+Enter)
+        if ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.command)
             && let Some(id) = *deps.focus
         {
             events.push(InboxEvent::OpenCard(id));
@@ -486,5 +486,52 @@ mod tests {
         let b = NoteId::parse("01ARZ3NDEKTSV4RRFFQ69G5FA2").unwrap();
         // Very unlikely to be equal by coincidence
         assert_ne!(paper_jitter(a), paper_jitter(b));
+    }
+
+    #[test]
+    fn card_pos_plain_layout_single_column_increasing_y() {
+        use jd_core::id::NoteId;
+        let panel = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1200.0, 800.0));
+        let id = NoteId::parse("01ARZ3NDEKTSV4RRFFQ69G5FA1").unwrap();
+        let margin = 32.0;
+        let row_gap = 16.0;
+        let card_h = crate::card::shape::card_size(crate::card::shape::CardShape::Scrap).y;
+
+        // Plain layout: single column, consecutive indices should have same x, increasing y
+        let pos0 = card_pos(0, id, CardStyle::Plain, panel);
+        let pos1 = card_pos(1, id, CardStyle::Plain, panel);
+        let pos2 = card_pos(2, id, CardStyle::Plain, panel);
+
+        // All positions should have the same x (left margin)
+        assert_eq!(
+            pos0.x, pos1.x,
+            "Plain layout column 0 and 1 must have same x"
+        );
+        assert_eq!(
+            pos1.x, pos2.x,
+            "Plain layout column 1 and 2 must have same x"
+        );
+
+        // y should increase by card_h + row_gap for each consecutive position
+        assert_eq!(
+            pos0.x,
+            panel.min.x + margin,
+            "Plain layout x must be at margin"
+        );
+        assert_eq!(
+            pos0.y,
+            panel.min.y + margin,
+            "Plain layout first position y must be at margin"
+        );
+        assert_eq!(
+            pos1.y,
+            pos0.y + card_h + row_gap,
+            "Plain layout position 1 y must be position 0 y + card_h + row_gap"
+        );
+        assert_eq!(
+            pos2.y,
+            pos1.y + card_h + row_gap,
+            "Plain layout position 2 y must be position 1 y + card_h + row_gap"
+        );
     }
 }

@@ -404,7 +404,7 @@ fn drop_card_to_desk_row_journals_one_entry_with_place_inverse() {
     );
 
     // Simulate undo: apply both ops in order → card must be ONLY on source desk.
-    // Re-place the card on the target desk first (simulate the move having happened).
+    // Apply the inverse Sessions ops to reverse the move.
     {
         let app = h.state_mut();
         for op in &ops {
@@ -769,5 +769,33 @@ fn ctrl_d_places_card_on_desk_stays_fleeting() {
         ordered.len(),
         3,
         "all 3 cards still in inbox after placement"
+    );
+}
+
+/// Ctrl+Enter on focused scrap does NOT open the editor; it fires Promote instead.
+#[test]
+fn ctrl_enter_promotes_not_opens_editor() {
+    let (_v, mut h, ids) = app_with_staggered_fleeting();
+
+    // Focus the first scrap.
+    {
+        let app = h.state_mut();
+        app.state.focus = Some(ids[0]);
+    }
+
+    // Before: no card is being edited.
+    assert!(
+        h.state().state.session.open_card.is_none(),
+        "before Ctrl+Enter, no card must be open"
+    );
+
+    // Press Ctrl+Enter via key_press_modifiers.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+    h.run_ok();
+
+    // After: editor must still be closed (Promote fired, not OpenCard).
+    assert!(
+        h.state().state.session.open_card.is_none(),
+        "Ctrl+Enter must NOT open the editor"
     );
 }
