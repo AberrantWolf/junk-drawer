@@ -7,59 +7,41 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, mpsc};
 use std::time::SystemTime;
 
+use crate::command::{Dest, OpResult, OpSource, VaultOp, label_display, op_label};
 use crate::doc::NoteDoc;
 use crate::error::CoreError;
 use crate::frontmatter::FrontmatterDoc;
 use crate::id::{IdGen, NoteId};
 use crate::index::{Index, SharedIndex};
-use crate::note::{NewNote, NoteMeta, Status};
+use crate::note::Status;
 use crate::time::Timestamp;
 use crate::vault::Vault;
 use crate::vault::io::{atomic_save, filename_for};
 use crate::vault::recovery::{clear_buffer, journal_buffer};
 use crate::vault::scan::{parse_note_file, scan};
-use crate::vault::trash::purge_older_than;
+use crate::vault::trash::{purge_older_than, restore, trash_note};
 use crate::vault::watcher::{VaultWatcher, WatchEvent};
-
-/// Which sub-folder to write a newly-created note into.
-pub enum Dest {
-    Inbox,
-    Notes,
-}
 
 /// Commands the vault worker accepts.
 pub enum VaultCommand {
-    Create {
-        seed: NewNote,
-        dest: Dest,
-    },
-    /// Full body text; the worker manages the frontmatter.
-    SaveBody {
-        id: NoteId,
-        content: String,
-    },
-    ReadBody {
-        id: NoteId,
-    },
-    JournalBuffer {
-        id: NoteId,
-        content: String,
-    },
-    PurgeTrash {
-        older_than_days: Option<u32>,
-    },
+    Op { op: VaultOp, source: OpSource },
+    ReadBody { id: NoteId },
+    JournalBuffer { id: NoteId, content: String },
+    PurgeTrash { older_than_days: Option<u32> },
     RescanAll,
     Shutdown,
 }
 
 /// Events emitted by the vault worker.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum VaultEvent {
-    Created {
-        meta: NoteMeta,
+    OpDone {
+        result: OpResult,
+        source: OpSource,
     },
-    Saved {
-        id: NoteId,
+    OpFailed {
+        label: String,
+        message: String,
     },
     Body {
         id: NoteId,
@@ -256,6 +238,530 @@ fn run_initial_scan(
     });
 }
 
+/// Execute a single VaultOp, returning an OpResult on success or an error
+/// message on failure.  The `emit` callback is used only for Conflict events
+/// (SaveBody conflict path succeeds with divergence: OpFailed is NOT emitted).
+fn execute_op(
+    vault: &Vault,
+    index: &SharedIndex,
+    id_gen: &mut IdGen,
+    ledger: &mut WriteLedger,
+    emit: &impl Fn(VaultEvent),
+    op: VaultOp,
+) -> Result<OpResult, String> {
+    match op {
+        VaultOp::Create { seed, dest } => {
+            let id = NoteId::generate(id_gen);
+            let now = Timestamp::now();
+
+            let dir_name = match dest {
+                Dest::Inbox => "inbox",
+                Dest::Notes => "notes",
+            };
+            let dir_abs = vault.abs(Path::new(dir_name));
+
+            let title = extract_note_title(&seed.body);
+            let abs_path = filename_for(&title, id, &dir_abs);
+            let rel_path = vault.rel(&abs_path).unwrap_or_else(|| abs_path.clone());
+
+            let mut fm = FrontmatterDoc::synthesize(id, now, seed.status);
+            fm.set_kind(seed.kind);
+            if let Some(src) = &seed.source {
+                fm.set_source(Some(src.as_str()));
+            }
+            if !seed.tags.is_empty() {
+                fm.set_tags(&seed.tags);
+            }
+
+            let doc = NoteDoc {
+                fm,
+                body: seed.body.clone(),
+            };
+            let content = doc.serialize();
+
+            atomic_save(&abs_path, &content).map_err(|e| e.to_string())?;
+
+            if let Some(s) = stat(&abs_path) {
+                ledger.insert(rel_path.clone(), s);
+            }
+
+            match parse_note_file(vault, &rel_path) {
+                Ok((meta, body)) => {
+                    let is_fleeting = meta.status == Status::Fleeting;
+                    let display = label_display(&title);
+                    index.write().unwrap().upsert(meta, &body);
+                    Ok(OpResult {
+                        inverse: Some(VaultOp::Delete { id }),
+                        label: op_label("Create", is_fleeting, &display),
+                        created: vec![id],
+                    })
+                }
+                Err(e) => Err(format!("create note index: {e}")),
+            }
+        }
+
+        VaultOp::SaveBody { id, content } => {
+            let meta = index
+                .read()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let rel_path = meta.rel_path.clone();
+            let abs_path = vault.abs(&rel_path);
+            let is_fleeting = meta.status == Status::Fleeting;
+            let display_title = meta
+                .title
+                .clone()
+                .unwrap_or_else(|| meta.first_line.clone());
+
+            // Read old body for the inverse
+            let old_body = match std::fs::read_to_string(&abs_path) {
+                Ok(s) => NoteDoc::parse(&s).body,
+                Err(_) => String::new(),
+            };
+
+            // Conflict check (decision #5): if ledger HAS an entry AND current stat ≠ ledger
+            if let Some(&ledger_stat) = ledger.get(&rel_path) {
+                let current_stat = stat(&abs_path);
+                if current_stat != Some(ledger_stat) {
+                    let conflict_id = NoteId::generate(id_gen);
+                    let conflict_path = conflict_copy_path(&abs_path, conflict_id);
+                    let conflict_rel = vault
+                        .rel(&conflict_path)
+                        .unwrap_or_else(|| conflict_path.clone());
+                    let now = Timestamp::now();
+                    let status = meta.status;
+                    let mut conflict_fm = FrontmatterDoc::synthesize(conflict_id, now, status);
+                    conflict_fm.set_modified(now);
+                    let conflict_doc = NoteDoc {
+                        fm: conflict_fm,
+                        body: content.clone(),
+                    };
+                    let conflict_content = conflict_doc.serialize();
+
+                    if let Err(e) = atomic_save(&conflict_path, &conflict_content) {
+                        return Err(format!("save conflict copy: {e}"));
+                    }
+
+                    if let Ok((cmeta, cbody)) = parse_note_file(vault, &conflict_rel) {
+                        index.write().unwrap().upsert(cmeta, &cbody);
+                    }
+
+                    emit(VaultEvent::Conflict {
+                        id,
+                        conflict_copy: conflict_rel,
+                    });
+
+                    // Op "succeeds with divergence" — return Ok with old-body inverse
+                    let label = op_label("Edit", is_fleeting, &label_display(&display_title));
+                    return Ok(OpResult {
+                        inverse: Some(VaultOp::SaveBody {
+                            id,
+                            content: old_body,
+                        }),
+                        label,
+                        created: vec![],
+                    });
+                }
+            }
+
+            // Happy path: read existing file (synthesize if missing)
+            let existing_content = std::fs::read_to_string(&abs_path).ok();
+            let mut doc = match &existing_content {
+                Some(s) => NoteDoc::parse(s),
+                None => {
+                    let now = Timestamp::now();
+                    let status = meta.status;
+                    let fm = FrontmatterDoc::synthesize(id, now, status);
+                    NoteDoc {
+                        fm,
+                        body: String::new(),
+                    }
+                }
+            };
+
+            if doc.fm.id().is_none() {
+                if doc.fm.serialize().is_empty() {
+                    let now = Timestamp::now();
+                    let status = meta.status;
+                    doc.fm = FrontmatterDoc::synthesize(id, now, status);
+                } else {
+                    doc.fm.set_id(id);
+                }
+            }
+
+            doc.body = content;
+            doc.fm.set_modified(Timestamp::now());
+            let new_content = doc.serialize();
+
+            atomic_save(&abs_path, &new_content).map_err(|e| format!("save body: {e}"))?;
+
+            if let Some(s) = stat(&abs_path) {
+                ledger.insert(rel_path.clone(), s);
+            }
+
+            match parse_note_file(vault, &rel_path) {
+                Ok((m, b)) => {
+                    index.write().unwrap().upsert(m, &b);
+                }
+                Err(e) => {
+                    return Err(format!("save body index: {e}"));
+                }
+            }
+
+            clear_buffer(vault, id);
+
+            let label = op_label("Edit", is_fleeting, &label_display(&display_title));
+            Ok(OpResult {
+                inverse: Some(VaultOp::SaveBody {
+                    id,
+                    content: old_body,
+                }),
+                label,
+                created: vec![],
+            })
+        }
+
+        VaultOp::Toss { id } => {
+            let meta = index
+                .read()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let is_fleeting = meta.status == Status::Fleeting;
+            let display = meta
+                .title
+                .clone()
+                .unwrap_or_else(|| meta.first_line.clone());
+            let rel_path = meta.rel_path.clone();
+
+            trash_note(vault, &meta).map_err(|e| e.to_string())?;
+            ledger.remove(&rel_path);
+            index.write().unwrap().remove(id);
+
+            Ok(OpResult {
+                inverse: Some(VaultOp::Restore { id }),
+                label: op_label("Toss", is_fleeting, &label_display(&display)),
+                created: vec![],
+            })
+        }
+
+        VaultOp::Delete { id } => {
+            let meta = index
+                .read()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let is_fleeting = meta.status == Status::Fleeting;
+            let display = meta
+                .title
+                .clone()
+                .unwrap_or_else(|| meta.first_line.clone());
+            let rel_path = meta.rel_path.clone();
+
+            trash_note(vault, &meta).map_err(|e| e.to_string())?;
+            ledger.remove(&rel_path);
+            index.write().unwrap().remove(id);
+
+            Ok(OpResult {
+                inverse: Some(VaultOp::Restore { id }),
+                label: op_label("Delete", is_fleeting, &label_display(&display)),
+                created: vec![],
+            })
+        }
+
+        VaultOp::Restore { id } => {
+            let new_rel = restore(vault, id).map_err(|e| e.to_string())?;
+
+            match parse_note_file(vault, &new_rel) {
+                Ok((meta, body)) => {
+                    let is_fleeting = meta.status == Status::Fleeting;
+                    let display = meta
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| meta.first_line.clone());
+                    index.write().unwrap().upsert(meta, &body);
+                    // Update ledger for the restored file
+                    let abs = vault.abs(&new_rel);
+                    if let Some(s) = stat(&abs) {
+                        ledger.insert(new_rel, s);
+                    }
+                    Ok(OpResult {
+                        inverse: Some(VaultOp::Toss { id }),
+                        label: op_label("Restore", is_fleeting, &label_display(&display)),
+                        created: vec![],
+                    })
+                }
+                Err(e) => Err(format!("restore index: {e}")),
+            }
+        }
+
+        VaultOp::Promote { id } => {
+            let meta = index
+                .read()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let old_rel = meta.rel_path.clone();
+            let old_abs = vault.abs(&old_rel);
+            let display = meta
+                .title
+                .clone()
+                .unwrap_or_else(|| meta.first_line.clone());
+
+            let content =
+                std::fs::read_to_string(&old_abs).map_err(|e| format!("promote read: {e}"))?;
+            let mut doc = NoteDoc::parse(&content);
+            doc.fm.set_status(Status::Permanent);
+            doc.fm.set_modified(Timestamp::now());
+            let new_content = doc.serialize();
+
+            let notes_dir = vault.abs(Path::new("notes"));
+            let new_abs = filename_for(&display, id, &notes_dir);
+            let new_rel = vault.rel(&new_abs).unwrap_or_else(|| new_abs.clone());
+
+            atomic_save(&new_abs, &new_content).map_err(|e| format!("promote write: {e}"))?;
+            std::fs::remove_file(&old_abs).map_err(|e| format!("promote remove old: {e}"))?;
+
+            ledger.remove(&old_rel);
+            if let Some(s) = stat(&new_abs) {
+                ledger.insert(new_rel.clone(), s);
+            }
+
+            match parse_note_file(vault, &new_rel) {
+                Ok((m, b)) => {
+                    index.write().unwrap().remove(id);
+                    index.write().unwrap().upsert(m, &b);
+                    Ok(OpResult {
+                        inverse: Some(VaultOp::Demote { id }),
+                        label: op_label("Promote", true, &label_display(&display)),
+                        created: vec![],
+                    })
+                }
+                Err(e) => Err(format!("promote index: {e}")),
+            }
+        }
+
+        VaultOp::Demote { id } => {
+            let meta = index
+                .read()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let old_rel = meta.rel_path.clone();
+            let old_abs = vault.abs(&old_rel);
+            let display = meta
+                .title
+                .clone()
+                .unwrap_or_else(|| meta.first_line.clone());
+
+            let content =
+                std::fs::read_to_string(&old_abs).map_err(|e| format!("demote read: {e}"))?;
+            let mut doc = NoteDoc::parse(&content);
+            doc.fm.set_status(Status::Fleeting);
+            doc.fm.set_modified(Timestamp::now());
+            let new_content = doc.serialize();
+
+            let inbox_dir = vault.abs(Path::new("inbox"));
+            let new_abs = filename_for(&display, id, &inbox_dir);
+            let new_rel = vault.rel(&new_abs).unwrap_or_else(|| new_abs.clone());
+
+            atomic_save(&new_abs, &new_content).map_err(|e| format!("demote write: {e}"))?;
+            std::fs::remove_file(&old_abs).map_err(|e| format!("demote remove old: {e}"))?;
+
+            ledger.remove(&old_rel);
+            if let Some(s) = stat(&new_abs) {
+                ledger.insert(new_rel.clone(), s);
+            }
+
+            match parse_note_file(vault, &new_rel) {
+                Ok((m, b)) => {
+                    index.write().unwrap().remove(id);
+                    index.write().unwrap().upsert(m, &b);
+                    Ok(OpResult {
+                        inverse: Some(VaultOp::Promote { id }),
+                        label: op_label("Demote", false, &label_display(&display)),
+                        created: vec![],
+                    })
+                }
+                Err(e) => Err(format!("demote index: {e}")),
+            }
+        }
+
+        VaultOp::SetKind { id, kind } => {
+            let meta = index
+                .read()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let old_kind = meta.kind;
+            let is_fleeting = meta.status == Status::Fleeting;
+            let display = meta
+                .title
+                .clone()
+                .unwrap_or_else(|| meta.first_line.clone());
+            let rel_path = meta.rel_path.clone();
+            let abs_path = vault.abs(&rel_path);
+
+            let content =
+                std::fs::read_to_string(&abs_path).map_err(|e| format!("set_kind read: {e}"))?;
+            let mut doc = NoteDoc::parse(&content);
+            doc.fm.set_kind(kind);
+            doc.fm.set_modified(Timestamp::now());
+            let new_content = doc.serialize();
+
+            atomic_save(&abs_path, &new_content).map_err(|e| format!("set_kind write: {e}"))?;
+
+            if let Some(s) = stat(&abs_path) {
+                ledger.insert(rel_path.clone(), s);
+            }
+
+            match parse_note_file(vault, &rel_path) {
+                Ok((m, b)) => {
+                    index.write().unwrap().upsert(m, &b);
+                    Ok(OpResult {
+                        inverse: Some(VaultOp::SetKind { id, kind: old_kind }),
+                        label: op_label("Edit", is_fleeting, &label_display(&display)),
+                        created: vec![],
+                    })
+                }
+                Err(e) => Err(format!("set_kind index: {e}")),
+            }
+        }
+
+        VaultOp::SetSource { id, source } => {
+            let meta = index
+                .read()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let old_source = meta.source.clone();
+            let is_fleeting = meta.status == Status::Fleeting;
+            let display = meta
+                .title
+                .clone()
+                .unwrap_or_else(|| meta.first_line.clone());
+            let rel_path = meta.rel_path.clone();
+            let abs_path = vault.abs(&rel_path);
+
+            let content =
+                std::fs::read_to_string(&abs_path).map_err(|e| format!("set_source read: {e}"))?;
+            let mut doc = NoteDoc::parse(&content);
+            doc.fm.set_source(source.as_deref());
+            doc.fm.set_modified(Timestamp::now());
+            let new_content = doc.serialize();
+
+            atomic_save(&abs_path, &new_content).map_err(|e| format!("set_source write: {e}"))?;
+
+            if let Some(s) = stat(&abs_path) {
+                ledger.insert(rel_path.clone(), s);
+            }
+
+            match parse_note_file(vault, &rel_path) {
+                Ok((m, b)) => {
+                    index.write().unwrap().upsert(m, &b);
+                    Ok(OpResult {
+                        inverse: Some(VaultOp::SetSource {
+                            id,
+                            source: old_source,
+                        }),
+                        label: op_label("Edit", is_fleeting, &label_display(&display)),
+                        created: vec![],
+                    })
+                }
+                Err(e) => Err(format!("set_source index: {e}")),
+            }
+        }
+
+        VaultOp::SetTags { id, tags } => {
+            let meta = index
+                .read()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| format!("note {id} not found in index"))?;
+            let old_tags: Vec<_> = meta.tags.iter().cloned().collect();
+            let is_fleeting = meta.status == Status::Fleeting;
+            let display = meta
+                .title
+                .clone()
+                .unwrap_or_else(|| meta.first_line.clone());
+            let rel_path = meta.rel_path.clone();
+            let abs_path = vault.abs(&rel_path);
+
+            let content =
+                std::fs::read_to_string(&abs_path).map_err(|e| format!("set_tags read: {e}"))?;
+            let mut doc = NoteDoc::parse(&content);
+            doc.fm.set_tags(&tags);
+            doc.fm.set_modified(Timestamp::now());
+            let new_content = doc.serialize();
+
+            atomic_save(&abs_path, &new_content).map_err(|e| format!("set_tags write: {e}"))?;
+
+            if let Some(s) = stat(&abs_path) {
+                ledger.insert(rel_path.clone(), s);
+            }
+
+            match parse_note_file(vault, &rel_path) {
+                Ok((m, b)) => {
+                    index.write().unwrap().upsert(m, &b);
+                    Ok(OpResult {
+                        inverse: Some(VaultOp::SetTags { id, tags: old_tags }),
+                        label: op_label("Edit", is_fleeting, &label_display(&display)),
+                        created: vec![],
+                    })
+                }
+                Err(e) => Err(format!("set_tags index: {e}")),
+            }
+        }
+
+        VaultOp::RenameTitle { .. } => Err("not yet implemented".into()),
+
+        VaultOp::Split { .. } => Err("not yet implemented".into()),
+
+        VaultOp::Batch(ops) => {
+            let mut done_inverses: Vec<VaultOp> = Vec::new();
+            let mut all_created: Vec<NoteId> = Vec::new();
+            let mut first_label: Option<String> = None;
+
+            for op in ops {
+                match execute_op(vault, index, id_gen, ledger, emit, op) {
+                    Ok(result) => {
+                        if let Some(inv) = result.inverse {
+                            done_inverses.push(inv);
+                        }
+                        all_created.extend(result.created);
+                        if first_label.is_none() {
+                            first_label = Some(result.label);
+                        }
+                    }
+                    Err(msg) => {
+                        // Rollback in reverse order (best-effort)
+                        for inv in done_inverses.into_iter().rev() {
+                            let _ = execute_op(vault, index, id_gen, ledger, emit, inv);
+                        }
+                        return Err(msg);
+                    }
+                }
+            }
+
+            done_inverses.reverse();
+            Ok(OpResult {
+                inverse: Some(VaultOp::Batch(done_inverses)),
+                label: first_label.unwrap_or_else(|| "Batch".into()),
+                created: all_created,
+            })
+        }
+    }
+}
+
 /// Handle a single VaultCommand (not Shutdown).
 #[allow(clippy::too_many_arguments)]
 fn handle_command(
@@ -269,213 +775,14 @@ fn handle_command(
     cmd: VaultCommand,
 ) {
     match cmd {
-        VaultCommand::Create { seed, dest } => {
-            let id = NoteId::generate(id_gen);
-            let now = Timestamp::now();
-
-            // Determine directory
-            let dir_name = match dest {
-                Dest::Inbox => "inbox",
-                Dest::Notes => "notes",
-            };
-            let dir_abs = vault.abs(Path::new(dir_name));
-
-            // Extract title from body: first `# ` heading, else first non-empty line
-            let title = extract_note_title(&seed.body);
-
-            // Determine filename
-            let abs_path = filename_for(&title, id, &dir_abs);
-            let rel_path = vault.rel(&abs_path).unwrap_or_else(|| abs_path.clone());
-
-            // Build frontmatter
-            let mut fm = FrontmatterDoc::synthesize(id, now, seed.status);
-            fm.set_kind(seed.kind);
-            if let Some(src) = &seed.source {
-                fm.set_source(Some(src.as_str()));
+        VaultCommand::Op { op, source } => {
+            match execute_op(vault, index, id_gen, ledger, emit, op) {
+                Ok(result) => emit(VaultEvent::OpDone { result, source }),
+                Err(msg) => emit(VaultEvent::OpFailed {
+                    label: "Operation".into(),
+                    message: msg,
+                }),
             }
-            if !seed.tags.is_empty() {
-                fm.set_tags(&seed.tags);
-            }
-
-            // Serialize and save
-            let doc = NoteDoc {
-                fm,
-                body: seed.body,
-            };
-            let content = doc.serialize();
-
-            if let Err(e) = atomic_save(&abs_path, &content) {
-                emit(VaultEvent::Error {
-                    context: "create note".into(),
-                    message: e.to_string(),
-                });
-                return;
-            }
-
-            // Record in ledger
-            if let Some(s) = stat(&abs_path) {
-                ledger.insert(rel_path.clone(), s);
-            }
-
-            // Parse back and upsert
-            match parse_note_file(vault, &rel_path) {
-                Ok((meta, body)) => {
-                    index.write().unwrap().upsert(meta.clone(), &body);
-                    emit(VaultEvent::Created { meta });
-                }
-                Err(e) => {
-                    emit(VaultEvent::Error {
-                        context: "create note index".into(),
-                        message: e,
-                    });
-                }
-            }
-        }
-
-        VaultCommand::SaveBody { id, content } => {
-            // Look up rel path from index
-            let rel_path = match index.read().unwrap().get(id) {
-                Some(m) => m.rel_path.clone(),
-                None => {
-                    emit(VaultEvent::Error {
-                        context: "save body".into(),
-                        message: format!("note {id} not found in index"),
-                    });
-                    return;
-                }
-            };
-            let abs_path = vault.abs(&rel_path);
-
-            // Conflict check (decision #5): if ledger HAS an entry AND current stat ≠ ledger
-            if let Some(&ledger_stat) = ledger.get(&rel_path) {
-                let current_stat = stat(&abs_path);
-                if current_stat != Some(ledger_stat) {
-                    // Build our content with synthesized frontmatter for the conflict copy.
-                    // Generate a new id for the conflict copy so it shows up as a distinct note.
-                    // The id is also threaded into conflict_copy_path so that same-minute
-                    // double conflicts get distinct id-suffixed names (spec §2: never clobber).
-                    let conflict_id = NoteId::generate(id_gen);
-
-                    // Conflict: write our content to a conflict copy.
-                    // Route through filename_for so same-minute double conflicts
-                    // get distinct id-suffixed names (spec §2: never clobber).
-                    let conflict_path = conflict_copy_path(&abs_path, conflict_id);
-                    let conflict_rel = vault
-                        .rel(&conflict_path)
-                        .unwrap_or_else(|| conflict_path.clone());
-                    let now = Timestamp::now();
-                    let status = index
-                        .read()
-                        .unwrap()
-                        .get(id)
-                        .map(|m| m.status)
-                        .unwrap_or(Status::Fleeting);
-                    let mut conflict_fm = FrontmatterDoc::synthesize(conflict_id, now, status);
-                    conflict_fm.set_modified(now);
-                    let conflict_doc = NoteDoc {
-                        fm: conflict_fm,
-                        body: content.clone(),
-                    };
-                    let conflict_content = conflict_doc.serialize();
-
-                    // conflict copy not ledgered — we don't own this path going forward
-                    if let Err(e) = atomic_save(&conflict_path, &conflict_content) {
-                        emit(VaultEvent::Error {
-                            context: "save conflict copy".into(),
-                            message: e.to_string(),
-                        });
-                        return;
-                    }
-
-                    // Index the conflict copy
-                    if let Ok((meta, body)) = parse_note_file(vault, &conflict_rel) {
-                        index.write().unwrap().upsert(meta, &body);
-                    }
-
-                    emit(VaultEvent::Conflict {
-                        id,
-                        conflict_copy: conflict_rel,
-                    });
-                    return;
-                }
-            }
-
-            // Happy path: read existing file (synthesize if missing)
-            let existing_content = std::fs::read_to_string(&abs_path).ok();
-            let mut doc = match &existing_content {
-                Some(s) => NoteDoc::parse(s),
-                None => {
-                    // File missing: synthesize frontmatter with current id
-                    let now = Timestamp::now();
-                    let status = index
-                        .read()
-                        .unwrap()
-                        .get(id)
-                        .map(|m| m.status)
-                        .unwrap_or(Status::Fleeting);
-                    let fm = FrontmatterDoc::synthesize(id, now, status);
-                    NoteDoc {
-                        fm,
-                        body: String::new(),
-                    }
-                }
-            };
-
-            // If frontmatter lacks an id, stamp it with the note's current index id
-            // (identity continuity, plan decision #1).
-            // - No frontmatter at all → synthesize a full block.
-            // - Frontmatter present but id missing/invalid → keep existing fields,
-            //   just inject the id line via set_id so unknown keys are preserved.
-            if doc.fm.id().is_none() {
-                if doc.fm.serialize().is_empty() {
-                    let now = Timestamp::now();
-                    let status = index
-                        .read()
-                        .unwrap()
-                        .get(id)
-                        .map(|m| m.status)
-                        .unwrap_or(Status::Fleeting);
-                    doc.fm = FrontmatterDoc::synthesize(id, now, status);
-                } else {
-                    doc.fm.set_id(id);
-                }
-            }
-
-            // Replace body, update modified
-            doc.body = content;
-            doc.fm.set_modified(Timestamp::now());
-            let new_content = doc.serialize();
-
-            if let Err(e) = atomic_save(&abs_path, &new_content) {
-                emit(VaultEvent::Error {
-                    context: "save body".into(),
-                    message: e.to_string(),
-                });
-                return;
-            }
-
-            // Update ledger
-            if let Some(s) = stat(&abs_path) {
-                ledger.insert(rel_path.clone(), s);
-            }
-
-            // Re-parse and upsert
-            match parse_note_file(vault, &rel_path) {
-                Ok((meta, body)) => {
-                    index.write().unwrap().upsert(meta, &body);
-                }
-                Err(e) => {
-                    emit(VaultEvent::Error {
-                        context: "save body index".into(),
-                        message: e,
-                    });
-                }
-            }
-
-            // Clear recovery buffer
-            clear_buffer(vault, id);
-
-            emit(VaultEvent::Saved { id });
         }
 
         VaultCommand::ReadBody { id } => {
@@ -560,23 +867,26 @@ fn handle_watch(
             // External change: re-parse and upsert
             match parse_note_file(vault, &rel) {
                 Ok((mut meta, body)) => {
-                    // Look up the previous id for this path in the index.
-                    let prev_id = index
+                    // Look up the previous meta for this path in the index.
+                    let prev_meta = index
                         .read()
                         .unwrap()
                         .iter_meta()
-                        .find_map(|m| if m.rel_path == rel { Some(m.id) } else { None });
+                        .find(|m| m.rel_path == rel)
+                        .cloned();
 
                     let emit_id;
-                    if let Some(prev) = prev_id {
-                        if meta.id != prev {
+                    if let Some(prev) = prev_meta {
+                        if meta.id != prev.id {
                             // The file lost its frontmatter id (e.g. external overwrite).
                             // Preserve identity: reuse the existing id, remove the old entry
                             // and re-insert under that id.
-                            index.write().unwrap().remove(prev);
-                            meta.id = prev;
+                            index.write().unwrap().remove(prev.id);
+                            meta.id = prev.id;
                         }
-                        emit_id = prev;
+                        // WP1d handoff: preserve created timestamp
+                        meta.created = prev.created;
+                        emit_id = prev.id;
                     } else {
                         emit_id = meta.id;
                     }
