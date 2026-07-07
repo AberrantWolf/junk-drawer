@@ -48,6 +48,7 @@ fn edit_harness(
                 &mut cache,
                 &|_| false,
                 &jd_app::theme::Theme::light(),
+                false,
             )
         };
         ui.add(
@@ -74,6 +75,7 @@ fn heading_row_is_taller_than_body_row() {
             &mut cache,
             &|_| false,
             &jd_app::theme::Theme::light(),
+            false,
         );
         if galley.rows.len() >= 2 {
             *sizes_clone.lock().unwrap() = Some((

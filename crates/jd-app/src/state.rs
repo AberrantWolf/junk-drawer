@@ -110,6 +110,15 @@ pub struct UiState {
     pub pending_create: Option<PendingCreate>,
     /// Per-card undo stacks that survive editor close/reopen within the session.
     pub text_undo: HashMap<NoteId, crate::text_undo::TextUndo>,
+    /// WP3 Task 4: human-readable label for a compound vault op whose worker
+    /// label (Batch's first-member label) is too generic. Set when dispatching
+    /// a Batch([SaveBody, Promote]) from the close-editor path; consumed by the
+    /// next matching OpDone in drain_events.
+    pub pending_label: Option<String>,
+    /// WP3 Task 4: when an editor is opened with pending_promotion=true but the
+    /// body hasn't arrived yet (deferred open via drain_events Body event),
+    /// stash the flag here so the Body handler can forward it.
+    pub pending_open_promotion: bool,
 }
 
 impl Default for UiState {
@@ -125,6 +134,8 @@ impl Default for UiState {
             last_error: None,
             pending_create: None,
             text_undo: HashMap::new(),
+            pending_label: None,
+            pending_open_promotion: false,
         }
     }
 }

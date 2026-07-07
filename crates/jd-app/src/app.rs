@@ -179,10 +179,22 @@ impl JdUi {
                     // lands here the editor is created.
                     if self.state.session.open_card == Some(id) && self.state.editor.is_none() {
                         let saved_undo = self.state.text_undo.remove(&id);
+                        let is_fleeting = {
+                            let idx = self.vault.index.read().unwrap();
+                            idx.get(id)
+                                .map(|m| m.status == jd_core::note::Status::Fleeting)
+                                .unwrap_or(false)
+                        };
+                        // Forward any pending_open_promotion (set by Inbox Ctrl+Enter
+                        // when the body wasn't yet cached).
+                        let pending_promotion =
+                            std::mem::take(&mut self.state.pending_open_promotion);
                         self.state.editor = Some(crate::editor::EditorState::open(
                             id,
                             content.clone(),
                             saved_undo,
+                            is_fleeting,
+                            pending_promotion,
                         ));
                     }
                     self.state.bodies.insert(id, content);
@@ -223,8 +235,12 @@ impl JdUi {
                     if source == OpSource::User
                         && let Some(inv_op) = result.inverse
                     {
+                        // WP3 Task 4: if a pending_label was set when dispatching
+                        // a compound op (Batch([SaveBody, Promote])), use it
+                        // instead of the worker's generic Batch label.
+                        let label = self.state.pending_label.take().unwrap_or(result.label);
                         self.state.journal.push(JournalEntry {
-                            label: result.label,
+                            label,
                             inverse: InverseAction::Vault(inv_op),
                             context: OpContext::default(),
                         });
@@ -678,7 +694,36 @@ impl JdUi {
             // the body cache via the watcher echo and push a phantom undo
             // entry with label "Save body").
             let editor = self.state.editor.take().unwrap();
-            if editor.dirty {
+            if editor.pending_promotion {
+                // Task 4: commit ONE compound op: SaveBody with "# title\nbody"
+                // then Promote. The body transformation prepends "# <first line>\n"
+                // to give extract_title the `# ` marker it requires.
+                let first_newline = editor.buffer.find('\n').unwrap_or(editor.buffer.len());
+                let first_line = editor.buffer[..first_newline].to_owned();
+                let rest = if first_newline < editor.buffer.len() {
+                    &editor.buffer[first_newline + 1..]
+                } else {
+                    ""
+                };
+                let promoted_body = if rest.is_empty() {
+                    format!("# {first_line}\n")
+                } else {
+                    format!("# {first_line}\n{rest}")
+                };
+                // Set the pending_label before dispatching so drain_events picks
+                // it up on the next OpDone.
+                self.state.pending_label = Some(format!("Promote scrap '{first_line}'"));
+                let _ = self.vault.commands.send(VaultCommand::Op {
+                    op: jd_core::command::VaultOp::Batch(vec![
+                        jd_core::command::VaultOp::SaveBody {
+                            id: editor.id,
+                            content: promoted_body,
+                        },
+                        jd_core::command::VaultOp::Promote { id: editor.id },
+                    ]),
+                    source: jd_core::command::OpSource::User,
+                });
+            } else if editor.dirty {
                 let _ = self.vault.commands.send(VaultCommand::Op {
                     op: jd_core::command::VaultOp::SaveBody {
                         id: editor.id,
@@ -723,10 +768,18 @@ impl JdUi {
                         && self.state.editor.is_none()
                     {
                         let saved_undo = self.state.text_undo.remove(&id);
+                        let is_fleeting = {
+                            let idx = self.vault.index.read().unwrap();
+                            idx.get(id)
+                                .map(|m| m.status == jd_core::note::Status::Fleeting)
+                                .unwrap_or(false)
+                        };
                         self.state.editor = Some(crate::editor::EditorState::open(
                             id,
                             cached.text.clone(),
                             saved_undo,
+                            is_fleeting,
+                            false,
                         ));
                     }
                 }
@@ -788,17 +841,36 @@ impl JdUi {
     /// (body not yet loaded; drain_events will open the editor when Body arrives).
     /// Mirrors the DeskEvent::OpenCard path in apply_desk_events.
     fn open_card_editor(&mut self, id: NoteId) {
+        self.open_card_editor_with_promotion(id, false);
+    }
+
+    /// Open the card editor for `id`, with optional immediate pending_promotion.
+    /// Used by InboxEvent::Promote (Ctrl+Enter on inbox card = promote-without-typing).
+    fn open_card_editor_with_promotion(&mut self, id: NoteId, pending_promotion: bool) {
         self.state.session.open_card = Some(id);
         self.state.session_dirty_at = Some(std::time::Instant::now());
+        // Stash pending_promotion for the deferred-open path (drain_events Body
+        // handler) in case the body hasn't arrived yet.
+        self.state.pending_open_promotion = pending_promotion;
         if let Some(cached) = self.state.bodies.get_or_request(id, &self.vault.commands)
             && self.state.editor.is_none()
         {
             let saved_undo = self.state.text_undo.remove(&id);
+            let is_fleeting = {
+                let idx = self.vault.index.read().unwrap();
+                idx.get(id)
+                    .map(|m| m.status == jd_core::note::Status::Fleeting)
+                    .unwrap_or(false)
+            };
             self.state.editor = Some(crate::editor::EditorState::open(
                 id,
                 cached.text.clone(),
                 saved_undo,
+                is_fleeting,
+                pending_promotion,
             ));
+            // Consumed — clear.
+            self.state.pending_open_promotion = false;
         }
     }
 
@@ -809,8 +881,11 @@ impl JdUi {
                 self.open_card_editor(id);
             }
 
-            InboxEvent::Promote(_id) => {
-                // wired in promotion task
+            InboxEvent::Promote(id) => {
+                // Task 4: Ctrl+Enter on an inbox scrap = promote-without-typing.
+                // Open the editor with pending_promotion=true so close dispatches
+                // the compound Batch([SaveBody, Promote]) immediately.
+                self.open_card_editor_with_promotion(id, true);
             }
 
             InboxEvent::Toss(id) => {

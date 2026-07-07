@@ -77,6 +77,10 @@ fn lex_capped(
 /// egui's TextEdit maps cursor hits through the galley, so as long as the
 /// job's byte ranges exactly tile the buffer, cursor/selection/IME inherit
 /// correctness from TextEdit itself.
+///
+/// `promote_restyle`: when `true`, the first line is rendered as a Heading(1)
+/// even without a `# ` prefix — promotion visual feedback (WP3 Task 4).
+/// The BUFFER stays raw; the `# ` is prepended at commit time only.
 pub fn layout_body(
     ui: &egui::Ui,
     text: &str,
@@ -84,6 +88,7 @@ pub fn layout_body(
     cache: &mut LineCache,
     resolve: &dyn Fn(&str) -> bool,
     theme: &crate::theme::Theme,
+    promote_restyle: bool,
 ) -> Arc<egui::Galley> {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width;
@@ -96,6 +101,21 @@ pub fn layout_body(
             job.append("\n", 0.0, crate::theme::text_format(SpanStyle::Text, theme));
             offset += 1;
         }
+
+        // Promotion restyle: first line rendered as heading even without `# `.
+        // This is presentation-only; the buffer stays raw.
+        if promote_restyle && i == 0 && !line.starts_with('#') {
+            let mut fmt = crate::theme::text_format(SpanStyle::Text, theme);
+            fmt.font_id = eframe::egui::FontId::new(
+                heading_size(1),
+                eframe::egui::FontFamily::Name("inter-bold".into()),
+            );
+            job.append(line, 0.0, fmt);
+            offset += line.len();
+            state = LineState::Normal; // first line can't be in a fence
+            continue;
+        }
+
         let key = line_key(line, state);
         let (spans, exit) = cache
             .map
@@ -156,16 +176,28 @@ pub struct EditorState {
     /// and URL-paste-over-selection; the buffer cannot change between frames,
     /// so last frame's cursor is current when this frame's input arrives).
     prev_cursor: Option<egui::text::CCursorRange>,
+    /// Whether the card being edited was fleeting when it was opened.
+    /// Threaded from FaceMeta/index at open time.
+    pub is_fleeting: bool,
+    /// Promotion is pending: on close, dispatch a compound
+    /// Batch([SaveBody{content: "# line1\nrest"}, Promote{id}]).
+    /// Set by Enter-at-end-of-single-line (fleeting only) or Ctrl+Enter.
+    pub pending_promotion: bool,
 }
 
 impl EditorState {
     /// Open a new editor for `id` pre-loaded with `body` (body-only, no frontmatter).
     /// `saved_undo` is the undo stack from the previous session (if any); when
     /// `None` a fresh stack is created from `body`.
+    /// `is_fleeting` is threaded from FaceMeta at open time.
+    /// `pending_promotion` is true when the Inbox Ctrl+Enter path immediately seeds
+    /// promotion (no newline needed; close will dispatch the compound op).
     pub fn open(
         id: NoteId,
         body: String,
         saved_undo: Option<crate::text_undo::TextUndo>,
+        is_fleeting: bool,
+        pending_promotion: bool,
     ) -> EditorState {
         let undo = saved_undo.unwrap_or_else(|| crate::text_undo::TextUndo::new(&body));
         EditorState {
@@ -180,6 +212,8 @@ impl EditorState {
             ac_selected: 0,
             ac_dismissed: false,
             prev_cursor: None,
+            is_fleeting,
+            pending_promotion,
         }
     }
 }
@@ -483,6 +517,11 @@ pub fn editor_ui(
     // when egui's own TextEdit would otherwise handle Enter.
     let ctrl_enter = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
     if ctrl_enter {
+        // Task 4: Ctrl+Enter on a fleeting single-line card = promote-without-typing.
+        // Set pending_promotion immediately; close falls through below.
+        if ed.is_fleeting && !ed.buffer.contains('\n') && !ed.pending_promotion {
+            ed.pending_promotion = true;
+        }
         close_requested = true;
     }
 
@@ -529,6 +568,11 @@ pub fn editor_ui(
             set_cursor_char(ui.ctx(), te_id, snap.cursor);
             ed.dirty = true;
             ed.last_edit = Some(Instant::now());
+            // If promotion was pending, the undo reverted the triggering newline.
+            // Unset pending_promotion so no compound op is dispatched on close.
+            if ed.pending_promotion {
+                ed.pending_promotion = false;
+            }
         }
         if do_redo && let Some(snap) = ed.undo.redo() {
             ed.buffer = snap.text;
@@ -615,67 +659,109 @@ pub fn editor_ui(
                 ac_accept(ed, ui.ctx(), te_id, &ac_ctx, &item, cb);
             }
         } else if has_focus && let (Some(c), Some(cb)) = (cursor_char, cursor_byte) {
-            // Enter: list/quote continuation. Plain Enter passes through
-            // (only Continue/EndList consume the key).
-            let line_start = ed.buffer[..cb].rfind('\n').map_or(0, |p| p + 1);
-            let line_before = ed.buffer[line_start..cb].to_owned();
-            let mut edited = false;
-            match enter_action(&line_before) {
-                EnterAction::Plain => {}
-                EnterAction::Continue(prefix) => {
-                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
-                        let ins = format!("\n{prefix}");
-                        ed.buffer.insert_str(cb, &ins);
-                        set_cursor_char(ui.ctx(), te_id, c + ins.chars().count());
-                        ed.dirty = true;
-                        ed.last_edit = Some(Instant::now());
-                        edited = true;
+            // Promotion trigger (Task 4): fleeting card, exactly one line in
+            // the buffer, cursor at the end of that line → Enter promotes.
+            // Compose with list continuation: promotion check runs first; if
+            // the single line happens to be a list prefix ("- "), list
+            // continuation takes priority (the scrap isn't meaningful yet).
+            // In practice a lone "- " triggers EndList which clears it, so
+            // entering an empty list line cannot accidentally promote.
+            let is_single_line = !ed.buffer.contains('\n');
+            let cursor_at_end = cb == ed.buffer.len();
+            if ed.is_fleeting
+                && !ed.pending_promotion
+                && is_single_line
+                && cursor_at_end
+                && enter_action(&ed.buffer) == EnterAction::Plain
+            {
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                    // Insert the newline so the user can type body text.
+                    ed.buffer.push('\n');
+                    // Move cursor to after the newline (start of line 2).
+                    set_cursor_char(ui.ctx(), te_id, c + 1);
+                    ed.dirty = true;
+                    ed.last_edit = Some(Instant::now());
+                    // Record now so Ctrl+Z can revert just the newline.
+                    ed.undo.record(&ed.buffer, c + 1, now_ms);
+                    ed.pending_promotion = true;
+                    // Skip the regular list/continuation block below.
+                }
+            } else {
+                // Enter: list/quote continuation. Plain Enter passes through
+                // (only Continue/EndList consume the key).
+                let line_start = ed.buffer[..cb].rfind('\n').map_or(0, |p| p + 1);
+                let line_before = ed.buffer[line_start..cb].to_owned();
+                let mut edited = false;
+                match enter_action(&line_before) {
+                    EnterAction::Plain => {}
+                    EnterAction::Continue(prefix) => {
+                        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                        {
+                            let ins = format!("\n{prefix}");
+                            ed.buffer.insert_str(cb, &ins);
+                            set_cursor_char(ui.ctx(), te_id, c + ins.chars().count());
+                            ed.dirty = true;
+                            ed.last_edit = Some(Instant::now());
+                            edited = true;
+                        }
+                    }
+                    EnterAction::EndList { strip_from } => {
+                        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                        {
+                            let strip_start = line_start + strip_from;
+                            let stripped = ed.buffer[strip_start..cb].chars().count();
+                            ed.buffer.replace_range(strip_start..cb, "");
+                            set_cursor_char(ui.ctx(), te_id, c - stripped);
+                            ed.dirty = true;
+                            ed.last_edit = Some(Instant::now());
+                            edited = true;
+                        }
                     }
                 }
-                EnterAction::EndList { strip_from } => {
-                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
-                        let strip_start = line_start + strip_from;
-                        let stripped = ed.buffer[strip_start..cb].chars().count();
-                        ed.buffer.replace_range(strip_start..cb, "");
-                        set_cursor_char(ui.ctx(), te_id, c - stripped);
-                        ed.dirty = true;
-                        ed.last_edit = Some(Instant::now());
-                        edited = true;
-                    }
-                }
-            }
 
-            // Tab / Shift+Tab: indent/outdent list lines only; non-list Tab
-            // passes through (TextEdit inserts \t — acceptable v1). Skipped
-            // when Enter already edited the buffer (cursor bytes are stale).
-            if !edited {
-                let line_end = ed.buffer[cb..]
-                    .find('\n')
-                    .map_or(ed.buffer.len(), |p| cb + p);
-                let line = ed.buffer[line_start..line_end].to_owned();
-                if indent_line(&line, false).is_some() {
-                    let outdent =
-                        ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
-                    let indent = !outdent
-                        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
-                    if (indent || outdent)
-                        && let Some(new_line) = indent_line(&line, outdent)
-                    {
-                        ed.buffer.replace_range(line_start..line_end, &new_line);
-                        let new_c = if outdent { c.saturating_sub(2) } else { c + 2 };
-                        set_cursor_char(ui.ctx(), te_id, new_c);
-                        ed.dirty = true;
-                        ed.last_edit = Some(Instant::now());
+                // Tab / Shift+Tab: indent/outdent list lines only; non-list Tab
+                // passes through (TextEdit inserts \t — acceptable v1). Skipped
+                // when Enter already edited the buffer (cursor bytes are stale).
+                if !edited {
+                    let line_end = ed.buffer[cb..]
+                        .find('\n')
+                        .map_or(ed.buffer.len(), |p| cb + p);
+                    let line = ed.buffer[line_start..line_end].to_owned();
+                    if indent_line(&line, false).is_some() {
+                        let outdent =
+                            ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+                        let indent = !outdent
+                            && ui.input_mut(|i| {
+                                i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                            });
+                        if (indent || outdent)
+                            && let Some(new_line) = indent_line(&line, outdent)
+                        {
+                            ed.buffer.replace_range(line_start..line_end, &new_line);
+                            let new_c = if outdent { c.saturating_sub(2) } else { c + 2 };
+                            set_cursor_char(ui.ctx(), te_id, new_c);
+                            ed.dirty = true;
+                            ed.last_edit = Some(Instant::now());
+                        }
                     }
                 }
-            }
+            } // closes else { (non-promotion path)
         }
 
         // Build the layouter closure; borrows `ed.cache` and `resolve_fn`.
         let cache = &mut ed.cache;
         let theme = deps.theme;
+        let promote_restyle = ed.pending_promotion;
         let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-            layout_body(ui, buf.as_str(), wrap, cache, &resolve_fn, theme)
+            layout_body(
+                ui,
+                buf.as_str(),
+                wrap,
+                cache,
+                &resolve_fn,
+                theme,
+                promote_restyle,
+            )
         };
 
         let te = egui::TextEdit::multiline(&mut ed.buffer)

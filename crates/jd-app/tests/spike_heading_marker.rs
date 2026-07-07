@@ -24,6 +24,7 @@ impl eframe::App for App {
             &mut cache,
             &|_| false,
             &jd_app::theme::Theme::light(),
+            false,
         );
         let sizes: Vec<f32> = galley
             .job

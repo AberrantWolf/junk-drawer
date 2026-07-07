@@ -237,7 +237,15 @@ pub fn card_face(
         }
 
         let wrap_width = rect.width() - 20.0;
-        let galley = layout_body(ui, body_for_layout, wrap_width, cache, &|_| false, th);
+        let galley = layout_body(
+            ui,
+            body_for_layout,
+            wrap_width,
+            cache,
+            &|_| false,
+            th,
+            false,
+        );
 
         let clip_rect = egui::Rect::from_min_max(
             egui::pos2(rect.min.x + 10.0, content_top),

@@ -799,3 +799,92 @@ fn ctrl_enter_promotes_not_opens_editor() {
         "Ctrl+Enter must NOT open the editor"
     );
 }
+
+// ===========================================================================
+// Task 4: Inbox Ctrl+Enter → open promoting editor
+// ===========================================================================
+
+/// Inbox Ctrl+Enter (InboxEvent::Promote) opens the editor with
+/// pending_promotion=true immediately, ready for the user to type a title.
+#[test]
+fn inbox_promote_event_opens_editor_with_pending_promotion() {
+    let (vault, mut h, ids) = app_with_staggered_fleeting();
+    let id = ids[0];
+
+    // Dispatch the Promote event directly (simulates Ctrl+Enter from inbox_ui).
+    {
+        use jd_app::surfaces::inbox::InboxEvent;
+        h.state_mut().apply_inbox_event(InboxEvent::Promote(id));
+    }
+
+    // Wait for editor to open (body fetch may be needed).
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_some(),
+        200,
+        "editor opens after Promote event",
+    );
+    for _ in 0..3 {
+        h.step();
+    }
+
+    // Editor must be open.
+    assert!(
+        h.state().state.editor.is_some(),
+        "editor must open after InboxEvent::Promote"
+    );
+
+    // pending_promotion must be true.
+    assert!(
+        h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "editor opened by InboxEvent::Promote must have pending_promotion=true"
+    );
+
+    // is_fleeting must be true (the scrap was fleeting).
+    assert!(
+        h.state().state.editor.as_ref().unwrap().is_fleeting,
+        "editor must know the scrap is fleeting"
+    );
+
+    // Close with Esc → compound Batch dispatched.
+    h.key_press(egui::Key::Escape);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_none(),
+        100,
+        "editor closes on Esc",
+    );
+
+    // Wait for worker to process the Batch.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id)
+                .map(|m| m.status == jd_core::note::Status::Permanent)
+                .unwrap_or(false)
+        },
+        200,
+        "scrap promoted to Permanent after inbox Ctrl+Enter close",
+    );
+
+    // Verify file is in notes/ and body has "# " prefix.
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let meta = idx.get(id).expect("note must be in index after promote");
+        let rel = meta.rel_path.to_string_lossy();
+        assert!(
+            rel.contains("notes/") || rel.starts_with("notes/"),
+            "promoted note must be in notes/, got: {rel}"
+        );
+        let abs = vault.path().join(&meta.rel_path);
+        drop(idx);
+        let content = std::fs::read_to_string(&abs).expect("read promoted file");
+        let doc = jd_core::doc::NoteDoc::parse(&content);
+        assert!(
+            doc.body.starts_with("# "),
+            "promoted body must start with '# ', got: {:?}",
+            &doc.body[..doc.body.len().min(60)]
+        );
+    }
+}

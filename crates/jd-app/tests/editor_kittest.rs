@@ -323,6 +323,7 @@ fn editor_styles_headings_larger() {
                 &mut cache,
                 &|_| false,
                 &jd_app::theme::Theme::light(),
+                false,
             );
             if galley.rows.len() >= 2 {
                 *self.rh.lock().unwrap() = Some((
@@ -627,6 +628,341 @@ fn text_undo_survives_close_and_reopen() {
         "Ctrl+Z after reopen must undo 'beta' → buffer 'alpha ', got: {:?}",
         buf_after_undo
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: Promotion tests
+// ---------------------------------------------------------------------------
+
+/// Create an app with one FLEETING scrap placed on the desk.
+/// Returns (vault_dir, harness, note_id).
+fn app_with_fleeting_on_desk(body: &str) -> (common::TempDir, Harness<'static, JdUi>, NoteId) {
+    let vault = common::temp_vault();
+    let mut app = JdUi::new(vault.path()).expect("JdUi::new");
+
+    let seed = jd_core::note::NewNote {
+        body: body.to_owned(),
+        status: jd_core::note::Status::Fleeting,
+        kind: jd_core::note::Kind::Note,
+        source: None,
+        tags: Vec::new(),
+    };
+    app.vault
+        .commands
+        .send(VaultCommand::Op {
+            op: VaultOp::Create {
+                seed,
+                dest: jd_core::command::Dest::Inbox,
+            },
+            source: OpSource::User,
+        })
+        .unwrap();
+
+    let note_id;
+    loop {
+        match app
+            .vault
+            .events
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("OpDone")
+        {
+            VaultEvent::OpDone { result, .. } => {
+                note_id = result.created.into_iter().next();
+                break;
+            }
+            VaultEvent::ScanComplete { .. } => {
+                app.state.scan_done = true;
+                app.state.bodies.invalidate_all();
+                if app.state.session.desks.is_empty() {
+                    use jd_core::id::IdGen;
+                    use jd_core::session::{DeskId, SessionOp, SurfaceId};
+                    let mut id_gen = IdGen::new();
+                    let desk_id = DeskId::generate(&mut id_gen);
+                    let _ = app.state.session.apply(&SessionOp::CreateDesk {
+                        id: desk_id,
+                        name: "Desk".into(),
+                    });
+                    app.state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+                }
+            }
+            _ => continue,
+        }
+    }
+    let note_id = note_id.expect("Create yielded an id");
+
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .build_ui_state(|ui, app: &mut JdUi| app.ui(ui), app);
+
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.scan_done && !a.state.session.desks.is_empty(),
+        200,
+        "scan + default desk",
+    );
+
+    let desk_id = h.state().state.session.desks[0].id;
+    let _ = h.state_mut().state.session.apply(&SessionOp::Place {
+        desk: desk_id,
+        id: note_id,
+        pos: Vec2 { x: 0.0, y: 0.0 },
+    });
+    h.run_ok();
+
+    (vault, h, note_id)
+}
+
+/// The full pedagogy path (Task 4):
+/// Create fleeting scrap, Enter at end → pending_promotion set + editor still open;
+/// type body; Esc → file moves to notes/, body starts "# ", status Permanent,
+/// journal has exactly ONE entry labeled with the scrap's first line.
+#[test]
+fn promotion_full_pedagogy_path() {
+    let (vault, mut h, id) = app_with_fleeting_on_desk("egui layouter idea");
+
+    // Verify the note starts fleeting.
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let meta = idx.get(id).expect("note in index");
+        assert_eq!(
+            meta.status,
+            jd_core::note::Status::Fleeting,
+            "note must start fleeting"
+        );
+    }
+
+    // Open the editor and verify is_fleeting is threaded.
+    open_editor(&mut h, id);
+    assert!(
+        h.state().state.editor.as_ref().unwrap().is_fleeting,
+        "editor must know the note is fleeting"
+    );
+    assert!(
+        !h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "pending_promotion must be false before Enter"
+    );
+
+    // Capture journal length before promotion.
+    let journal_len_before = h.state().state.journal.len();
+
+    // Press Enter at end of the single-line buffer → triggers promotion.
+    h.key_press(egui::Key::Enter);
+    h.step();
+    h.run_ok();
+
+    // Editor must still be open.
+    assert!(
+        h.state().state.editor.is_some(),
+        "editor must stay open after promotion Enter"
+    );
+    // pending_promotion must be set.
+    assert!(
+        h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "pending_promotion must be set after Enter at end of single-line"
+    );
+    // Buffer must have a newline (second line was added).
+    let buf = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(
+        buf.contains('\n'),
+        "buffer must contain a newline after promotion Enter, got: {:?}",
+        buf
+    );
+
+    // Type some body text.
+    let node = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+    node.type_text("body words");
+    h.step();
+    h.run_ok();
+
+    // Close with Esc → compound Batch dispatched.
+    h.key_press(egui::Key::Escape);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_none(),
+        100,
+        "editor closes on Esc",
+    );
+
+    // Wait for the worker to process the Batch (SaveBody + Promote).
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(id)
+                .map(|m| m.status == jd_core::note::Status::Permanent)
+                .unwrap_or(false)
+        },
+        200,
+        "note promoted to Permanent",
+    );
+
+    // Give worker time to flush.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    h.run_ok();
+
+    // File must be in notes/.
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let meta = idx.get(id).expect("note must still be in index");
+        assert_eq!(
+            meta.status,
+            jd_core::note::Status::Permanent,
+            "promoted note must be Permanent"
+        );
+        let rel = meta.rel_path.to_string_lossy();
+        assert!(
+            rel.contains("notes/") || rel.starts_with("notes/"),
+            "promoted note must be in notes/, got: {rel}"
+        );
+    }
+
+    // Body must start with "# egui layouter idea".
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let meta = idx.get(id).expect("note in index");
+        let abs = vault.path().join(&meta.rel_path);
+        drop(idx);
+        let content = std::fs::read_to_string(&abs).expect("read promoted note");
+        let doc = jd_core::doc::NoteDoc::parse(&content);
+        assert!(
+            doc.body.starts_with("# egui layouter idea"),
+            "promoted body must start with '# egui layouter idea', got: {:?}",
+            &doc.body[..doc.body.len().min(100)]
+        );
+    }
+
+    // ONE journal entry labeled with the first line.
+    let journal_len_after = h.state().state.journal.len();
+    assert_eq!(
+        journal_len_after,
+        journal_len_before + 1,
+        "promotion must journal exactly ONE entry (was {journal_len_before}, now {journal_len_after})"
+    );
+    assert_eq!(
+        h.state().state.journal.undo_label(),
+        Some("Promote scrap 'egui layouter idea'"),
+        "journal label must name the first line"
+    );
+
+    // NOTE: Single Ctrl+Z full reversal (file back to inbox/, fleeting) lands
+    // in Task 6's test once undo keys are wired to the app stack. Not testing here.
+}
+
+/// Multi-line scrap: Enter at end of line 2 does NOT trigger promotion.
+#[test]
+fn multiline_scrap_enter_does_not_promote() {
+    let (_, mut h, id) = app_with_fleeting_on_desk("line one");
+
+    open_editor(&mut h, id);
+
+    // Type a second line manually to make the buffer multi-line.
+    let node = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+    node.type_text("\nline two");
+    h.step();
+    h.run_ok();
+
+    // Verify we now have a 2-line buffer.
+    let buf = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(
+        buf.contains('\n'),
+        "buffer must be multi-line at this point"
+    );
+
+    // Press Enter — must NOT trigger promotion (not a single-line card anymore).
+    h.key_press(egui::Key::Enter);
+    h.step();
+    h.run_ok();
+
+    assert!(
+        !h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "multi-line scrap Enter must NOT set pending_promotion"
+    );
+
+    // Status must still be fleeting.
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let meta = idx.get(id).expect("note in index");
+        assert_eq!(
+            meta.status,
+            jd_core::note::Status::Fleeting,
+            "multi-line scrap must remain Fleeting after Enter"
+        );
+    }
+}
+
+/// Ctrl+Z while pending reverts the in-editor state (no vault op sent).
+/// Sets pending_promotion, then Ctrl+Z → pending unset, no Batch dispatched.
+#[test]
+fn ctrl_z_while_pending_reverts_without_vault_op() {
+    let (_, mut h, _id) = app_with_fleeting_on_desk("my idea");
+
+    open_editor(&mut h, _id);
+
+    let journal_len_before = h.state().state.journal.len();
+
+    // Enter at end → pending.
+    h.key_press(egui::Key::Enter);
+    h.step();
+    h.run_ok();
+    assert!(
+        h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "pending_promotion must be set"
+    );
+
+    // Ctrl+Z → revert the newline + unset pending.
+    h.event(egui::Event::Key {
+        key: egui::Key::Z,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    });
+    h.step();
+    h.run_ok();
+
+    assert!(
+        !h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "Ctrl+Z must unset pending_promotion"
+    );
+
+    // Buffer must be back to single-line (no newline).
+    let buf = h.state().state.editor.as_ref().unwrap().buffer.clone();
+    assert!(
+        !buf.contains('\n'),
+        "Ctrl+Z must revert the promotion newline, buf: {:?}",
+        buf
+    );
+
+    // Close without saving (clean close — no edit after undo).
+    h.key_press(egui::Key::Escape);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_none(),
+        100,
+        "editor closes",
+    );
+
+    // No new journal entry from the Ctrl+Z or close (no promotion, no save).
+    // Give worker time to potentially send (should not).
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    h.run_ok();
+
+    let journal_len_after = h.state().state.journal.len();
+    assert_eq!(
+        journal_len_before, journal_len_after,
+        "Ctrl+Z+close without edit must not push journal entry (was {journal_len_before}, now {journal_len_after})"
+    );
+
+    // Status must still be Fleeting.
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let meta = idx.get(_id).expect("note in index");
+        assert_eq!(
+            meta.status,
+            jd_core::note::Status::Fleeting,
+            "Ctrl+Z revert must keep note Fleeting"
+        );
+    }
 }
 
 /// Ctrl+Z in the editor must never push to the app journal.
