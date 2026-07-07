@@ -66,6 +66,12 @@ impl BodyCache {
         self.map.insert(id, CachedBody { text: content });
     }
 
+    /// Returns the cached body without requesting it; `None` if not yet loaded.
+    /// Used by kitests to poll for body load completion.
+    pub fn get_cached(&self, id: NoteId) -> Option<&CachedBody> {
+        self.map.get(&id)
+    }
+
     /// Invalidate a single entry, forcing re-request on next access.
     pub fn invalidate(&mut self, id: NoteId) {
         self.map.remove(&id);

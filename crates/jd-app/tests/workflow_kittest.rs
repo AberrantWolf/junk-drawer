@@ -532,3 +532,242 @@ fn rename_desk_empty_name_on_commit_does_not_rename() {
         "empty-name commit must not journal"
     );
 }
+
+// ===========================================================================
+// Task 3: Inbox surface
+// ===========================================================================
+
+/// Build an app with 3 fleeting scraps with staggered `created` timestamps.
+/// A ~5 ms sleep between creates ensures distinct ms-precision timestamps so
+/// that `Index::fleeting()` returns them oldest-first reliably.
+fn app_with_staggered_fleeting() -> (common::TempDir, Harness<'static, JdUi>, Vec<NoteId>) {
+    let vault = common::temp_vault();
+    let mut app = JdUi::new(vault.path()).expect("JdUi::new");
+    let mut ids = Vec::new();
+
+    // Bootstrap scan/desk loop first so IDs are reliably processed.
+    for i in 1..=3_usize {
+        // Small sleep between creates: `created` has ms precision.
+        if i > 1 {
+            std::thread::sleep(std::time::Duration::from_millis(6));
+        }
+        let seed = jd_core::note::NewNote {
+            body: format!("scrap {i}"),
+            status: jd_core::note::Status::Fleeting,
+            kind: jd_core::note::Kind::Note,
+            source: None,
+            tags: Vec::new(),
+        };
+        app.vault
+            .commands
+            .send(VaultCommand::Op {
+                op: VaultOp::Create {
+                    seed,
+                    dest: Dest::Inbox,
+                },
+                source: OpSource::User,
+            })
+            .unwrap();
+        loop {
+            match app
+                .vault
+                .events
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("OpDone for fleeting scrap")
+            {
+                VaultEvent::OpDone { result, .. } => {
+                    ids.push(
+                        result
+                            .created
+                            .into_iter()
+                            .next()
+                            .expect("Create yields an id"),
+                    );
+                    break;
+                }
+                VaultEvent::ScanComplete { .. } => {
+                    app.state.scan_done = true;
+                    app.state.bodies.invalidate_all();
+                    if app.state.session.desks.is_empty() {
+                        use jd_core::id::IdGen;
+                        let mut id_gen = IdGen::new();
+                        let desk_id = DeskId::generate(&mut id_gen);
+                        let _ = app.state.session.apply(&SessionOp::CreateDesk {
+                            id: desk_id,
+                            name: "Desk".into(),
+                        });
+                        app.state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .build_ui_state(|ui, app: &mut JdUi| app.ui(ui), app);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.scan_done && !a.state.session.desks.is_empty(),
+        200,
+        "scan + desk",
+    );
+
+    // Switch to Inbox surface.
+    h.state_mut().state.session.current_surface = Some(SurfaceId::Inbox);
+    h.run_ok();
+
+    (vault, h, ids)
+}
+
+/// Inbox renders scraps oldest-first.
+/// We verify by checking the index's fleeting() order (the source of truth for
+/// inbox ordering) matches the creation order (staggered timestamps).
+#[test]
+fn inbox_scraps_oldest_first_order() {
+    let (_v, mut h, ids) = app_with_staggered_fleeting();
+
+    // The index's fleeting() must return them in creation order (oldest-first).
+    let ordered: Vec<NoteId> = {
+        let idx = h.state().vault.index.read().unwrap();
+        idx.fleeting()
+    };
+
+    assert_eq!(ordered.len(), 3, "index must list 3 fleeting notes");
+
+    // All three IDs must appear in the ordered list.
+    for id in &ids {
+        assert!(ordered.contains(id), "id {id} must be in fleeting list");
+    }
+
+    // The ordered list must match the creation order (ids were created oldest-first
+    // with staggered timestamps, so they must appear in creation order).
+    assert_eq!(
+        ordered, ids,
+        "index must return fleeting notes in creation order"
+    );
+
+    // Wait for bodies to load so scrap a11y labels become non-empty.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            // All 3 body caches populated.
+            ids.iter()
+                .all(|&id| a.state.bodies.get_cached(id).is_some())
+        },
+        200,
+        "body cache to populate",
+    );
+
+    // All three scrap a11y labels (by body content) must be visible in the inbox.
+    for i in 1..=3_usize {
+        let label = format!("scrap {i}");
+        // Card faces use "Scrap: '<first_line>'" from card_a11y_label.
+        let expected = format!("Scrap: '{label}'");
+        h.get_by_label(&expected);
+    }
+}
+
+/// Del on the focused scrap tosses it: it disappears from the index's fleeting list.
+#[test]
+fn del_tosses_focused_scrap() {
+    let (_v, mut h, ids) = app_with_staggered_fleeting();
+
+    // Focus the first (oldest) scrap.
+    {
+        let app = h.state_mut();
+        app.state.focus = Some(ids[0]);
+    }
+
+    // Before: 3 fleeting notes.
+    let count_before = {
+        let idx = h.state().vault.index.read().unwrap();
+        idx.fleeting().len()
+    };
+    assert_eq!(count_before, 3);
+
+    // Press Delete.
+    h.key_press(egui::Key::Delete);
+    h.run_ok();
+
+    // Wait for the Toss to complete (worker journal entry arrives).
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.fleeting().len() < 3
+        },
+        200,
+        "toss to complete",
+    );
+
+    // After: 2 fleeting notes remain; the tossed id is gone.
+    let ordered_after = {
+        let idx = h.state().vault.index.read().unwrap();
+        idx.fleeting()
+    };
+    assert_eq!(ordered_after.len(), 2, "one scrap must be tossed");
+    assert!(
+        !ordered_after.contains(&ids[0]),
+        "tossed scrap must not be in fleeting list"
+    );
+
+    // Verify the tossed note is absent from the index entirely.
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert!(
+            idx.get(ids[0]).is_none(),
+            "tossed note must not be present in the index"
+        );
+    }
+}
+
+/// Ctrl+D opens the desk picker and Enter on the selection places the card on the desk
+/// while keeping it in the inbox list (still fleeting).
+#[test]
+fn ctrl_d_places_card_on_desk_stays_fleeting() {
+    let (_v, mut h, ids) = app_with_staggered_fleeting();
+
+    // Focus the second scrap.
+    let target_id = ids[1];
+    {
+        let app = h.state_mut();
+        app.state.focus = Some(target_id);
+    }
+
+    // Dispatch PlaceOnDesk directly (avoids keyboard-shortcut rendering complexity).
+    let desk_id = h.state().state.session.desks[0].id;
+    {
+        use jd_app::surfaces::inbox::InboxEvent;
+        h.state_mut().apply_inbox_event(InboxEvent::PlaceOnDesk {
+            id: target_id,
+            desk: desk_id,
+        });
+    }
+    h.run_ok();
+
+    // Card is on the desk.
+    assert!(
+        h.state().state.session.desks[0]
+            .cards
+            .iter()
+            .any(|c| c.id == target_id),
+        "card must be placed on the desk"
+    );
+
+    // Card is STILL in the inbox (still fleeting — placement doesn't change status).
+    let ordered = {
+        let idx = h.state().vault.index.read().unwrap();
+        idx.fleeting()
+    };
+    assert!(
+        ordered.contains(&target_id),
+        "card must still be in the fleeting (inbox) list after placement"
+    );
+    assert_eq!(
+        ordered.len(),
+        3,
+        "all 3 cards still in inbox after placement"
+    );
+}

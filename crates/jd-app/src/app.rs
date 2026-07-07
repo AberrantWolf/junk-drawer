@@ -18,6 +18,7 @@ use jd_core::worker::{self, VaultCommand, VaultEvent, VaultHandle};
 use crate::rail::{RailEvent, RailUiDeps};
 use crate::state::UiState;
 use crate::surfaces::desk::{DeskEvent, DeskUiDeps, DragState, FaceMeta};
+use crate::surfaces::inbox::{InboxEvent, InboxUiDeps};
 
 /// Repaint hook: the worker wakes us between frames; the egui Context only
 /// exists once the first frame runs, so it's injected lazily.
@@ -616,8 +617,38 @@ impl JdUi {
                     }
                 }
 
-                // Tasks 3/5 not yet implemented — show placeholder until they land.
-                Some(SurfaceId::Inbox) | Some(SurfaceId::Trash) | None => {
+                // Task 3: Inbox surface.
+                Some(SurfaceId::Inbox) => {
+                    // Prefetch FaceMeta for all fleeting notes under ONE index read lock.
+                    // Also get the ordered list (oldest-first by `created`).
+                    let (face_metas, ordered_ids): (Vec<FaceMeta>, Vec<NoteId>) = {
+                        let idx = self.vault.index.read().unwrap();
+                        let ordered = idx.fleeting(); // oldest-first
+                        let metas: Vec<FaceMeta> = ordered
+                            .iter()
+                            .filter_map(|&id| {
+                                idx.get(id).map(|m| FaceMeta::from_note_meta(m, &idx))
+                            })
+                            .collect();
+                        (metas, ordered)
+                    };
+                    let mut deps = InboxUiDeps {
+                        focus: &mut self.state.focus,
+                        bodies: &mut self.state.bodies,
+                        commands: &self.vault.commands,
+                        theme: &self.theme,
+                        line_cache: &mut self.line_cache,
+                        face_metas: &face_metas,
+                        session: &self.state.session,
+                        ordered_ids: &ordered_ids,
+                        editor_open: self.state.editor.is_some(),
+                    };
+                    let evts = crate::surfaces::inbox::inbox_ui(ui, &mut deps);
+                    self.apply_inbox_events(evts);
+                }
+
+                // Task 5: Trash surface — placeholder until it lands.
+                Some(SurfaceId::Trash) | None => {
                     crate::surfaces::placeholder::placeholder_ui(ui);
                 }
 
@@ -750,6 +781,64 @@ impl JdUi {
                     self.state.session_dirty_at = Some(std::time::Instant::now());
                 }
             }
+        }
+    }
+
+    /// Open the card editor for `id`, either immediately (body cached) or deferred
+    /// (body not yet loaded; drain_events will open the editor when Body arrives).
+    /// Mirrors the DeskEvent::OpenCard path in apply_desk_events.
+    fn open_card_editor(&mut self, id: NoteId) {
+        self.state.session.open_card = Some(id);
+        self.state.session_dirty_at = Some(std::time::Instant::now());
+        if let Some(cached) = self.state.bodies.get_or_request(id, &self.vault.commands)
+            && self.state.editor.is_none()
+        {
+            let saved_undo = self.state.text_undo.remove(&id);
+            self.state.editor = Some(crate::editor::EditorState::open(
+                id,
+                cached.text.clone(),
+                saved_undo,
+            ));
+        }
+    }
+
+    /// Apply `InboxEvent`s emitted by `inbox_ui`.
+    pub fn apply_inbox_event(&mut self, ev: InboxEvent) {
+        match ev {
+            InboxEvent::OpenCard(id) => {
+                self.open_card_editor(id);
+            }
+
+            InboxEvent::Promote(_id) => {
+                // wired in promotion task
+            }
+
+            InboxEvent::Toss(id) => {
+                let _ = self.vault.commands.send(jd_core::worker::VaultCommand::Op {
+                    op: jd_core::command::VaultOp::Toss { id },
+                    source: jd_core::command::OpSource::User,
+                });
+            }
+
+            InboxEvent::PlaceOnDesk { id, desk } => {
+                // Place the card on the desk at that desk's viewport center.
+                // Card stays fleeting/inboxed — this is placement only, not a status change.
+                let pos = self
+                    .state
+                    .session
+                    .desks
+                    .iter()
+                    .find(|d| d.id == desk)
+                    .map(|d| d.viewport.center)
+                    .unwrap_or_default();
+                self.place_card(desk, id, pos);
+            }
+        }
+    }
+
+    fn apply_inbox_events(&mut self, events: Vec<InboxEvent>) {
+        for ev in events {
+            self.apply_inbox_event(ev);
         }
     }
 
