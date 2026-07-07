@@ -54,6 +54,39 @@ impl Vault {
     }
 }
 
+/// In-crate TempDir twin for unit tests (integration tests keep their own copy
+/// in tests/common/mod.rs — Rust can't share across the crate boundary).
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    pub struct TempDir(pub std::path::PathBuf);
+
+    impl TempDir {
+        pub fn new() -> TempDir {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "jd-unit-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
