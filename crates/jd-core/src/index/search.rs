@@ -386,7 +386,9 @@ impl SearchIndex {
             // entry.  Compare using the same total_cmp polarity as the heap key.
             let score_bits = Reverse(score.to_bits()); // NaN-safe: to_bits preserves total_cmp order for non-NaN f32
             let id_rev = Reverse(id);
-            if heap.len() >= limit && let Some(worst) = heap.peek() {
+            if heap.len() >= limit
+                && let Some(worst) = heap.peek()
+            {
                 // worse-or-equal: score_bits > worst (min-heap so worst is at top
                 // with the LOWEST score, i.e. the HIGHEST Reverse(bits))
                 let new_entry_worse = score_bits > worst.score_rev
