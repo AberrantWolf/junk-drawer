@@ -300,6 +300,7 @@ impl JdUi {
                     // Clear any pending_label so it cannot leak onto the next
                     // successful op's journal entry (WP3 Task 4 review finding).
                     self.state.pending_label = None;
+                    restore_failed_undo_redo(&mut self.state);
                 }
                 VaultEvent::Error { context, message } => {
                     self.state.last_error = Some(format!("{context}: {message}"));
@@ -1359,6 +1360,27 @@ impl Drop for JdUi {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// If a vault undo/redo op fails, clear the in-flight guard and restore the
+/// stashed entry to the stack it came from so the user can retry. Without this
+/// the guard stays set and all future app-stack vault undo/redo is permanently
+/// blocked.
+fn restore_failed_undo_redo(state: &mut UiState) {
+    if let (Some(kind), Some(entry)) = (
+        state.pending_undo_redo.take(),
+        state.pending_undo_entry.take(),
+    ) {
+        match kind {
+            UndoRedoKind::Undo => {
+                // Entry was popped from undo; push it back without clearing redo.
+                state.journal.push_undo_from_redo(entry);
+            }
+            UndoRedoKind::Redo => {
+                state.journal.push_redo(entry);
+            }
+        }
+    }
+}
+
 /// Journal label for session ops that are undoable user actions.
 /// Viewport changes (ViewportMoved) and structural ops (CreateDesk etc.)
 /// are NOT journaled.
@@ -1484,5 +1506,67 @@ mod tests {
         let mut out = Vec::new();
         op_subject_ids(&op, &mut out);
         assert!(out.is_empty());
+    }
+
+    fn journal_entry(n: u8) -> JournalEntry {
+        JournalEntry {
+            label: format!("op {n}"),
+            inverse: InverseAction::Vault(VaultOp::Promote { id: nid(n) }),
+            context: OpContext::default(),
+        }
+    }
+
+    /// A failed vault-undo op must clear the in-flight guard and push the
+    /// stashed entry back onto the undo stack (so the user can retry).
+    #[test]
+    fn restore_failed_undo_redo_undo_restores_to_undo_stack() {
+        let mut state = UiState::default();
+        let entry = journal_entry(1);
+        state.pending_undo_redo = Some(UndoRedoKind::Undo);
+        state.pending_undo_entry = Some(entry.clone());
+
+        restore_failed_undo_redo(&mut state);
+
+        assert!(state.pending_undo_redo.is_none(), "guard must be cleared");
+        assert!(state.pending_undo_entry.is_none(), "stash must be cleared");
+        assert_eq!(
+            state.journal.undo_label(),
+            Some(entry.label.as_str()),
+            "entry must be back on undo stack"
+        );
+        assert!(
+            state.journal.redo_label().is_none(),
+            "redo stack must not be disturbed"
+        );
+    }
+
+    /// A failed vault-redo op must clear the in-flight guard and push the
+    /// stashed entry back onto the redo stack (so the user can retry).
+    #[test]
+    fn restore_failed_undo_redo_redo_restores_to_redo_stack() {
+        let mut state = UiState::default();
+        let entry = journal_entry(2);
+        state.pending_undo_redo = Some(UndoRedoKind::Redo);
+        state.pending_undo_entry = Some(entry.clone());
+
+        restore_failed_undo_redo(&mut state);
+
+        assert!(state.pending_undo_redo.is_none(), "guard must be cleared");
+        assert!(state.pending_undo_entry.is_none(), "stash must be cleared");
+        assert_eq!(
+            state.journal.redo_label(),
+            Some(entry.label.as_str()),
+            "entry must be back on redo stack"
+        );
+    }
+
+    /// With no in-flight undo/redo, restore_failed_undo_redo is a no-op.
+    #[test]
+    fn restore_failed_undo_redo_no_op_when_not_in_flight() {
+        let mut state = UiState::default();
+        restore_failed_undo_redo(&mut state);
+        assert!(state.pending_undo_redo.is_none());
+        assert!(state.pending_undo_entry.is_none());
+        assert!(state.journal.undo_label().is_none());
     }
 }
