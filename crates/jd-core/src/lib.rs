@@ -8,6 +8,7 @@ pub mod frontmatter;
 pub mod geom;
 pub mod id;
 pub mod index;
+pub mod journal;
 pub mod lexer;
 pub mod note;
 pub mod rng;
