@@ -181,3 +181,23 @@ test result: ok. 7 passed; 0 failed; 0 ignored
 ```
 
 Full suite: 32/32 pass. `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo fmt --check` clean.
+
+## Re-review fixes (d33cdf0)
+
+1. **reveal() panel rect (Important)**: removed the hardcoded 1200×776 rect in
+   `apply_desk_events`' FocusChanged arm. `JdUi` now caches
+   `last_panel_rect: Option<egui::Rect>` from `ui.max_rect()` inside the
+   CentralPanel closure each frame before `desk_ui` runs; the FocusChanged arm
+   uses it, falling back to `egui::Rect::NOTHING` when `None` so reveal always
+   fires on the first frame (errs on the side of revealing).
+2. **Line-unit scroll→zoom**: MouseWheel Line multiplier 50.0 → 40.0 pt/line
+   (egui's native line_scroll_speed default) in desk.rs.
+3. **reveal() per-shape card size**: `reveal` now takes `face_metas` and uses
+   `card::shape::card_size(shape_for(status, kind))` per card (300×200
+   IndexCard fallback when meta is absent), scaling by `cam.zoom` for the
+   screen-space visibility rect — consistent with the hit-test path. Centering
+   uses the per-shape half-size.
+
+Tests: 33/33 pass (`cargo test -p jd-app`), including
+`desk_kittest::arrowkey_to_offscreen_card_reveals_it`. Clippy `-D warnings`
+clean; `cargo fmt --check` clean. No jd-core changes.

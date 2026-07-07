@@ -88,27 +88,49 @@ impl JdUi {
         })
     }
 
+    /// Apply a session op, always mark dirty, and push a journal entry when
+    /// `journal` is `Some(label)`.  This is the single authoritative path for
+    /// all session mutations.
+    fn apply_session(&mut self, op: SessionOp, journal: Option<&'static str>) {
+        let inverse = self.state.session.apply(&op);
+        self.state.session_dirty_at = Some(std::time::Instant::now());
+        if let Some(label) = journal {
+            self.state.journal.push(JournalEntry {
+                label: label.to_owned(),
+                inverse: InverseAction::Session(inverse),
+                context: OpContext::default(),
+            });
+        }
+    }
+
     /// Place a note on a desk at the given world position.
     /// Journaled as "Place card" and marks the session dirty.
     pub fn place_card(&mut self, desk: DeskId, id: NoteId, pos: CoreVec2) {
-        let op = SessionOp::Place { desk, id, pos };
-        let inverse = self.state.session.apply(&op);
-        self.state.session_dirty_at = Some(std::time::Instant::now());
-        self.state.journal.push(JournalEntry {
-            label: "Place card".to_owned(),
-            inverse: InverseAction::Session(inverse),
-            context: OpContext::default(),
-        });
+        self.apply_session(SessionOp::Place { desk, id, pos }, Some("Place card"));
     }
 
-    /// If a pending_create is set and `created_ids` contains the new id, place
-    /// it on the current desk and optionally open the editor.
-    fn handle_pending_create(&mut self, created_ids: &[NoteId]) {
+    /// If a pending_create is set and the OpDone was a Create op (identified by
+    /// its inverse being `VaultOp::Delete { .. }` — the shape WP1e returns for
+    /// Create), place the new card and optionally open the editor.
+    ///
+    /// Robustness: only consumes pending_create when the inverse is Delete, so a
+    /// future non-Create op with a non-empty `created` list (e.g. Split) cannot
+    /// steal the pending placement.
+    ///
+    /// WP3 handoff: a stale pending_create that outlives ScanComplete (e.g. if the
+    /// worker emits OpDone before ScanComplete arrives) will be cleared on the
+    /// next qualifying OpDone; this edge case is tracked as a WP3 cleanup item.
+    fn handle_pending_create(&mut self, result: &jd_core::command::OpResult) {
+        // Only consume pending_create for Create ops: their inverse is Delete{id}.
+        let is_create_op = matches!(result.inverse, Some(VaultOp::Delete { .. }));
+        if !is_create_op {
+            return;
+        }
         let Some(pending) = self.state.pending_create.take() else {
             return;
         };
-        let Some(&new_id) = created_ids.first() else {
-            // No id in this OpDone (shouldn't happen for Create, but be safe).
+        let Some(&new_id) = result.created.first() else {
+            // No id in this Create result (shouldn't happen, but be safe).
             self.state.pending_create = Some(pending);
             return;
         };
@@ -116,7 +138,7 @@ impl JdUi {
             self.place_card(desk_id, new_id, pending.at);
             if pending.open_editor {
                 self.state.session.open_card = Some(new_id);
-                self.state.session_dirty_at = Some(std::time::Instant::now());
+                // session_dirty_at already set by place_card → apply_session; no reset needed.
             }
         } else {
             // No desk yet — restore pending_create (unlikely race; best-effort).
@@ -134,11 +156,17 @@ impl JdUi {
                     // First-run: create a default desk if none exist.
                     if self.state.session.desks.is_empty() {
                         let desk_id = DeskId::generate(&mut self.id_gen);
-                        // Bootstrap desk is a system act, not undoable — do not journal.
-                        let _inv = self.state.session.apply(&SessionOp::CreateDesk {
-                            id: desk_id,
-                            name: "Desk".into(),
-                        });
+                        // Bootstrap desk: system act, not undoable — no journal label.
+                        // Marking dirty here is harmless: a first-run session save is
+                        // acceptable and keeps the dirty invariant simple (apply_session
+                        // always marks dirty).
+                        self.apply_session(
+                            SessionOp::CreateDesk {
+                                id: desk_id,
+                                name: "Desk".into(),
+                            },
+                            None,
+                        );
                         self.state.session.current_surface = Some(SurfaceId::Desk(desk_id));
                     }
                 }
@@ -175,7 +203,7 @@ impl JdUi {
 
                     // Ctrl+N pending_create: if a Create just finished while
                     // pending_create is set, place the new card and open editor.
-                    self.handle_pending_create(&result.created);
+                    self.handle_pending_create(&result);
 
                     // Push to journal only for user-originated ops.
                     if source == OpSource::User
@@ -434,17 +462,10 @@ impl JdUi {
                     }
                 }
                 DeskEvent::SessionOp(op) => {
+                    // Move/PutAway are journaled; viewport ops are not applicable here
+                    // (desk_ui emits ViewportMoved for those, not SessionOp).
                     let label = session_op_label(&op);
-                    let inverse = self.state.session.apply(&op);
-                    self.state.session_dirty_at = Some(std::time::Instant::now());
-                    // Journal only user-facing session ops (Move, PutAway).
-                    if let Some(lbl) = label {
-                        self.state.journal.push(JournalEntry {
-                            label: lbl.to_owned(),
-                            inverse: InverseAction::Session(inverse),
-                            context: OpContext::default(),
-                        });
-                    }
+                    self.apply_session(op, label);
                 }
                 DeskEvent::ViewportMoved { desk, cam } => {
                     if let Some(d) = self.state.session.desks.iter_mut().find(|d| d.id == desk) {
@@ -482,7 +503,7 @@ fn session_op_label(op: &SessionOp) -> Option<&'static str> {
     match op {
         SessionOp::Move { .. } => Some("Move card"),
         SessionOp::PutAway { .. } => Some("Put card away"),
-        SessionOp::Place { .. } => None, // system placement not journaled here
+        SessionOp::Place { .. } => None, // never emitted by desk_ui; place_card journals directly
         _ => None,
     }
 }
