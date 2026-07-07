@@ -5,4 +5,5 @@ pub mod card;
 pub mod editor;
 pub mod state;
 pub mod surfaces;
+pub mod text_undo;
 pub mod theme;

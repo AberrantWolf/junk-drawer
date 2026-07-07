@@ -171,6 +171,14 @@ impl JdUi {
                     }
                 }
                 VaultEvent::Body { id, content } => {
+                    // If this body belongs to the open_card and no editor is live yet,
+                    // open the editor now.  This is the "body arrived" trigger described
+                    // in the architecture: OpenCard fires get_or_request; when the body
+                    // lands here the editor is created.
+                    if self.state.session.open_card == Some(id) && self.state.editor.is_none() {
+                        self.state.editor =
+                            Some(crate::editor::EditorState::open(id, content.clone()));
+                    }
                     self.state.bodies.insert(id, content);
                 }
                 VaultEvent::External { changed, removed } => {
@@ -406,6 +414,33 @@ impl JdUi {
             }
         });
 
+        // 4b. Editor modal overlay (Task 10).
+        if let Some(ed) = &mut self.state.editor {
+            let mut deps = crate::editor::EditorDeps {
+                theme: &self.theme,
+                commands: &self.vault.commands,
+                index: &self.vault.index,
+                reduced_motion: false,
+            };
+            let ev = crate::editor::editor_ui(ui, ed, &mut deps);
+            if matches!(ev, crate::editor::EditorEvent::CloseAndSave) {
+                // Always save on close — SaveBody is idempotent and the editor
+                // may have unsaved changes from autosave timing gaps.
+                let _ = self.vault.commands.send(VaultCommand::Op {
+                    op: jd_core::command::VaultOp::SaveBody {
+                        id: ed.id,
+                        content: ed.buffer.clone(),
+                    },
+                    source: jd_core::command::OpSource::User,
+                });
+                self.state.editor = None;
+                self.state.session.open_card = None;
+                self.state.session_dirty_at = Some(std::time::Instant::now());
+                // Return focus to the desk card by clearing the focused-widget memory.
+                ui.ctx().memory_mut(|mem| mem.stop_text_input());
+            }
+        }
+
         // 5. Debounced saves: if session_dirty_at elapsed > 1s → save and clear.
         if let Some(dirty_at) = self.state.session_dirty_at
             && dirty_at.elapsed() > std::time::Duration::from_secs(1)
@@ -427,6 +462,18 @@ impl JdUi {
                 DeskEvent::OpenCard(id) => {
                     self.state.session.open_card = Some(id);
                     self.state.session_dirty_at = Some(std::time::Instant::now());
+                    // Kick off the body fetch (or use cached body immediately).
+                    // If the body is already cached, open the editor right now.
+                    // If not, drain_events will open it when the Body event arrives.
+                    if let Some(cached) = self
+                        .state
+                        .bodies
+                        .get_or_request(id, &self.vault.commands)
+                        && self.state.editor.is_none()
+                    {
+                        self.state.editor =
+                            Some(crate::editor::EditorState::open(id, cached.text.clone()));
+                    }
                 }
                 DeskEvent::FocusChanged(id) => {
                     self.state.focus = id;
