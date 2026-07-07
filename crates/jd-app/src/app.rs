@@ -5,14 +5,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
-use jd_core::command::{OpSource, VaultOp};
+use jd_core::command::{Dest, OpSource, VaultOp};
 use jd_core::error::CoreError;
 use jd_core::geom::Vec2 as CoreVec2;
 use jd_core::id::{IdGen, NoteId};
 use jd_core::journal::{InverseAction, JournalEntry, OpContext};
+use jd_core::note::{Kind, NewNote, Status};
 use jd_core::session::{DeskId, SessionOp, SessionState, SurfaceId};
 use jd_core::vault::Vault;
-use jd_core::worker::{self, VaultEvent, VaultHandle};
+use jd_core::worker::{self, VaultCommand, VaultEvent, VaultHandle};
 
 use crate::state::UiState;
 use crate::surfaces::desk::{DeskEvent, DeskUiDeps, DragState, FaceMeta};
@@ -39,6 +40,9 @@ impl Waker {
 
 pub struct JdUi {
     pub vault: VaultHandle,
+    /// A second Vault handle for session load/save (worker::start consumed the
+    /// first one; Vault::open just resolves paths — no exclusive lock).
+    vault_ref: Vault,
     waker: Waker,
     pub state: UiState,
     pub theme: crate::theme::Theme,
@@ -56,18 +60,23 @@ pub struct JdUi {
 
 impl JdUi {
     pub fn new(vault_root: &Path) -> Result<JdUi, CoreError> {
-        let vault = Vault::open(vault_root)?;
+        // Open a lightweight Vault reference for session load/save (paths only,
+        // no exclusive locking — Vault::open is idempotent and cheap).
+        let vault_ref = Vault::open(vault_root)?;
         // Load session BEFORE starting the worker (worker::start consumes vault).
-        let session = SessionState::load(&vault);
+        let session = SessionState::load(&vault_ref);
+        // Open a second Vault so worker::start can consume it.
+        let vault_for_worker = Vault::open(vault_root)?;
         let waker = Waker::default();
         let w = waker.clone();
-        let handle = worker::start(vault, Box::new(move || w.wake()))?;
+        let handle = worker::start(vault_for_worker, Box::new(move || w.wake()))?;
         let state = UiState {
             session,
             ..Default::default()
         };
         Ok(JdUi {
             vault: handle,
+            vault_ref,
             waker,
             state,
             theme: crate::theme::Theme::light(),
@@ -77,6 +86,42 @@ impl JdUi {
             drag: None,
             last_panel_rect: None,
         })
+    }
+
+    /// Place a note on a desk at the given world position.
+    /// Journaled as "Place card" and marks the session dirty.
+    pub fn place_card(&mut self, desk: DeskId, id: NoteId, pos: CoreVec2) {
+        let op = SessionOp::Place { desk, id, pos };
+        let inverse = self.state.session.apply(&op);
+        self.state.session_dirty_at = Some(std::time::Instant::now());
+        self.state.journal.push(JournalEntry {
+            label: "Place card".to_owned(),
+            inverse: InverseAction::Session(inverse),
+            context: OpContext::default(),
+        });
+    }
+
+    /// If a pending_create is set and `created_ids` contains the new id, place
+    /// it on the current desk and optionally open the editor.
+    fn handle_pending_create(&mut self, created_ids: &[NoteId]) {
+        let Some(pending) = self.state.pending_create.take() else {
+            return;
+        };
+        let Some(&new_id) = created_ids.first() else {
+            // No id in this OpDone (shouldn't happen for Create, but be safe).
+            self.state.pending_create = Some(pending);
+            return;
+        };
+        if let Some(desk_id) = self.state.session.desks.first().map(|d| d.id) {
+            self.place_card(desk_id, new_id, pending.at);
+            if pending.open_editor {
+                self.state.session.open_card = Some(new_id);
+                self.state.session_dirty_at = Some(std::time::Instant::now());
+            }
+        } else {
+            // No desk yet — restore pending_create (unlikely race; best-effort).
+            self.state.pending_create = Some(pending);
+        }
     }
 
     /// Frame-loop step 1 (architecture §3): drain ALL pending worker events.
@@ -127,6 +172,11 @@ impl JdUi {
                             self.state.bodies.invalidate(id);
                         }
                     }
+
+                    // Ctrl+N pending_create: if a Create just finished while
+                    // pending_create is set, place the new card and open editor.
+                    self.handle_pending_create(&result.created);
+
                     // Push to journal only for user-originated ops.
                     if source == OpSource::User
                         && let Some(inv_op) = result.inverse
@@ -163,7 +213,83 @@ impl JdUi {
             };
         }
         self.waker.attach(ui.ctx());
+
+        // ══════════════════════════════════════════════════════════════════
+        // Frame-loop order (architecture §3, WP2)
+        // ══════════════════════════════════════════════════════════════════
+
+        // 1. Drain all pending worker events (OpDone, ScanComplete, Body, …).
+        //    OpDone + pending_create → place_card + open editor inside drain_events.
         self.drain_events();
+
+        // 2. IPC — WP7; skip.
+
+        // 3. Global shortcut dispatch.
+        //    If editor is open → only editor keys (Task 10).
+        //    Otherwise: Ctrl+N → create a new fleeting scrap in Inbox.
+        if self.state.editor.is_none() {
+            let ctrl_n = ui.input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key {
+                            key: egui::Key::N,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.command
+                    )
+                })
+            });
+            if ctrl_n {
+                // Determine where to place the new card: pointer world pos if
+                // the pointer is over the panel, otherwise panel center.
+                let place_at = self
+                    .last_panel_rect
+                    .map(|panel| {
+                        let pointer = ui.input(|i| i.pointer.latest_pos());
+                        let ptr = pointer.unwrap_or(panel.center());
+                        // Convert screen → world using the current camera.
+                        if let Some(desk) = self.state.session.desks.first() {
+                            let cam = crate::surfaces::desk::DeskCamera {
+                                center: egui::vec2(desk.viewport.center.x, desk.viewport.center.y),
+                                zoom: desk.viewport.zoom,
+                            };
+                            let world = cam.to_world(panel, ptr);
+                            CoreVec2 {
+                                x: world.x,
+                                y: world.y,
+                            }
+                        } else {
+                            CoreVec2::default()
+                        }
+                    })
+                    .unwrap_or_default();
+
+                self.state.pending_create = Some(crate::state::PendingCreate {
+                    at: place_at,
+                    open_editor: true,
+                });
+
+                // Send Create{seed: empty fleeting scrap, dest: Inbox}.
+                let seed = NewNote {
+                    body: String::new(),
+                    status: Status::Fleeting,
+                    kind: Kind::Note,
+                    source: None,
+                    tags: Vec::new(),
+                };
+                let _ = self.vault.commands.send(VaultCommand::Op {
+                    op: VaultOp::Create {
+                        seed,
+                        dest: Dest::Inbox,
+                    },
+                    source: OpSource::User,
+                });
+            }
+        }
+
+        // 4. Render: central desk + status line; editor overlay when open (Task 10).
 
         // ------------------------------------------------------------------
         // Status line (bottom)
@@ -251,6 +377,14 @@ impl JdUi {
                 self.apply_desk_events(evts, desk.id, &face_metas);
             }
         });
+
+        // 5. Debounced saves: if session_dirty_at elapsed > 1s → save and clear.
+        if let Some(dirty_at) = self.state.session_dirty_at
+            && dirty_at.elapsed() > std::time::Duration::from_secs(1)
+        {
+            let _ = self.state.session.save(&self.vault_ref);
+            self.state.session_dirty_at = None;
+        }
     }
 
     /// Apply `DeskEvent`s emitted by `desk_ui`.
@@ -324,6 +458,15 @@ impl JdUi {
                     self.state.session_dirty_at = Some(std::time::Instant::now());
                 }
             }
+        }
+    }
+}
+
+/// Save-on-drop: best-effort flush of any pending session changes.
+impl Drop for JdUi {
+    fn drop(&mut self) {
+        if self.state.session_dirty_at.is_some() {
+            let _ = self.state.session.save(&self.vault_ref);
         }
     }
 }

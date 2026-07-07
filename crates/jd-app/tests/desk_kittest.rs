@@ -396,3 +396,271 @@ fn backspace_puts_away_not_deletes() {
     );
     assert_eq!(h.state().state.journal.undo_label(), Some("Put card away"));
 }
+
+#[test]
+fn ctrl_n_creates_a_scrap_on_the_desk_with_editor_open() {
+    // Ctrl+N → pump until the card exists on the desk (pending_create consumed),
+    // session.open_card is the new id, and the index shows a Fleeting note in inbox/.
+    let (_v, mut h, _ids) = app_with_cards(0);
+
+    // Send Ctrl+N shortcut.
+    h.event(egui::Event::Key {
+        key: egui::Key::N,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    });
+    h.run_ok();
+
+    // Pump until pending_create is consumed (card placed on desk).
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            a.state.pending_create.is_none()
+                && !a.state.session.desks.is_empty()
+                && !a.state.session.desks[0].cards.is_empty()
+        },
+        200,
+        "ctrl+n: scrap placed on desk",
+    );
+
+    let desk = &h.state().state.session.desks[0];
+    assert_eq!(desk.cards.len(), 1, "exactly one card placed");
+    let placed_id = desk.cards[0].id;
+
+    // open_card should be the new note id (editor opened).
+    assert_eq!(
+        h.state().state.session.open_card,
+        Some(placed_id),
+        "open_card must be the newly created scrap"
+    );
+
+    // The index must show a Fleeting note.
+    let idx = h.state().vault.index.read().unwrap();
+    let meta = idx.get(placed_id).expect("scrap in index");
+    assert_eq!(
+        meta.status,
+        jd_core::note::Status::Fleeting,
+        "created note must be Fleeting"
+    );
+    // Scrap lives in inbox/ (Dest::Inbox).
+    assert!(
+        meta.rel_path.starts_with("inbox"),
+        "scrap must be in inbox/, got {:?}",
+        meta.rel_path
+    );
+}
+
+#[test]
+fn session_survives_restart_exactly() {
+    // Build app, place 3 cards, pan+zoom, OPEN one card (open_card set), drop
+    // the harness/JdUi (Drop saves), build a NEW JdUi on the same vault root,
+    // pump scan; assert desks/positions/viewport/open_card round-trip exactly.
+    let vault = common::temp_vault();
+
+    // ---- First session ----
+    let app1 = JdUi::new(vault.path()).expect("JdUi::new first");
+    // Wait for scan + default desk.
+    {
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1200.0, 800.0))
+            .build_ui_state(|ui, app: &mut JdUi| app.ui(ui), app1);
+        common::pump(
+            &mut h,
+            &mut |a: &JdUi| a.state.scan_done && !a.state.session.desks.is_empty(),
+            200,
+            "scan + default desk (session restart test)",
+        );
+
+        // Create 3 notes via worker.
+        let mut created_ids: Vec<NoteId> = Vec::new();
+        for i in 1..=3u32 {
+            let seed = common::new_note(&format!("Restart {i}"), "body");
+            h.state_mut()
+                .vault
+                .commands
+                .send(VaultCommand::Op {
+                    op: VaultOp::Create {
+                        seed,
+                        dest: Dest::Notes,
+                    },
+                    source: OpSource::User,
+                })
+                .unwrap();
+            loop {
+                match h
+                    .state_mut()
+                    .vault
+                    .events
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("OpDone for restart note")
+                {
+                    VaultEvent::OpDone { result, .. } => {
+                        created_ids
+                            .push(result.created.into_iter().next().expect("Create yields id"));
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
+        // Place the 3 cards at specific positions.
+        let desk_id = h.state().state.session.desks[0].id;
+        for (i, &id) in created_ids.iter().enumerate() {
+            let _ = h.state_mut().state.session.apply(&SessionOp::Place {
+                desk: desk_id,
+                id,
+                pos: Vec2 {
+                    x: 120.5 + (i as f32) * 200.0,
+                    y: -80.0,
+                },
+            });
+        }
+
+        // Pan + zoom to known values that round-trip through f32 serialization.
+        if let Some(d) = h
+            .state_mut()
+            .state
+            .session
+            .desks
+            .iter_mut()
+            .find(|d| d.id == desk_id)
+        {
+            d.viewport.center = jd_core::geom::Vec2 { x: 120.5, y: -80.0 };
+            d.viewport.zoom = 1.25;
+        }
+
+        // Open card 0.
+        h.state_mut().state.session.open_card = Some(created_ids[0]);
+
+        // Mark dirty so Drop saves.
+        h.state_mut().state.session_dirty_at = Some(std::time::Instant::now());
+
+        h.run_ok();
+
+        // Extract the session state we expect to survive.
+        let expected_desk = h.state().state.session.desks[0].clone();
+        let expected_open = h.state().state.session.open_card;
+
+        // Drop the harness, consuming JdUi → Drop impl saves session.
+        let jd_ui = h.into_state();
+        drop(jd_ui);
+
+        // ---- Second session: new JdUi on same vault ----
+        let app2 = JdUi::new(vault.path()).expect("JdUi::new second");
+        let mut h2 = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1200.0, 800.0))
+            .build_ui_state(|ui, app: &mut JdUi| app.ui(ui), app2);
+        common::pump(
+            &mut h2,
+            &mut |a: &JdUi| a.state.scan_done && !a.state.session.desks.is_empty(),
+            200,
+            "scan + desk (second session)",
+        );
+
+        let reloaded_desk = &h2.state().state.session.desks[0];
+
+        // Same desk id.
+        assert_eq!(
+            reloaded_desk.id, expected_desk.id,
+            "desk id must survive restart"
+        );
+
+        // Same viewport (f32 exact round-trip for 120.5, -80.0, 1.25).
+        assert_eq!(
+            reloaded_desk.viewport.center.x, expected_desk.viewport.center.x,
+            "viewport center.x must survive restart"
+        );
+        assert_eq!(
+            reloaded_desk.viewport.center.y, expected_desk.viewport.center.y,
+            "viewport center.y must survive restart"
+        );
+        assert_eq!(
+            reloaded_desk.viewport.zoom, expected_desk.viewport.zoom,
+            "viewport zoom must survive restart"
+        );
+
+        // Same card positions.
+        assert_eq!(
+            reloaded_desk.cards.len(),
+            expected_desk.cards.len(),
+            "card count must survive restart"
+        );
+        for ec in &expected_desk.cards {
+            let rc = reloaded_desk
+                .cards
+                .iter()
+                .find(|c| c.id == ec.id)
+                .expect("placed card must survive restart");
+            assert_eq!(rc.pos.x, ec.pos.x, "card x must survive restart");
+            assert_eq!(rc.pos.y, ec.pos.y, "card y must survive restart");
+        }
+
+        // open_card survives.
+        assert_eq!(
+            h2.state().state.session.open_card,
+            expected_open,
+            "open_card must survive restart"
+        );
+    }
+}
+
+#[test]
+fn session_save_is_debounced_not_per_frame() {
+    // Move a card, read session.jd mtime immediately (unchanged),
+    // pump past 1s (std::thread::sleep(1100ms) + step), assert file updated.
+    use std::time::{Duration, SystemTime};
+
+    let vault = common::temp_vault();
+    let session_path = vault
+        .path()
+        .join(".junkdrawer")
+        .join("session")
+        .join("session.jd");
+
+    // Build a fresh app on our vault.
+    let app = JdUi::new(vault.path()).expect("JdUi::new debounce");
+    let mut h = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .build_ui_state(|ui, app: &mut JdUi| app.ui(ui), app);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.scan_done && !a.state.session.desks.is_empty(),
+        200,
+        "scan + desk (debounce test)",
+    );
+
+    // Capture mtime before any change.
+    let mtime_before: Option<SystemTime> =
+        session_path.metadata().ok().and_then(|m| m.modified().ok());
+
+    // Mark session dirty (simulates a Move) — but do NOT wait 1s.
+    h.state_mut().state.session_dirty_at = Some(std::time::Instant::now());
+    h.run_ok();
+
+    // Immediately after marking dirty, file must NOT yet be updated.
+    let mtime_immediate: Option<SystemTime> =
+        session_path.metadata().ok().and_then(|m| m.modified().ok());
+    assert_eq!(
+        mtime_before, mtime_immediate,
+        "session must NOT be saved immediately after marking dirty (debounce)"
+    );
+
+    // Sleep past the 1s debounce, then step to trigger the save.
+    std::thread::sleep(Duration::from_millis(1100));
+    h.run_ok();
+
+    // File must now exist and be newer.
+    let mtime_after: Option<SystemTime> =
+        session_path.metadata().ok().and_then(|m| m.modified().ok());
+    assert!(
+        session_path.exists(),
+        "session.jd must exist after debounce save"
+    );
+    assert!(
+        mtime_after > mtime_before,
+        "session.jd mtime must advance after debounce save; before={mtime_before:?} after={mtime_after:?}"
+    );
+}
