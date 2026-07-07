@@ -202,20 +202,61 @@ impl SearchIndex {
         }
 
         // Candidates: intersection over groups (union within a group).
-        let mut candidates: Option<HashSet<NoteId>> = None;
-        for group in &groups {
-            let mut docs = HashSet::new();
-            for term in group {
+        //
+        // Strategy: pick the smallest group (by total posting count) as the
+        // seed — collect its doc ids into a Vec.  For every other group,
+        // retain only ids that appear in at least one of that group's posting
+        // maps, probing directly rather than materialising a per-group HashSet.
+        // This avoids O(N) HashSet allocations for dense queries where every
+        // group covers most of the corpus.
+
+        // Compute total posting count per group to find the smallest.
+        let group_sizes: Vec<usize> = groups
+            .iter()
+            .map(|g| {
+                g.iter()
+                    .map(|t| self.terms.get(t).map_or(0, HashMap::len))
+                    .sum()
+            })
+            .collect();
+        let seed_idx = group_sizes
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &sz)| sz)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        // Build seed Vec from the smallest group (dedup via HashSet when the
+        // group has multiple expansions, plain extend when it has one).
+        let seed_group = &groups[seed_idx];
+        let mut candidates: Vec<NoteId> = if seed_group.len() == 1 {
+            self.terms
+                .get(&seed_group[0])
+                .map(|p| p.keys().copied().collect())
+                .unwrap_or_default()
+        } else {
+            let mut seen: HashSet<NoteId> = HashSet::new();
+            for term in seed_group {
                 if let Some(posts) = self.terms.get(term) {
-                    docs.extend(posts.keys().copied());
+                    seen.extend(posts.keys().copied());
                 }
             }
-            candidates = Some(match candidates {
-                None => docs,
-                Some(prev) => prev.intersection(&docs).copied().collect(),
+            seen.into_iter().collect()
+        };
+
+        // Intersect with every other group by probing their postings maps.
+        for (i, group) in groups.iter().enumerate() {
+            if i == seed_idx {
+                continue;
+            }
+            candidates.retain(|id| {
+                group
+                    .iter()
+                    .any(|t| self.terms.get(t).is_some_and(|p| p.contains_key(id)))
             });
         }
-        let mut candidates = candidates.unwrap_or_default();
+
+        // Apply filter, negation, and phrase constraints.
         if let Some(f) = filter {
             candidates.retain(|id| f.contains(id));
         }
