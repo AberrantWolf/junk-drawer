@@ -3057,3 +3057,500 @@ fn split_from_inbox_surface_places_both_cards_on_first_desk() {
         echo
     );
 }
+
+// ===========================================================================
+// Task 10: The M3 story
+// ===========================================================================
+
+/// The complete M3 story, every step verifiable, every journal label named:
+///
+/// 1. Capture two scraps (staggered `created` timestamps) → both appear in
+///    the inbox oldest-first.
+/// 2. Promote the FIRST via the full pedagogy path: open the editor from the
+///    inbox, Enter at the end of the single line → pending_promotion; type a
+///    body; Esc → compound Batch commit.  The scrap is now Permanent, lives
+///    in notes/, its body starts "# <first line>", and the journal has ONE
+///    entry named "Promote scrap '<line1>'".
+/// 3. Toss the SECOND scrap → gone from inbox and index; journal names
+///    "Toss scrap '<line1>'".
+/// 4. Undo the toss (Ctrl+Z) → restored, still Fleeting, back in the inbox;
+///    "Undid:" echo; trash is empty again.
+/// 5. Take the restored scrap to a desk via the Ctrl+D picker EVENT path
+///    (InboxEvent::PlaceOnDesk) → on the desk AND still in the inbox;
+///    journal names "Place card".
+/// 6. Put it away via Backspace on the desk surface → gone from the desk,
+///    still in the inbox; journal names "Put card away".
+/// 7. Final state: trash empty, inbox has exactly 1 scrap (the restored one;
+///    the promoted card left the inbox), desk has no cards.
+/// 8. RESTART (drop the app → session saved; new JdUi on the same vault) →
+///    everything persists: the promoted note is Permanent in notes/ with its
+///    "# " title, the scrap is still Fleeting in the inbox, the desk survives.
+#[test]
+fn m3_story_capture_promote_toss_undo_take_to_desk_put_away_restart() {
+    // ---- Act 1: capture two scraps with staggered created timestamps -------
+    let vault = common::temp_vault();
+    let mut app = JdUi::new(vault.path()).expect("JdUi::new");
+    let mut ids: Vec<NoteId> = Vec::new();
+    for (i, line) in ["a promising thought", "a second thought"]
+        .iter()
+        .enumerate()
+    {
+        if i > 0 {
+            // `created` has ms precision; stagger so oldest-first is reliable.
+            std::thread::sleep(std::time::Duration::from_millis(6));
+        }
+        let seed = jd_core::note::NewNote {
+            body: (*line).to_owned(),
+            status: jd_core::note::Status::Fleeting,
+            kind: jd_core::note::Kind::Note,
+            source: None,
+            tags: Vec::new(),
+        };
+        app.vault
+            .commands
+            .send(VaultCommand::Op {
+                op: VaultOp::Create {
+                    seed,
+                    dest: Dest::Inbox,
+                },
+                source: OpSource::User,
+            })
+            .unwrap();
+        loop {
+            match app
+                .vault
+                .events
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("OpDone for captured scrap")
+            {
+                VaultEvent::OpDone { result, .. } => {
+                    ids.push(
+                        result
+                            .created
+                            .into_iter()
+                            .next()
+                            .expect("Create yields an id"),
+                    );
+                    break;
+                }
+                VaultEvent::ScanComplete { .. } => {
+                    app.state.scan_done = true;
+                    app.state.bodies.invalidate_all();
+                    if app.state.session.desks.is_empty() {
+                        use jd_core::id::IdGen;
+                        let mut id_gen = IdGen::new();
+                        let desk_id = DeskId::generate(&mut id_gen);
+                        let _ = app.state.session.apply(&SessionOp::CreateDesk {
+                            id: desk_id,
+                            name: "Desk".into(),
+                        });
+                        app.state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+    let (first, second) = (ids[0], ids[1]);
+
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .build_ui_state(|ui, app: &mut JdUi| app.ui(ui), app);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.scan_done && !a.state.session.desks.is_empty(),
+        200,
+        "scan + default desk",
+    );
+    let desk_id = h.state().state.session.desks[0].id;
+    let trash_dir = vault.path().join(".junkdrawer/trash");
+    let trash_meta_count = |dir: &std::path::Path| -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "meta"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+
+    // Both scraps in the inbox, oldest-first.
+    h.state_mut().state.session.current_surface = Some(SurfaceId::Inbox);
+    h.run_ok();
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert_eq!(
+            idx.fleeting(),
+            vec![first, second],
+            "both scraps must be in the inbox oldest-first"
+        );
+    }
+
+    // ---- Act 2: promote the FIRST via the full pedagogy path ---------------
+    // Open the editor from the inbox (Enter on the focused scrap's event path).
+    {
+        use jd_app::surfaces::inbox::InboxEvent;
+        h.state_mut().state.focus = Some(first);
+        h.state_mut().apply_inbox_event(InboxEvent::OpenCard(first));
+    }
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_some(),
+        200,
+        "editor opens for the first scrap",
+    );
+    for _ in 0..3 {
+        h.step();
+    }
+    assert!(
+        h.state().state.editor.as_ref().unwrap().is_fleeting,
+        "editor must know the scrap is fleeting"
+    );
+    assert!(
+        !h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "pending_promotion must start false"
+    );
+
+    // Focus the TextEdit and put the cursor at the END of the single line.
+    h.get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .focus();
+    h.get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .click();
+    h.run_ok();
+    let te_id = egui::Id::new("editor_te");
+    {
+        let char_end = {
+            let ed = h.state().state.editor.as_ref().unwrap();
+            ed.buffer.chars().count()
+        };
+        let mut te_state = egui::text_edit::TextEditState::load(&h.ctx, te_id).unwrap_or_default();
+        te_state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(char_end),
+            )));
+        te_state.store(&h.ctx, te_id);
+    }
+    h.step(); // prev_cursor picks up the stored cursor
+
+    // Enter at the end of the single line → the promoting moment.
+    h.key_press(egui::Key::Enter);
+    h.step();
+    h.run_ok();
+    assert!(
+        h.state().state.editor.is_some(),
+        "editor must stay open after the promoting Enter"
+    );
+    assert!(
+        h.state().state.editor.as_ref().unwrap().pending_promotion,
+        "Enter at end of a single-line scrap must set pending_promotion"
+    );
+
+    // Type the body under the new title line.
+    h.get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .type_text("the fleshed-out body");
+    h.step();
+    h.run_ok();
+
+    // Esc → compound Batch([SaveBody, Promote]) commit.
+    h.key_press(egui::Key::Escape);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_none(),
+        100,
+        "editor closes on Esc",
+    );
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(first)
+                .map(|m| m.status == jd_core::note::Status::Permanent)
+                .unwrap_or(false)
+        },
+        200,
+        "first scrap promoted to Permanent",
+    );
+    // The index updates on the worker thread before the UI drains OpDone;
+    // wait for the journal entry (pushed in drain_events) to land too.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.journal.undo_label().is_some(),
+        200,
+        "promotion journal entry drained",
+    );
+
+    // Now permanent, in notes/, body starts "# a promising thought".
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let meta = idx.get(first).expect("promoted note in index");
+        assert_eq!(meta.status, jd_core::note::Status::Permanent);
+        let rel = meta.rel_path.to_string_lossy().into_owned();
+        assert!(
+            rel.starts_with("notes/") || rel.contains("notes/"),
+            "promoted note must live in notes/, got {rel}"
+        );
+        let abs = vault.path().join(&meta.rel_path);
+        drop(idx);
+        let content = std::fs::read_to_string(&abs).expect("read promoted note");
+        let doc = jd_core::doc::NoteDoc::parse(&content);
+        assert!(
+            doc.body.starts_with("# a promising thought"),
+            "promoted body must start with '# a promising thought', got: {:?}",
+            &doc.body[..doc.body.len().min(80)]
+        );
+        assert!(
+            doc.body.contains("the fleshed-out body"),
+            "promoted body must contain the typed body text"
+        );
+    }
+    // Journal names the promotion after the scrap's first line.
+    assert_eq!(
+        h.state().state.journal.undo_label(),
+        Some("Promote scrap 'a promising thought'"),
+        "promotion journal label must name the first line"
+    );
+    // The promoted card has left the inbox.
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert_eq!(
+            idx.fleeting(),
+            vec![second],
+            "inbox must hold only the second scrap after promotion"
+        );
+    }
+
+    // ---- Act 3: toss the second scrap ---------------------------------------
+    {
+        use jd_app::surfaces::inbox::InboxEvent;
+        h.state_mut().apply_inbox_event(InboxEvent::Toss(second));
+    }
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(second).is_none()
+        },
+        200,
+        "toss completes",
+    );
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.journal.undo_label() == Some("Toss scrap 'a second thought'"),
+        200,
+        "toss journal entry drained",
+    );
+    assert_eq!(
+        h.state().state.journal.undo_label(),
+        Some("Toss scrap 'a second thought'"),
+        "toss journal label must name the scrap"
+    );
+    assert_eq!(
+        trash_meta_count(&trash_dir),
+        1,
+        "trash must hold the tossed scrap"
+    );
+
+    // ---- Act 4: undo the toss (Ctrl+Z) --------------------------------------
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_ok();
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(second).is_some()
+        },
+        200,
+        "undo toss: scrap restored",
+    );
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.journal.redo_label() == Some("Toss scrap 'a second thought'"),
+        200,
+        "undo toss: redo entry restacked",
+    );
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let meta = idx.get(second).expect("restored scrap in index");
+        assert_eq!(
+            meta.status,
+            jd_core::note::Status::Fleeting,
+            "restored scrap must still be Fleeting"
+        );
+        assert_eq!(
+            idx.fleeting(),
+            vec![second],
+            "restored scrap must be back in the inbox"
+        );
+    }
+    let echo = h.state().state.status_echo.as_ref().map(|(s, _)| s.clone());
+    assert!(
+        echo.as_deref()
+            .map(|s| s.contains("Undid:"))
+            .unwrap_or(false),
+        "undo must echo 'Undid:', got {echo:?}"
+    );
+    // The undone toss sits on the redo stack, still named.
+    assert_eq!(
+        h.state().state.journal.redo_label(),
+        Some("Toss scrap 'a second thought'"),
+        "redo label must name the undone toss"
+    );
+    assert_eq!(
+        trash_meta_count(&trash_dir),
+        0,
+        "trash must be empty after undoing the toss"
+    );
+
+    // ---- Act 5: take the restored scrap to a desk (Ctrl+D picker event) -----
+    {
+        use jd_app::surfaces::inbox::InboxEvent;
+        h.state_mut().apply_inbox_event(InboxEvent::PlaceOnDesk {
+            id: second,
+            desk: desk_id,
+        });
+    }
+    h.run_ok();
+    assert!(
+        h.state().state.session.desks[0]
+            .cards
+            .iter()
+            .any(|c| c.id == second),
+        "scrap must be placed on the desk"
+    );
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert!(
+            idx.fleeting().contains(&second),
+            "scrap must STILL be in the inbox after take-to-desk (placement only)"
+        );
+    }
+    assert_eq!(
+        h.state().state.journal.undo_label(),
+        Some("Place card"),
+        "take-to-desk journal label must be 'Place card'"
+    );
+
+    // ---- Act 6: put it away via Backspace on the desk surface ---------------
+    h.state_mut().state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+    h.state_mut().state.focus = Some(second);
+    h.run_ok();
+    h.key_press(egui::Key::Backspace);
+    h.run_ok();
+    assert!(
+        !h.state().state.session.desks[0]
+            .cards
+            .iter()
+            .any(|c| c.id == second),
+        "scrap must be gone from the desk after Backspace put-away"
+    );
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert!(
+            idx.fleeting().contains(&second),
+            "scrap must still be in the inbox after put-away"
+        );
+    }
+    assert_eq!(
+        h.state().state.journal.undo_label(),
+        Some("Put card away"),
+        "put-away journal label must be 'Put card away'"
+    );
+
+    // ---- Act 7: final state before restart -----------------------------------
+    assert_eq!(trash_meta_count(&trash_dir), 0, "trash must be empty");
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        assert_eq!(
+            idx.fleeting(),
+            vec![second],
+            "inbox must hold exactly the restored scrap"
+        );
+    }
+    assert!(
+        h.state().state.session.desks[0].cards.is_empty(),
+        "desk must have no cards after put-away"
+    );
+
+    // Mark the session dirty so Drop persists the final state.
+    h.state_mut().state.session_dirty_at = Some(std::time::Instant::now());
+    h.run_ok();
+
+    // ---- Act 8: restart — drop the app (session saves on Drop), reopen ------
+    let jd_ui = h.into_state();
+    drop(jd_ui);
+
+    let app2 = JdUi::new(vault.path()).expect("JdUi::new second session");
+    let mut h2 = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .build_ui_state(|ui, app: &mut JdUi| app.ui(ui), app2);
+    common::pump(
+        &mut h2,
+        &mut |a: &JdUi| a.state.scan_done && !a.state.session.desks.is_empty(),
+        200,
+        "scan + desk (second session)",
+    );
+
+    // The promoted note persists: Permanent, in notes/, "# " title on disk.
+    {
+        let idx = h2.state().vault.index.read().unwrap();
+        let meta = idx.get(first).expect("promoted note must survive restart");
+        assert_eq!(
+            meta.status,
+            jd_core::note::Status::Permanent,
+            "promoted note must still be Permanent after restart"
+        );
+        assert_eq!(
+            meta.title.as_deref(),
+            Some("a promising thought"),
+            "promoted note must carry its title after restart"
+        );
+        let rel = meta.rel_path.to_string_lossy().into_owned();
+        assert!(
+            rel.starts_with("notes/") || rel.contains("notes/"),
+            "promoted note must still be in notes/ after restart, got {rel}"
+        );
+        let abs = vault.path().join(&meta.rel_path);
+        drop(idx);
+        let content = std::fs::read_to_string(&abs).expect("read promoted note after restart");
+        let doc = jd_core::doc::NoteDoc::parse(&content);
+        assert!(
+            doc.body.starts_with("# a promising thought"),
+            "promoted body must keep its '# ' title after restart"
+        );
+    }
+
+    // The restored scrap persists: Fleeting, the only inbox resident.
+    {
+        let idx = h2.state().vault.index.read().unwrap();
+        let meta = idx.get(second).expect("scrap must survive restart");
+        assert_eq!(
+            meta.status,
+            jd_core::note::Status::Fleeting,
+            "scrap must still be Fleeting after restart"
+        );
+        assert_eq!(
+            idx.fleeting(),
+            vec![second],
+            "inbox must hold exactly the restored scrap after restart"
+        );
+    }
+
+    // The desk (and the put-away) persist in the restored session.
+    assert_eq!(
+        h2.state().state.session.desks[0].id,
+        desk_id,
+        "the desk must survive restart with the same id"
+    );
+    assert!(
+        h2.state().state.session.desks[0].cards.is_empty(),
+        "the put-away must persist: desk has no cards after restart"
+    );
+
+    // Trash is still empty on disk.
+    assert_eq!(
+        trash_meta_count(&trash_dir),
+        0,
+        "trash must still be empty after restart"
+    );
+}

@@ -826,10 +826,10 @@ WP1b/WP1c parallelize after WP1a. WP5 needs only WP2's surfaces scaffolding + WP
 - Undo of Split leaves the split-off note in trash (consistent with Create-undo; document in undo UX copy).
 
 **WP2 → WP3 handoffs:**
-- Face checkbox ☐/☑ glyph substitution + click-to-toggle (needs face-only text transform; editor must keep raw source — TODO(WP3) in theme.rs).
-- Ctrl+Enter promotion hook: editor_ui returns EditorEvent; promotion branches there.
-- Stale pending_create if a Create's OpDone precedes ScanComplete (comment at consumption site in app.rs); consider a ScanComplete sweep.
-- ac_dismissed persists for the whole [[ context after Esc — consider re-showing on query change.
+- Face checkbox ☐/☑ glyph substitution + click-to-toggle (needs face-only text transform; editor must keep raw source — TODO(WP3) in theme.rs). ✓ (WP3)
+- Ctrl+Enter promotion hook: editor_ui returns EditorEvent; promotion branches there. ✓ (WP3)
+- Stale pending_create if a Create's OpDone precedes ScanComplete (comment at consumption site in app.rs); consider a ScanComplete sweep. ✓ (WP3)
+- ac_dismissed persists for the whole [[ context after Esc — consider re-showing on query change. ✓ (WP3)
 - Editor autosave/debounce tests use one real sleep each — watch for CI flake; #[ignore] escape hatch documented.
 - jd-core worker sets `modified` on every SaveBody — frontmatter is deliberately NOT byte-identical after a dirty save (the round-trip law's one sanctioned field change; don't "fix" set_modified).
 
@@ -847,6 +847,16 @@ WP1b/WP1c parallelize after WP1a. WP5 needs only WP2's surfaces scaffolding + WP
 
 **Consumes:** WP1e ops/journal, WP2 desk/editor.
 **Produces:** complete capture→promote→link loop; the app is now dogfoodable.
+
+**WP3 → WP4 handoffs:**
+- Inbox faces don't click-toggle checkboxes (desk faces only) — extend the face hit-test to the inbox pile if wanted.
+- Drag pointer-path to the rail is untested headless (kittest pointer-drag over panels is unreliable); the event-level path (`CardDroppedOnInbox`/`CardDroppedOnDesk`) is authoritative and covered.
+- Cut/Copy/Paste Edit-menu items are disabled pending an egui programmatic clipboard path (revisit at WP6 menus).
+- Shift+F10 popup can open and close within one frame if a click lands the same frame — cosmetic only.
+- Multibyte-indent glyph offset drift in checkbox face substitution (exotic content; tracked, not blocking).
+- Real-sleep tests (editor debounce/autosave) remain a CI-flake watch item; #[ignore] escape hatch documented.
+- `pending_create` sweep keeps only the FIRST orphaned Create that lands pre-scan; later orphans are dropped.
+- `created` timestamps persist at second precision on disk — post-restart same-second inbox ordering falls back to ULID order.
 
 ---
 
@@ -947,3 +957,4 @@ WP1b/WP1c parallelize after WP1a. WP5 needs only WP2's surfaces scaffolding + WP
 12. **Title collisions in the index** — `titles` maps lowercased title → the most recently upserted note; duplicate titles are legal on disk (filename suffixing handles files), and links resolve to the latest holder.
 13. **Mixed-size layouter PROVEN (Spike A, WP2, 2026-07-07):** real heading sizes (24/20/17 on 15pt body, JetBrains Mono 14) inside one editable TextEdit galley. Mechanism: one LayoutJob tiling every buffer byte (per-line lex cache keyed on (line-hash, fence-entry-state), 8KB per-line lex cap, explicit '\n' appends); egui's cursor/selection/IME machinery handles mixed row heights natively. Heading-marker spans derive their level from leading '#' count at layout time (SpanStyle::HeadingMarker carries none). Unresolved wikilinks: text_weak color + solid underline (egui has no dashed) vs accent+underline for resolved. Exit criteria (taller row, cursor-exact typing across the boundary, boundary-spanning select-all) are pinned as tests in jd-app/tests/spike_layouter.rs.
 14. **AccessKit spatial focus on a free-form canvas PROVEN (Spike B, WP2, 2026-07-07):** `ui.allocate_rect(rect, Sense::click_and_drag())` + `response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label))` yields fully queryable/actionable AccessKit nodes at arbitrary canvas positions — no framework workaround needed. Reading order = (y-band rounded at BAND_HEIGHT 120px = 0.6×card-height, then x, then NoteId); Left/Right walk the reading order globally across bands; Up/Down seek nearest |Δx| outward band-by-band; no wrap at the true ends. Culled (offscreen) cards get no nodes; focusing one auto-reveals (viewport centers via the cached real panel rect). Labels per spec §12, singular/plural correct.
+15. **WP3 mechanisms (2026-07-08):** `pending_label` (UiState) overrides the worker's generic Batch label for compound acts (promotion "Promote scrap '<line1>'", split) — consumed by the next matching User OpDone, cleared on OpFailed. `InverseAction::Sessions(Vec<SessionOp>)` added to the jd-core journal for multi-step session inverses (the composite move-to-desk); undo applies the ops in order, redo = reverse-ordered collected inverses. Split placement rides the op un-journaled (the Split undo trashes the split-off); inbox-origin splits fall back to the first desk with a status echo. Checkbox faces use □/■ (Inter-covered glyphs), fence-aware recognition shared with the lexer, ordinal-mapped toggles via SaveBody.
