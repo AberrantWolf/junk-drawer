@@ -159,6 +159,189 @@ impl DeskCamera {
 }
 
 // ---------------------------------------------------------------------------
+// WP4 Task 5: ghost fan ranking + edges-on-select (architecture §3, §6.16)
+// ---------------------------------------------------------------------------
+
+/// The fan shows at most this many ghosts.
+pub const GHOST_K: usize = 5;
+/// Ghost minis render at this fraction of the real card size.
+pub const GHOST_SCALE: f32 = 0.4;
+/// Gap between the anchor card and the fan, and between fan minis (world px).
+const GHOST_GAP: f32 = 24.0;
+/// How many cosine neighbours `ghost_candidates` blends in. `Index::similar`
+/// returns only its top-k, so structural candidates outside this top-N get a
+/// cosine contribution of 0 (a deliberate approximation — see below).
+const GHOST_SIMILAR_N: usize = 32;
+
+/// Pinned ranking weights (decision §6.16). A unit test enforces the law:
+/// direct link 3.0 > backlink 2.5 > shared tag 1.0 each; relations stack and
+/// the cosine similarity (clamped 0–1) is added on top.
+pub const W_DIRECT_LINK: f32 = 3.0;
+pub const W_BACKLINK: f32 = 2.5;
+pub const W_SHARED_TAG: f32 = 1.0;
+
+/// Pure scoring law for one candidate. Kept free of the Index so the weights
+/// are pinned by a table-style unit test.
+pub fn ghost_score(direct_link: bool, backlink: bool, shared_tags: usize, cosine: f32) -> f32 {
+    (if direct_link { W_DIRECT_LINK } else { 0.0 })
+        + (if backlink { W_BACKLINK } else { 0.0 })
+        + shared_tags as f32 * W_SHARED_TAG
+        + cosine.clamp(0.0, 1.0)
+}
+
+/// Rank every OFF-desk note as a ghost candidate for `id` (the selected/open
+/// card): top `GHOST_K` by `ghost_score`, ties broken by id for determinism.
+///
+/// Blend note: links, backlinks and shared tags are scored exhaustively from
+/// the index adjacency (links_fwd/links_rev/tags). Cosine comes from
+/// `Index::similar(id, GHOST_SIMILAR_N)`, which only returns its top-N
+/// neighbours — candidates outside that top-N simply get cosine 0, and
+/// cosine-only neighbours (no structural relation) still enter the pool.
+/// Call under the caller's index read lock (the ONE-lock-per-frame idiom).
+pub fn ghost_candidates(
+    idx: &jd_core::index::Index,
+    id: NoteId,
+    on_desk: &std::collections::HashSet<NoteId>,
+) -> Vec<(NoteId, f32)> {
+    use std::collections::{HashMap, HashSet};
+    let Some(meta) = idx.get(id) else {
+        return Vec::new();
+    };
+
+    // Structural relations (deduped: two [[X]] refs are still ONE direct link).
+    let direct: HashSet<NoteId> = idx.outlinks(id).iter().filter_map(|(_, r)| *r).collect();
+    let back: HashSet<NoteId> = idx.backlinks(id).into_iter().collect();
+    let mut shared_tags: HashMap<NoteId, usize> = HashMap::new();
+    for tag in &meta.tags {
+        for other in idx.notes_with_tag(tag) {
+            *shared_tags.entry(other).or_default() += 1;
+        }
+    }
+    let cosine: HashMap<NoteId, f32> = idx.similar(id, GHOST_SIMILAR_N).into_iter().collect();
+
+    let pool: HashSet<NoteId> = direct
+        .iter()
+        .chain(back.iter())
+        .chain(shared_tags.keys())
+        .chain(cosine.keys())
+        .copied()
+        .collect();
+
+    let mut scored: Vec<(NoteId, f32)> = pool
+        .into_iter()
+        .filter(|c| *c != id && !on_desk.contains(c) && idx.get(*c).is_some())
+        .map(|c| {
+            let s = ghost_score(
+                direct.contains(&c),
+                back.contains(&c),
+                shared_tags.get(&c).copied().unwrap_or(0),
+                cosine.get(&c).copied().unwrap_or(0.0),
+            );
+            (c, s)
+        })
+        .filter(|(_, s)| *s > 0.0)
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    scored.truncate(GHOST_K);
+    scored
+}
+
+/// Edges to draw when `selected` is the focused/open card: one edge per
+/// distinct linked-or-linking note that is ON the desk (both directions,
+/// deduped — a mutual link is one edge). Sorted by the far endpoint for
+/// determinism. This pure fn is the testable seam: kitests assert counts
+/// here instead of reading pixels. Call under the caller's index read lock.
+pub fn selected_edges(
+    idx: &jd_core::index::Index,
+    selected: NoteId,
+    on_desk: &std::collections::HashSet<NoteId>,
+) -> Vec<(NoteId, NoteId)> {
+    let mut others: std::collections::BTreeSet<NoteId> = std::collections::BTreeSet::new();
+    for (_, resolved) in idx.outlinks(selected) {
+        if let Some(t) = resolved
+            && t != selected
+            && on_desk.contains(&t)
+        {
+            others.insert(t);
+        }
+    }
+    for b in idx.backlinks(selected) {
+        if b != selected && on_desk.contains(&b) {
+            others.insert(b);
+        }
+    }
+    others.into_iter().map(|o| (selected, o)).collect()
+}
+
+/// One ghost mini, prefetched in app.rs under the frame's index read lock.
+pub struct GhostSpec {
+    pub id: NoteId,
+    /// Title, or first line for untitled scraps (a11y label + mini face text).
+    pub title: String,
+    /// The candidate's REAL card size in world units (fan scales it by
+    /// `GHOST_SCALE`; a click places the real card at the ghost's position).
+    pub size: egui::Vec2,
+}
+
+/// World-space top-left positions for the fan minis.
+///
+/// Edge heuristic (documented per §6.16): measure the free space between the
+/// anchor card and the visible panel's world bounds on each of N/E/S/W and
+/// fan along the side with the MOST free space — a simple, stable choice that
+/// keeps ghosts on-screen without any packing logic. E/W fans stack
+/// vertically centered on the anchor; N/S fans run horizontally.
+pub fn ghost_fan_positions(
+    anchor: egui::Rect,
+    panel_world: egui::Rect,
+    sizes: &[egui::Vec2],
+) -> Vec<egui::Pos2> {
+    if sizes.is_empty() {
+        return Vec::new();
+    }
+    let free_w = anchor.min.x - panel_world.min.x;
+    let free_e = panel_world.max.x - anchor.max.x;
+    let free_n = anchor.min.y - panel_world.min.y;
+    let free_s = panel_world.max.y - anchor.max.y;
+    let ghost_size: egui::Vec2 = sizes.iter().fold(egui::Vec2::ZERO, |m, s| m.max(*s));
+
+    // (free space, side). max_by on total order; ties resolve to the LAST max,
+    // so list in W,E,N,S order for a stable preference of S > N > E > W on ties.
+    let side = [(free_w, 'W'), (free_e, 'E'), (free_n, 'N'), (free_s, 'S')]
+        .into_iter()
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, s)| s)
+        .unwrap_or('E');
+
+    let n = sizes.len() as f32;
+    match side {
+        'W' | 'E' => {
+            let total_h = n * ghost_size.y + (n - 1.0) * GHOST_GAP;
+            let start_y = anchor.center().y - total_h / 2.0;
+            let x = if side == 'W' {
+                anchor.min.x - GHOST_GAP - ghost_size.x
+            } else {
+                anchor.max.x + GHOST_GAP
+            };
+            (0..sizes.len())
+                .map(|i| egui::pos2(x, start_y + i as f32 * (ghost_size.y + GHOST_GAP)))
+                .collect()
+        }
+        _ => {
+            let total_w = n * ghost_size.x + (n - 1.0) * GHOST_GAP;
+            let start_x = anchor.center().x - total_w / 2.0;
+            let y = if side == 'N' {
+                anchor.min.y - GHOST_GAP - ghost_size.y
+            } else {
+                anchor.max.y + GHOST_GAP
+            };
+            (0..sizes.len())
+                .map(|i| egui::pos2(start_x + i as f32 * (ghost_size.x + GHOST_GAP), y))
+                .collect()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Prefetched face metadata (ONE index read lock per frame in app.rs)
 // ---------------------------------------------------------------------------
 
@@ -232,6 +415,13 @@ pub enum DeskEvent {
         /// 0-based ordinal of the clicked task box in the raw body.
         ordinal: usize,
     },
+    /// A ghost mini was clicked: place the real card at the ghost's world
+    /// position (app.rs calls `place_card` — journaled "Place card").
+    GhostClicked {
+        id: NoteId,
+        /// World-space top-left where the ghost stood (the card lands there).
+        pos: Vec2,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +458,15 @@ pub struct DeskUiDeps<'a> {
     /// is inside one of these rects, we emit CardDroppedOnInbox / CardDroppedOnDesk
     /// instead of a plain Move.
     pub rail_row_hits: &'a [(egui::Rect, crate::rail::RailDropTarget)],
+    /// WP4 Task 5: the selected/open card the ghost fan + edges anchor to
+    /// (None when nothing on this desk is selected or open). Prefetched in
+    /// app.rs under the frame's single index read lock, like face_metas.
+    pub ghost_anchor: Option<NoteId>,
+    /// Top-GHOST_K off-desk ghost candidates for the anchor (ranked).
+    pub ghosts: &'a [GhostSpec],
+    /// Edges from the anchor to linked/linking cards ON this desk
+    /// (`selected_edges` — both directions, deduped).
+    pub edges: &'a [(NoteId, NoteId)],
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +789,35 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
     // ------------------------------------------------------------------
     let cull_rect = panel.expand(100.0);
 
+    // Edges-on-select (WP4 Task 5): painted BEFORE the card faces so the
+    // lines sit beneath the cards (painter order = z order in one layer).
+    // Endpoints are card centers in world space; the stroke is subtle
+    // (theme text_weak at half alpha) so edges read as context, not content.
+    if !state.edges.is_empty() {
+        let world_center = |id: NoteId| -> Option<egui::Pos2> {
+            let card = desk.cards.iter().find(|c| c.id == id)?;
+            let size = state
+                .face_metas
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| {
+                    crate::card::shape::card_size(crate::card::shape::shape_for(m.status, m.kind))
+                })
+                .unwrap_or_else(|| egui::vec2(300.0, 200.0));
+            Some(egui::pos2(
+                card.pos.x + size.x / 2.0,
+                card.pos.y + size.y / 2.0,
+            ))
+        };
+        let stroke = egui::Stroke::new(1.5, state.theme.text_weak.gamma_multiply(0.5));
+        for (a, b) in state.edges {
+            if let (Some(ca), Some(cb)) = (world_center(*a), world_center(*b)) {
+                ui.painter()
+                    .line_segment([cam.to_screen(panel, ca), cam.to_screen(panel, cb)], stroke);
+            }
+        }
+    }
+
     // Live drag position for the card being dragged
     let dragged_id = state.drag.as_ref().map(|d| d.id);
     let live_drag_screen: Option<egui::Pos2> = if let Some(ref drag) = *state.drag {
@@ -815,6 +1043,85 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
         }
     }
 
+    // ------------------------------------------------------------------
+    // 6. Ghost fan (WP4 Task 5) — painted ABOVE the cards, at the anchor
+    //    card's freest edge.
+    //
+    // Ghosts are PREVIEWS: they carry AccessKit labels ("Ghost: '<title>'")
+    // so they are announced and clickable via assistive tech, but they are
+    // deliberately NOT in the arrow-key reading order (reading_order walks
+    // desk.cards only). Rationale: the spec's no-spatial-only law is already
+    // satisfied — the palette and the Drawer are full keyboard paths to the
+    // same notes — and adding transient previews to the focus ring would
+    // make arrow traversal unstable as the fan recomputes every selection.
+    // ------------------------------------------------------------------
+    if let Some(anchor_id) = state.ghost_anchor
+        && !state.ghosts.is_empty()
+        && let Some(anchor_card) = desk.cards.iter().find(|c| c.id == anchor_id)
+    {
+        let anchor_size = state
+            .face_metas
+            .iter()
+            .find(|m| m.id == anchor_id)
+            .map(|m| crate::card::shape::card_size(crate::card::shape::shape_for(m.status, m.kind)))
+            .unwrap_or_else(|| egui::vec2(300.0, 200.0));
+        let anchor_rect = egui::Rect::from_min_size(
+            egui::pos2(anchor_card.pos.x, anchor_card.pos.y),
+            anchor_size,
+        );
+        let panel_world = egui::Rect::from_two_pos(
+            cam.to_world(panel, panel.min),
+            cam.to_world(panel, panel.max),
+        );
+        let mini_sizes: Vec<egui::Vec2> =
+            state.ghosts.iter().map(|g| g.size * GHOST_SCALE).collect();
+        let positions = ghost_fan_positions(anchor_rect, panel_world, &mini_sizes);
+
+        for ((spec, world_pos), mini_size) in state.ghosts.iter().zip(&positions).zip(&mini_sizes) {
+            let screen_min = cam.to_screen(panel, *world_pos);
+            let rect = egui::Rect::from_min_size(screen_min, *mini_size * cam.zoom);
+            let resp = ui.allocate_rect(rect, egui::Sense::click());
+            let label = format!("Ghost: '{}'", spec.title);
+            resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.as_str())
+            });
+
+            // Faded mini = tinted rect + title (the sanctioned fallback,
+            // §6.16): card_face has no opacity parameter and its laid-out
+            // galleys can't be alpha-multiplied without re-tessellation, so
+            // a 40%-alpha fill with a weak title string reads as "ghost"
+            // more cheaply and more legibly than a washed-out full face.
+            let painter = ui.painter().with_clip_rect(rect);
+            painter.rect_filled(rect, 4.0, state.theme.card_plain_bg.gamma_multiply(0.4));
+            painter.rect_stroke(
+                rect,
+                4.0,
+                egui::Stroke::new(1.0, state.theme.card_border.gamma_multiply(0.6)),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                egui::pos2(rect.min.x + 6.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                spec.title.as_str(),
+                egui::FontId::new(12.0 * cam.zoom.max(0.5), egui::FontFamily::Proportional),
+                state.theme.text_weak,
+            );
+
+            // Click → the real card lands where the ghost stood (journaled
+            // via place_card in app.rs). Gated while the palette is open,
+            // same as the card mouse paths.
+            if resp.clicked() && !state.palette_open {
+                events.push(DeskEvent::GhostClicked {
+                    id: spec.id,
+                    pos: Vec2 {
+                        x: world_pos.x,
+                        y: world_pos.y,
+                    },
+                });
+            }
+        }
+    }
+
     events
 }
 
@@ -919,6 +1226,201 @@ mod tests {
         assert_eq!(next_focus(&cards, Some(id(1)), FocusDir::Down), Some(id(3)));
         assert_eq!(next_focus(&cards, Some(id(3)), FocusDir::Up), Some(id(1))); // nearest |Δx|
         assert_eq!(next_focus(&cards, None, FocusDir::Right), Some(id(1))); // no focus → first
+    }
+
+    // ── WP4 Task 5: ghost ranking + edges-on-select ─────────────────────
+
+    /// Weight law pinned (architecture decision §6.16): direct link 3.0 >
+    /// backlink 2.5 > shared tags 1.0 each; cosine blends in at 0–1.
+    #[test]
+    fn ghost_score_weights_pinned() {
+        // Direct link beats backlink.
+        assert!(ghost_score(true, false, 0, 0.0) > ghost_score(false, true, 0, 0.0));
+        // Backlink beats two shared tags.
+        assert!(ghost_score(false, true, 0, 0.0) > ghost_score(false, false, 2, 0.0));
+        // Exact values.
+        assert_eq!(ghost_score(true, false, 0, 0.0), 3.0);
+        assert_eq!(ghost_score(false, true, 0, 0.0), 2.5);
+        assert_eq!(ghost_score(false, false, 2, 0.0), 2.0);
+        assert_eq!(ghost_score(false, false, 1, 0.0), 1.0);
+        // Relations stack: direct + backlink + one tag.
+        assert_eq!(ghost_score(true, true, 1, 0.0), 6.5);
+        // Cosine is clamped to 0..1 and added.
+        assert_eq!(ghost_score(false, false, 0, 2.0), 1.0);
+        assert_eq!(ghost_score(false, false, 0, -1.0), 0.0);
+    }
+
+    mod ghost_index_tests {
+        use super::super::*;
+        use jd_core::index::Index;
+        use jd_core::note::{Kind, NoteMeta, Status};
+        use jd_core::tag::Tag;
+        use jd_core::time::Timestamp;
+        use std::collections::HashSet;
+
+        fn gid(n: u8) -> NoteId {
+            NoteId([n; 16])
+        }
+
+        fn meta(n: u8, title: &str, tags: &[&str], body: &str) -> NoteMeta {
+            NoteMeta {
+                id: gid(n),
+                rel_path: format!("notes/{n}.md").into(),
+                title: Some(title.to_owned()),
+                first_line: title.to_owned(),
+                status: Status::Permanent,
+                kind: Kind::Note,
+                source: None,
+                created: Timestamp(n as i64 * 1000),
+                modified: Timestamp(n as i64 * 1000),
+                tags: tags.iter().filter_map(|t| Tag::new(t)).collect(),
+                links_out: jd_core::doc::extract_links(body),
+                word_count: 0,
+            }
+        }
+
+        fn build(notes: &[(u8, &str, &[&str], &str)]) -> Index {
+            let mut ix = Index::new();
+            for (n, title, tags, body) in notes {
+                ix.upsert(meta(*n, title, tags, body), body);
+            }
+            ix.refresh_similarity_cache();
+            ix
+        }
+
+        /// Fixture: A(1) is the anchor. B is directly linked, C backlinks,
+        /// D shares two tags, E shares one. Bodies are single unique words so
+        /// D/E get zero cosine; B/C pick up only the tiny link-token overlap.
+        fn fixture() -> Index {
+            build(&[
+                (1, "Alpha", &["t1", "t2"], "[[Beta]]"),
+                (2, "Beta", &[], "banana"),
+                (3, "Gamma", &[], "[[Alpha]]"),
+                (4, "Delta", &["t1", "t2"], "durian"),
+                (5, "Eps", &["t1"], "elder"),
+            ])
+        }
+
+        #[test]
+        fn ghost_candidates_orders_by_pinned_weights() {
+            let ix = fixture();
+            let on_desk: HashSet<NoteId> = [gid(1)].into_iter().collect();
+            let got = ghost_candidates(&ix, gid(1), &on_desk);
+            let order: Vec<NoteId> = got.iter().map(|(id, _)| *id).collect();
+            assert_eq!(
+                order,
+                vec![gid(2), gid(3), gid(4), gid(5)],
+                "direct link > backlink > two shared tags > one shared tag"
+            );
+            let score = |n: u8| got.iter().find(|(id, _)| *id == gid(n)).unwrap().1;
+            // D and E share no body/title tokens with A: pure tag weights.
+            assert_eq!(score(4), 2.0);
+            assert_eq!(score(5), 1.0);
+            // B/C: structural weight plus a small cosine (link-token overlap).
+            assert!(score(2) >= 3.0 && score(2) < 4.0);
+            assert!(score(3) >= 2.5 && score(3) < 3.5);
+        }
+
+        #[test]
+        fn ghost_candidates_excludes_self_and_on_desk() {
+            let ix = fixture();
+            let on_desk: HashSet<NoteId> = [gid(1), gid(2)].into_iter().collect();
+            let got = ghost_candidates(&ix, gid(1), &on_desk);
+            assert!(got.iter().all(|(id, _)| *id != gid(1)), "self excluded");
+            assert!(
+                got.iter().all(|(id, _)| *id != gid(2)),
+                "on-desk note excluded"
+            );
+            assert_eq!(got.first().map(|(id, _)| *id), Some(gid(3)));
+        }
+
+        #[test]
+        fn ghost_candidates_caps_at_k() {
+            // Anchor + 7 notes sharing one tag: only GHOST_K survive.
+            let ix = build(&[
+                (1, "Anchor", &["t"], "aa"),
+                (2, "N2", &["t"], "bb"),
+                (3, "N3", &["t"], "cc"),
+                (4, "N4", &["t"], "dd"),
+                (5, "N5", &["t"], "ee"),
+                (6, "N6", &["t"], "ff"),
+                (7, "N7", &["t"], "gg"),
+                (8, "N8", &["t"], "hh"),
+            ]);
+            let on_desk: HashSet<NoteId> = [gid(1)].into_iter().collect();
+            let got = ghost_candidates(&ix, gid(1), &on_desk);
+            assert_eq!(got.len(), GHOST_K);
+        }
+
+        #[test]
+        fn ghost_candidates_blends_cosine_only_neighbours() {
+            // F(6) shares body terms with the anchor but has no links or tags:
+            // it enters purely via the Index::similar cosine blend.
+            let ix = build(&[
+                (1, "Alpha", &[], "quantum flux capacitor"),
+                (6, "Zeta", &[], "quantum flux and more words"),
+                (7, "Other", &[], "unrelated entirely"),
+            ]);
+            let on_desk: HashSet<NoteId> = [gid(1)].into_iter().collect();
+            let got = ghost_candidates(&ix, gid(1), &on_desk);
+            let f = got.iter().find(|(id, _)| *id == gid(6));
+            let (_, s) = f.expect("cosine-only neighbour must be a candidate");
+            assert!(*s > 0.0 && *s <= 1.0, "cosine-only score in (0,1], got {s}");
+        }
+
+        #[test]
+        fn selected_edges_dedup_both_directions_on_desk_only() {
+            // A ↔ B mutual links (must dedup to one edge); A → C where C is
+            // OFF the desk (no edge); D backlinks A (edge).
+            let ix = build(&[
+                (1, "Alpha", &[], "[[Beta]] and [[Ceta]]"),
+                (2, "Beta", &[], "back at [[Alpha]]"),
+                (3, "Ceta", &[], "off desk"),
+                (4, "Delta", &[], "see [[Alpha]]"),
+            ]);
+            let on_desk: HashSet<NoteId> = [gid(1), gid(2), gid(4)].into_iter().collect();
+            let edges = selected_edges(&ix, gid(1), &on_desk);
+            assert_eq!(edges.len(), 2, "A–B (dedup) and A–D, not off-desk A–C");
+            assert!(edges.contains(&(gid(1), gid(2))));
+            assert!(edges.contains(&(gid(1), gid(4))));
+        }
+
+        #[test]
+        fn selected_edges_empty_without_links() {
+            let ix = build(&[(1, "Alpha", &[], "solo"), (2, "Beta", &[], "also solo")]);
+            let on_desk: HashSet<NoteId> = [gid(1), gid(2)].into_iter().collect();
+            assert!(selected_edges(&ix, gid(1), &on_desk).is_empty());
+        }
+    }
+
+    #[test]
+    fn ghost_fan_picks_freest_edge_and_stays_off_anchor() {
+        // Anchor pushed toward the panel's east edge → fan goes WEST.
+        let panel_world =
+            egui::Rect::from_min_max(egui::pos2(-500.0, -400.0), egui::pos2(500.0, 400.0));
+        let anchor = egui::Rect::from_min_size(egui::pos2(150.0, -100.0), egui::vec2(300.0, 200.0));
+        let sizes = vec![egui::vec2(120.0, 80.0); 3];
+        let pos = ghost_fan_positions(anchor, panel_world, &sizes);
+        assert_eq!(pos.len(), 3);
+        for (p, s) in pos.iter().zip(&sizes) {
+            let r = egui::Rect::from_min_size(*p, *s);
+            assert!(
+                !r.intersects(anchor),
+                "ghost {r:?} must not overlap the anchor"
+            );
+            assert!(
+                r.max.x <= anchor.min.x,
+                "fan must be on the west (freest) side"
+            );
+        }
+        // Anchor near the north edge → fan goes SOUTH.
+        let anchor_n =
+            egui::Rect::from_min_size(egui::pos2(-150.0, -390.0), egui::vec2(300.0, 200.0));
+        let pos_n = ghost_fan_positions(anchor_n, panel_world, &sizes);
+        for (p, s) in pos_n.iter().zip(&sizes) {
+            let r = egui::Rect::from_min_size(*p, *s);
+            assert!(r.min.y >= anchor_n.max.y, "fan must be on the south side");
+        }
     }
 
     #[test]

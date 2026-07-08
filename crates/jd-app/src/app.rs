@@ -976,14 +976,13 @@ impl JdUi {
         egui::CentralPanel::default().show(ui, |ui| {
             match self.state.session.current_surface {
                 Some(SurfaceId::Desk(desk_id)) => {
-                    // Prefetch FaceMeta for all placed cards under ONE index read lock.
-                    let face_metas: Vec<FaceMeta> = {
+                    // Prefetch FaceMeta for all placed cards under ONE index read
+                    // lock — plus (WP4 Task 5) the ghost-fan candidates and the
+                    // edges-on-select list for the anchor (focused-or-open) card.
+                    let (face_metas, ghost_anchor, ghosts, edges) = {
                         let idx = self.vault.index.read().unwrap();
-                        self.state
-                            .session
-                            .desks
-                            .iter()
-                            .find(|d| d.id == desk_id)
+                        let desk = self.state.session.desks.iter().find(|d| d.id == desk_id);
+                        let face_metas: Vec<FaceMeta> = desk
                             .map(|desk| {
                                 desk.cards
                                     .iter()
@@ -992,7 +991,42 @@ impl JdUi {
                                     })
                                     .collect()
                             })
-                            .unwrap_or_default()
+                            .unwrap_or_default();
+                        let on_desk: std::collections::HashSet<NoteId> = desk
+                            .map(|d| d.cards.iter().map(|c| c.id).collect())
+                            .unwrap_or_default();
+                        // Anchor: the focused card, else the open card — but
+                        // only when it sits ON this desk (ghosts + edges are
+                        // desk-local by definition).
+                        let anchor = self.state.focus.filter(|id| on_desk.contains(id)).or(self
+                            .state
+                            .session
+                            .open_card
+                            .filter(|id| on_desk.contains(id)));
+                        let (ghosts, edges) = anchor
+                            .map(|a| {
+                                let specs: Vec<crate::surfaces::desk::GhostSpec> =
+                                    crate::surfaces::desk::ghost_candidates(&idx, a, &on_desk)
+                                        .into_iter()
+                                        .filter_map(|(gid, _)| {
+                                            idx.get(gid).map(|m| crate::surfaces::desk::GhostSpec {
+                                                id: gid,
+                                                title: m
+                                                    .title
+                                                    .clone()
+                                                    .unwrap_or_else(|| m.first_line.clone()),
+                                                size: crate::card::shape::card_size(
+                                                    crate::card::shape::shape_for(m.status, m.kind),
+                                                ),
+                                            })
+                                        })
+                                        .collect();
+                                let edges =
+                                    crate::surfaces::desk::selected_edges(&idx, a, &on_desk);
+                                (specs, edges)
+                            })
+                            .unwrap_or_default();
+                        (face_metas, anchor, ghosts, edges)
                     };
 
                     // Handle Fit button for this desk.
@@ -1067,6 +1101,9 @@ impl JdUi {
                             desks: &desk_list,
                             current_desk_id: desk_id,
                             rail_row_hits: &self.rail_row_hits,
+                            ghost_anchor,
+                            ghosts: &ghosts,
+                            edges: &edges,
                         };
                         let evts = crate::surfaces::desk::desk_ui(ui, &desk, &mut deps);
                         self.apply_desk_events(evts, desk.id, &face_metas);
@@ -1406,6 +1443,13 @@ impl JdUi {
                 ui.ctx().memory_mut(|mem| mem.stop_text_input());
                 if let crate::palette::PaletteEvent::Activate { row, open_after } = event {
                     self.apply_palette_activation(row, open_after, &query);
+                    // If the activation armed the highlight pulse, request a
+                    // repaint now: the pulse fade check at the top of ui() ran
+                    // before this frame's arming, so without this the first
+                    // fade frame would wait for the next input event.
+                    if self.state.highlight_pulse.is_some() {
+                        ui.ctx().request_repaint();
+                    }
                 }
             }
         }
@@ -1825,6 +1869,13 @@ impl JdUi {
                             });
                         }
                     }
+                }
+                DeskEvent::GhostClicked { id, pos } => {
+                    // The ghost becomes a real card where it stood — journaled
+                    // "Place card" (the same single placement path the palette
+                    // and Ctrl+D use). The fan recomputes next frame with the
+                    // newly-placed note excluded (it is on-desk now).
+                    self.place_card(_desk_id, id, pos);
                 }
             }
         }

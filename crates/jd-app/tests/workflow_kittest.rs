@@ -3603,3 +3603,212 @@ fn m3_story_capture_promote_toss_undo_take_to_desk_put_away_restart() {
         "trash must still be empty after restart"
     );
 }
+
+// ===========================================================================
+// WP4 Task 5: M4 scenario — ghost fan + edges-on-select
+// "Palette + Drawer + ghost-fan connections" (spec §14 M4 bar)
+// ===========================================================================
+
+/// The M4 connection story:
+/// 1. A permanent "Linked Note" exists off-desk; a scrap that references it
+///    is promoted via the WP3 path (InboxEvent::Promote + editor close).
+/// 2. The promoted card is placed on the desk and selected (focused).
+/// 3. The ghost fan shows the directly-linked off-desk note FIRST
+///    (direct link 3.0 dominates — weights pinned in desk.rs unit tests).
+/// 4. Clicking the ghost places the real card at the fan position (journaled
+///    "Place card") — NOT at the viewport center.
+/// 5. The edge list (the testable seam `selected_edges`) goes 0 → 1.
+#[test]
+fn m4_ghost_fan_connects_promoted_card() {
+    let vault = common::temp_vault();
+    let mut app = JdUi::new(vault.path()).expect("JdUi::new");
+
+    // Create the link target first (so [[Linked Note]] resolves), then the
+    // scrap that references it. Handle the ScanComplete race like the other
+    // fixtures in this file.
+    let mut ids: Vec<NoteId> = Vec::new();
+    let seeds = [
+        (
+            jd_core::note::NewNote {
+                body: "# Linked Note\nthe far end of the connection".to_owned(),
+                status: jd_core::note::Status::Permanent,
+                kind: jd_core::note::Kind::Note,
+                source: None,
+                tags: Vec::new(),
+            },
+            Dest::Notes,
+        ),
+        (
+            jd_core::note::NewNote {
+                body: "Anchor Card\nsee [[Linked Note]] for the far end".to_owned(),
+                status: jd_core::note::Status::Fleeting,
+                kind: jd_core::note::Kind::Note,
+                source: None,
+                tags: Vec::new(),
+            },
+            Dest::Inbox,
+        ),
+    ];
+    for (seed, dest) in seeds {
+        app.vault
+            .commands
+            .send(VaultCommand::Op {
+                op: VaultOp::Create { seed, dest },
+                source: OpSource::User,
+            })
+            .unwrap();
+        loop {
+            match app
+                .vault
+                .events
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("OpDone for fixture note")
+            {
+                VaultEvent::OpDone { result, .. } => {
+                    ids.push(result.created.into_iter().next().expect("id"));
+                    break;
+                }
+                VaultEvent::ScanComplete { .. } => {
+                    app.state.scan_done = true;
+                    app.state.bodies.invalidate_all();
+                    if app.state.session.desks.is_empty() {
+                        use jd_core::id::IdGen;
+                        let mut id_gen = IdGen::new();
+                        let desk_id = DeskId::generate(&mut id_gen);
+                        let _ = app.state.session.apply(&SessionOp::CreateDesk {
+                            id: desk_id,
+                            name: "Desk".into(),
+                        });
+                        app.state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+    let (linked_id, scrap_id) = (ids[0], ids[1]);
+
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .build_ui_state(|ui, app: &mut JdUi| app.ui(ui), app);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.scan_done && !a.state.session.desks.is_empty(),
+        200,
+        "scan + desk",
+    );
+    let desk_id = h.state().state.session.desks[0].id;
+
+    // ---- Promote the scrap via the WP3 path ---------------------------------
+    {
+        use jd_app::surfaces::inbox::InboxEvent;
+        h.state_mut()
+            .apply_inbox_event(InboxEvent::Promote(scrap_id));
+    }
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_some(),
+        200,
+        "promoting editor opens",
+    );
+    h.key_press(egui::Key::Escape);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_none(),
+        100,
+        "editor closes",
+    );
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            let idx = a.vault.index.read().unwrap();
+            idx.get(scrap_id)
+                .map(|m| m.status == jd_core::note::Status::Permanent)
+                .unwrap_or(false)
+        },
+        200,
+        "scrap promoted to Permanent",
+    );
+
+    // ---- Place the promoted card on the desk and select it ------------------
+    let _ = h.state_mut().state.session.apply(&SessionOp::Place {
+        desk: desk_id,
+        id: scrap_id,
+        pos: Vec2 { x: 0.0, y: 0.0 },
+    });
+    h.state_mut().state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+    h.state_mut().state.focus = Some(scrap_id);
+    h.run_ok();
+
+    // ---- Ghost fan: the directly-linked off-desk note ranks FIRST -----------
+    let on_desk: std::collections::HashSet<NoteId> = [scrap_id].into_iter().collect();
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let ghosts = jd_app::surfaces::desk::ghost_candidates(&idx, scrap_id, &on_desk);
+        assert_eq!(
+            ghosts.first().map(|(id, _)| *id),
+            Some(linked_id),
+            "the directly-linked off-desk note must rank first in the fan"
+        );
+        // No edges yet: the linked note is not on the desk (the seam,
+        // asserted by count — no pixel reading).
+        assert!(
+            jd_app::surfaces::desk::selected_edges(&idx, scrap_id, &on_desk).is_empty(),
+            "no edges while the linked note is off-desk"
+        );
+    }
+
+    // The fan mini is announced via AccessKit.
+    h.get_by_label("Ghost: 'Linked Note'");
+
+    // ---- Click the ghost: the real card lands where the ghost stood ---------
+    let journal_len_before = h.state().state.journal.len();
+    h.get_by_label("Ghost: 'Linked Note'").click();
+    h.run_ok();
+
+    let placed_pos = h.state().state.session.desks[0]
+        .cards
+        .iter()
+        .find(|c| c.id == linked_id)
+        .map(|c| c.pos)
+        .expect("clicked ghost must place the linked note on the desk");
+    // The fan position, not the viewport-center of the plain place path.
+    let center = h.state().state.session.desks[0].viewport.center;
+    assert_ne!(
+        placed_pos, center,
+        "ghost placement must land at the fan position, not the viewport center"
+    );
+    assert_eq!(
+        h.state().state.journal.len(),
+        journal_len_before + 1,
+        "ghost placement must journal exactly one entry"
+    );
+    assert_eq!(
+        h.state().state.journal.undo_label(),
+        Some("Place card"),
+        "ghost placement journal label must be 'Place card'"
+    );
+
+    // ---- Edges: with both cards on the desk, exactly one edge ---------------
+    let on_desk_after: std::collections::HashSet<NoteId> =
+        [scrap_id, linked_id].into_iter().collect();
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let edges = jd_app::surfaces::desk::selected_edges(&idx, scrap_id, &on_desk_after);
+        assert_eq!(
+            edges,
+            vec![(scrap_id, linked_id)],
+            "exactly one edge between the promoted card and the placed ghost"
+        );
+    }
+    // The placed note is on-desk now, so it leaves the fan on the next frame.
+    h.run_ok();
+    {
+        let idx = h.state().vault.index.read().unwrap();
+        let ghosts = jd_app::surfaces::desk::ghost_candidates(&idx, scrap_id, &on_desk_after);
+        assert!(
+            ghosts.iter().all(|(id, _)| *id != linked_id),
+            "a placed note must not reappear as a ghost"
+        );
+    }
+}

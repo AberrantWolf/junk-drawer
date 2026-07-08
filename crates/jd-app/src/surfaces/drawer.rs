@@ -15,7 +15,9 @@
 //!   frame (the FaceMeta idiom).
 //! - Needs Attention also renders quarantined files (not in the index) as
 //!   inert rows: "Quarantined: '<filename>' — <reason>" — no face, plain
-//!   labels, not focusable-to-open.
+//!   labels, not focusable-to-open. Quarantined rows IGNORE the other chips:
+//!   they aren't indexed notes, so status/kind/tag/Unlinked cannot apply —
+//!   the Needs Attention chip alone shows or hides them.
 //!
 //! Keyboard (gated on editor/confirm/palette overlays and the popups):
 //!   Up/Left / Down/Right → linear focus over the grid (list order IS
@@ -473,10 +475,10 @@ pub fn drawer_ui(ui: &mut egui::Ui, deps: &mut DrawerUiDeps<'_>) -> Vec<DrawerEv
     // ordered_ids order (newest-modified first), row-major.
     // -------------------------------------------------------------------
     let cols = grid_cols(panel);
-    for (idx, &id) in ids.iter().enumerate() {
-        let Some(meta) = deps.face_metas.iter().find(|m| m.id == id) else {
-            continue;
-        };
+    // face_metas is prefetched in app.rs IN ordered_ids order under the same
+    // index read lock, so a straight zip replaces the old per-id O(n²) find.
+    for (idx, (&id, meta)) in ids.iter().zip(deps.face_metas.iter()).enumerate() {
+        debug_assert_eq!(meta.id, id, "face_metas must be in ordered_ids order");
         let shape = shape_for(meta.status, meta.kind);
         let size = card_size(shape) * MINI_SCALE;
         let top_left = mini_pos(idx, cols, panel, y);
