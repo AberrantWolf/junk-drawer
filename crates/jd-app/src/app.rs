@@ -19,6 +19,7 @@ use crate::menus::{CardMenuEvent, EditMenuAction, EditMenuCtx, edit_menu_bar};
 use crate::rail::{RailDropTarget, RailEvent, RailUiDeps};
 use crate::state::{UiState, UndoRedoKind};
 use crate::surfaces::desk::{DeskEvent, DeskUiDeps, DragState, FaceMeta};
+use crate::surfaces::drawer::{DrawerEvent, DrawerUiDeps};
 use crate::surfaces::inbox::{InboxEvent, InboxUiDeps};
 use crate::surfaces::trash::{TrashEvent, TrashUiDeps};
 
@@ -1114,12 +1115,55 @@ impl JdUi {
                     self.apply_trash_events(evts);
                 }
 
+                // WP4 Task 4: Drawer surface.
+                Some(SurfaceId::Drawer) => {
+                    // Filtered ids + FaceMeta + tag list under ONE index read
+                    // lock (the FaceMeta prefetch idiom).
+                    let (face_metas, ordered_ids, all_tags): (
+                        Vec<FaceMeta>,
+                        Vec<NoteId>,
+                        Vec<(jd_core::tag::Tag, usize)>,
+                    ) = {
+                        let idx = self.vault.index.read().unwrap();
+                        let ids = crate::surfaces::drawer::drawer_ids(
+                            &idx,
+                            &self.state.drawer_filters,
+                            &self.state.conflicts,
+                        );
+                        let metas = ids
+                            .iter()
+                            .filter_map(|&id| {
+                                idx.get(id).map(|m| FaceMeta::from_note_meta(m, &idx))
+                            })
+                            .collect();
+                        (metas, ids, idx.all_tags())
+                    };
+                    let mut deps = DrawerUiDeps {
+                        focus: &mut self.state.focus,
+                        bodies: &mut self.state.bodies,
+                        commands: &self.vault.commands,
+                        theme: &self.theme,
+                        line_cache: &mut self.line_cache,
+                        face_metas: &face_metas,
+                        ordered_ids: &ordered_ids,
+                        filters: &mut self.state.drawer_filters,
+                        all_tags: &all_tags,
+                        quarantined: &self.state.quarantined,
+                        session: &self.state.session,
+                        editor_open: self.state.editor.is_some(),
+                        confirm_pending: self.state.pending_confirm.is_some(),
+                        palette_open: self.state.palette.is_some(),
+                    };
+                    let evts = crate::surfaces::drawer::drawer_ui(ui, &mut deps);
+                    self.apply_drawer_events(evts);
+                }
+
                 None => {
                     crate::surfaces::placeholder::placeholder_ui(ui);
                 }
 
-                // Drawer (WP4) and Map (WP5) — placeholder per scope boundaries.
-                Some(SurfaceId::Drawer) | Some(SurfaceId::Map) => {
+                // Map (WP5) — placeholder per scope boundaries.
+                Some(SurfaceId::Map) => {
                     crate::surfaces::placeholder::placeholder_ui(ui);
                 }
             }
@@ -1881,6 +1925,37 @@ impl JdUi {
     fn apply_inbox_events(&mut self, events: Vec<InboxEvent>) {
         for ev in events {
             self.apply_inbox_event(ev);
+        }
+    }
+
+    /// Apply a single `DrawerEvent` — public so kitests can dispatch events directly.
+    pub fn apply_drawer_event(&mut self, ev: DrawerEvent) {
+        match ev {
+            DrawerEvent::OpenCard(id) => {
+                // Same open path as the desk/inbox; the editor overlay is
+                // surface-agnostic, so it opens in place over the Drawer.
+                self.open_card_editor(id);
+            }
+            DrawerEvent::PlaceOnDesk { id, desk } => {
+                // Place at that desk's viewport center (journaled "Place card").
+                // Placement only — status is untouched (the Inbox Ctrl+D idiom).
+                let pos = self
+                    .state
+                    .session
+                    .desks
+                    .iter()
+                    .find(|d| d.id == desk)
+                    .map(|d| d.viewport.center)
+                    .unwrap_or_default();
+                self.place_card(desk, id, pos);
+            }
+        }
+    }
+
+    /// Apply `DrawerEvent`s emitted by `drawer_ui`.
+    fn apply_drawer_events(&mut self, events: Vec<DrawerEvent>) {
+        for ev in events {
+            self.apply_drawer_event(ev);
         }
     }
 

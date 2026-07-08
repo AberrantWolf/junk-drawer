@@ -178,6 +178,10 @@ pub struct UiState {
     /// is never cleared while the app runs (a per-note clear on the next
     /// user save is a possible later refinement) and starts empty on launch.
     pub conflicts: Vec<NoteId>,
+    /// WP4 Task 4: the Drawer's filter-chip state. View state (like `focus`):
+    /// not session-persisted, not journaled; survives surface switches within
+    /// the running app so the drawer keeps its query.
+    pub drawer_filters: crate::surfaces::drawer::DrawerFilters,
     /// WP3 Task 9: orphaned Create OpDone that arrived before ScanComplete.
     /// When pending_create is set and a Create OpDone arrives but no desk exists
     /// yet, the new note's id is buffered here instead of being lost. On
@@ -212,6 +216,7 @@ impl Default for UiState {
             reduced_motion: false,
             quarantined: Vec::new(),
             conflicts: Vec::new(),
+            drawer_filters: crate::surfaces::drawer::DrawerFilters::default(),
             orphaned_create_id: None,
         }
     }

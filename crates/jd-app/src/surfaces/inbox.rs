@@ -119,19 +119,11 @@ fn card_pos(index: usize, id: NoteId, style: CardStyle, panel: egui::Rect) -> eg
 }
 
 // ---------------------------------------------------------------------------
-// Desk picker popup state (stored in egui memory)
+// Desk picker popup (shared component — surfaces/desk_picker.rs)
 // ---------------------------------------------------------------------------
 
 fn picker_state_id() -> egui::Id {
     egui::Id::new("inbox_desk_picker")
-}
-
-#[derive(Clone, Default)]
-struct PickerState {
-    open: bool,
-    for_id: Option<NoteId>,
-    /// Index of the currently highlighted desk in the picker list.
-    highlight: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,9 +152,7 @@ pub fn inbox_ui(ui: &mut egui::Ui, deps: &mut InboxUiDeps<'_>) -> Vec<InboxEvent
     // -------------------------------------------------------------------------
     // Keyboard handling (only when editor is closed and picker is not open)
     // -------------------------------------------------------------------------
-    let picker_open = ui
-        .memory(|m| m.data.get_temp::<PickerState>(picker_state_id()))
-        .is_some_and(|p| p.open);
+    let picker_open = crate::surfaces::desk_picker::is_open(ui, picker_state_id());
 
     if !deps.editor_open && !picker_open && !deps.confirm_pending && !deps.palette_open {
         // Up/Down/Left/Right: linear navigation
@@ -252,12 +242,7 @@ pub fn inbox_ui(ui: &mut egui::Ui, deps: &mut InboxUiDeps<'_>) -> Vec<InboxEvent
             && let Some(id) = *deps.focus
             && !deps.session.desks.is_empty()
         {
-            let state = PickerState {
-                open: true,
-                for_id: Some(id),
-                highlight: 0,
-            };
-            ui.memory_mut(|m| m.data.insert_temp(picker_state_id(), state));
+            crate::surfaces::desk_picker::open_for(ui, picker_state_id(), id);
         }
     }
 
@@ -265,129 +250,14 @@ pub fn inbox_ui(ui: &mut egui::Ui, deps: &mut InboxUiDeps<'_>) -> Vec<InboxEvent
     // Desk picker popup (Ctrl+D)
     // -------------------------------------------------------------------------
     if picker_open {
-        let picker = ui
-            .memory(|m| m.data.get_temp::<PickerState>(picker_state_id()))
-            .unwrap_or_default();
-
-        // Key handling inside the picker
-        let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
-        let down_pressed = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
-        let up_pressed = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
-
-        let desk_count = deps.session.desks.len();
-        let mut highlight = picker.highlight;
-        if down_pressed && highlight + 1 < desk_count {
-            highlight += 1;
-        }
-        if up_pressed && highlight > 0 {
-            highlight -= 1;
-        }
-
-        if esc_pressed {
-            ui.memory_mut(|m| {
-                m.data
-                    .insert_temp(picker_state_id(), PickerState::default())
-            });
-        } else if enter_pressed {
-            if let Some(for_id) = picker.for_id
-                && let Some(desk) = deps.session.desks.get(highlight)
-            {
-                events.push(InboxEvent::PlaceOnDesk {
-                    id: for_id,
-                    desk: desk.id,
-                });
-            }
-            ui.memory_mut(|m| {
-                m.data
-                    .insert_temp(picker_state_id(), PickerState::default())
-            });
-        } else {
-            // Update highlight if it changed
-            ui.memory_mut(|m| {
-                let s = m
-                    .data
-                    .get_temp_mut_or(picker_state_id(), PickerState::default());
-                s.highlight = highlight;
-            });
-        }
-
-        // Render picker as a small window in the center.
-        let panel_center = panel.center();
-        let picker_width = 280.0_f32;
-        let row_h = 28.0_f32;
-        let picker_h = 8.0 + desk_count as f32 * row_h + 8.0;
-        let picker_rect =
-            egui::Rect::from_center_size(panel_center, egui::vec2(picker_width, picker_h));
-
-        // Collect (row_rect, desk_id, desk_name, is_hl) before any painting.
-        let rows: Vec<(egui::Rect, DeskId, String, bool)> = deps
-            .session
-            .desks
-            .iter()
-            .enumerate()
-            .map(|(i, desk)| {
-                let row_rect = egui::Rect::from_min_size(
-                    egui::pos2(
-                        picker_rect.min.x,
-                        picker_rect.min.y + 8.0 + i as f32 * row_h,
-                    ),
-                    egui::vec2(picker_width, row_h),
-                );
-                (row_rect, desk.id, desk.name.clone(), i == highlight)
-            })
-            .collect();
-
-        // Allocate interactive rects first (mutable borrow of ui).
-        let mut row_clicked: Option<DeskId> = None;
-        for (row_rect, desk_id, desk_name, is_hl) in &rows {
-            let label = format!("Desk: {desk_name}");
-            let row_resp = ui.allocate_rect(*row_rect, egui::Sense::click());
-            row_resp.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, *is_hl, label.as_str())
-            });
-            if row_resp.clicked() {
-                row_clicked = Some(*desk_id);
-            }
-        }
-
-        // Now paint (painter borrows ui immutably).
-        {
-            let painter = ui.painter();
-            painter.rect_filled(picker_rect, 6.0, deps.theme.card_plain_bg);
-            painter.rect_stroke(
-                picker_rect,
-                6.0,
-                egui::Stroke::new(1.0, deps.theme.card_border),
-                egui::StrokeKind::Outside,
-            );
-            for (row_rect, _desk_id, desk_name, is_hl) in &rows {
-                if *is_hl {
-                    painter.rect_filled(*row_rect, 4.0, deps.theme.focus_ring.gamma_multiply(0.25));
-                }
-                let font = egui::FontId::new(14.0, egui::FontFamily::Proportional);
-                painter.text(
-                    egui::pos2(row_rect.min.x + 12.0, row_rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    desk_name.as_str(),
-                    font,
-                    deps.theme.text,
-                );
-            }
-        }
-
-        // Handle click after painting.
-        if let Some(clicked_desk) = row_clicked
-            && let Some(for_id) = picker.for_id
-        {
-            events.push(InboxEvent::PlaceOnDesk {
-                id: for_id,
-                desk: clicked_desk,
-            });
-            ui.memory_mut(|m| {
-                m.data
-                    .insert_temp(picker_state_id(), PickerState::default())
-            });
+        if let Some((id, desk)) = crate::surfaces::desk_picker::desk_picker_ui(
+            ui,
+            picker_state_id(),
+            panel,
+            deps.session,
+            deps.theme,
+        ) {
+            events.push(InboxEvent::PlaceOnDesk { id, desk });
         }
 
         // Absorb keyboard so the picker doesn't bleed onto card actions.

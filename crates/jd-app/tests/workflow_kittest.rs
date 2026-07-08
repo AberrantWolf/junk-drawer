@@ -428,14 +428,15 @@ fn drop_card_to_desk_row_journals_one_entry_with_place_inverse() {
     );
 }
 
-/// Switching to Drawer or Map surfaces renders the placeholder label.
+/// The Drawer is a real surface since WP4 Task 4 (chips row renders);
+/// Map still renders the placeholder label.
 #[test]
-fn drawer_and_map_render_placeholder() {
+fn drawer_renders_and_map_renders_placeholder() {
     let (_v, mut h, _ids) = app_with_fleeting(0);
 
     h.state_mut().state.session.current_surface = Some(SurfaceId::Drawer);
     h.run_ok();
-    h.get_by_label_contains("Coming in a later milestone");
+    h.get_by_label("Filter: Scraps, inactive");
 
     h.state_mut().state.session.current_surface = Some(SurfaceId::Map);
     h.run_ok();
