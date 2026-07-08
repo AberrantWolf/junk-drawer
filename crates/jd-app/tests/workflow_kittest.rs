@@ -2338,6 +2338,7 @@ fn card_menu_items_blocked_while_editor_or_confirm_open() {
             on_desk: true,
             editor_open: true,
             confirm_pending: false,
+            palette_open: false,
         };
         let result = card_menu_items(ui, &ctx);
         assert!(
@@ -2358,6 +2359,7 @@ fn card_menu_items_blocked_while_editor_or_confirm_open() {
             on_desk: true,
             editor_open: false,
             confirm_pending: true,
+            palette_open: false,
         };
         let result = card_menu_items(ui, &ctx);
         assert!(

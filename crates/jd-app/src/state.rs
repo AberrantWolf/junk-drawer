@@ -161,6 +161,14 @@ pub struct UiState {
     /// while the palette is open it suppresses surface keyboard handling
     /// (same gate pattern as editor_open/confirm_pending).
     pub palette: Option<crate::palette::PaletteState>,
+    /// WP4 Task 2: highlight pulse — a ~600ms fading ring drawn at this card
+    /// after a palette pan-to-existing. Armed only when `reduced_motion` is
+    /// off; cleared by app.rs once the pulse duration elapses.
+    pub highlight_pulse: Option<(NoteId, std::time::Instant)>,
+    /// Reduced-motion preference (single source of truth; EditorDeps and the
+    /// palette highlight pulse both read this). Currently defaults to false;
+    /// WP6 owns surfacing it as a setting.
+    pub reduced_motion: bool,
     /// WP3 Task 9: orphaned Create OpDone that arrived before ScanComplete.
     /// When pending_create is set and a Create OpDone arrives but no desk exists
     /// yet, the new note's id is buffered here instead of being lost. On
@@ -191,6 +199,8 @@ impl Default for UiState {
             pending_copy_text: None,
             pending_split: None,
             palette: None,
+            highlight_pulse: None,
+            reduced_motion: false,
             orphaned_create_id: None,
         }
     }

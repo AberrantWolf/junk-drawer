@@ -168,6 +168,9 @@ pub struct CardMenuCtx<'a> {
     pub editor_open: bool,
     /// True while a delete-confirm modal is pending.  Same guard as editor_open.
     pub confirm_pending: bool,
+    /// True while the Ctrl+K palette overlay is open.  Same guard as
+    /// editor_open: the menu must not emit actions behind the palette.
+    pub palette_open: bool,
 }
 
 /// Render the 9 card-menu items inside the calling `ui` (which may be a
@@ -180,7 +183,7 @@ pub fn card_menu_items(ui: &mut egui::Ui, ctx: &CardMenuCtx<'_>) -> Option<CardM
     // the context menu must not emit any actions.  This prevents a right-click
     // menu opened on the card before the modal appeared from being acted on
     // while the modal is in front.
-    if ctx.editor_open || ctx.confirm_pending {
+    if ctx.editor_open || ctx.confirm_pending || ctx.palette_open {
         ui.close();
         return None;
     }

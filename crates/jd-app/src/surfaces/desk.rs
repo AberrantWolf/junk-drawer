@@ -254,6 +254,10 @@ pub struct DeskUiDeps<'a> {
     /// keyboard handling (same gate pattern as confirm_pending) and stops the
     /// focused card from stealing keyboard focus from the palette input.
     pub palette_open: bool,
+    /// WP4 Task 2: highlight pulse at a card the palette panned to —
+    /// (card id, age fraction 0..1). desk_ui paints a fading ring around the
+    /// card; app.rs owns the timer and clears it after ~600ms.
+    pub highlight_pulse: Option<(NoteId, f32)>,
     /// All desks (id + name) for the "Take to Desk ▸" submenu.
     pub desks: &'a [(jd_core::session::DeskId, String)],
     /// The current desk id — used to determine whether a card is "on a desk"
@@ -677,8 +681,25 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
             *state.focus = Some(card.id);
             events.push(DeskEvent::FocusChanged(*state.focus));
         }
-        if resp.double_clicked() {
+        // Mouse paths are gated while the palette overlay is open (same
+        // discipline as the keyboard block above): a double-click behind the
+        // palette must not open the editor.
+        if resp.double_clicked() && !state.palette_open {
             events.push(DeskEvent::OpenCard(card.id));
+        }
+
+        // Highlight pulse: fading ring around the card the palette panned to.
+        if let Some((pulse_id, frac)) = state.highlight_pulse
+            && pulse_id == card.id
+        {
+            let alpha = (1.0 - frac).clamp(0.0, 1.0);
+            let expand = 4.0 + 8.0 * frac;
+            ui.painter().rect_stroke(
+                card_screen_rect.expand(expand),
+                6.0,
+                egui::Stroke::new(3.0, state.theme.focus_ring.gamma_multiply(alpha)),
+                egui::StrokeKind::Outside,
+            );
         }
         // Only hold keyboard focus on the card when the editor is closed.
         // While the editor modal is open, its TextEdit owns keyboard focus;
@@ -717,6 +738,7 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
             on_desk: true, // card is on a desk surface
             editor_open: state.editor_open,
             confirm_pending: state.confirm_pending,
+            palette_open: state.palette_open,
         };
 
         // Right-click context menu via Response::context_menu.

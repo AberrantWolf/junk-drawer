@@ -1,9 +1,9 @@
 //! Ctrl+K palette (WP4 Task 1): overlay with a query input and three strata —
 //! title fuzzy matches, body search hits, and an always-last "New scrap" row.
 //!
-//! Rendering only in this task; actions (place / pan-to / create) are Task 2.
 //! Events-out discipline: the palette mutates nothing but its own PaletteState;
-//! app.rs owns open/close and (in Task 2) will apply row activation.
+//! app.rs owns open/close and applies row activation (Task 2: place /
+//! pan-to-existing / place-and-open / new scrap).
 
 use eframe::egui;
 use jd_core::id::NoteId;
@@ -39,10 +39,24 @@ pub enum PaletteRow {
     NewScrap,
 }
 
+/// What the palette asked app.rs to do this frame.
+#[derive(Clone, Debug)]
+pub enum PaletteEvent {
+    /// Esc — close the palette, nothing else.
+    Close,
+    /// Enter / Ctrl+Enter on the selected row. `open_after` = Ctrl held
+    /// (place-or-pan AND open the editor). app.rs closes the palette after
+    /// applying the activation.
+    Activate { row: PaletteRow, open_after: bool },
+}
+
 pub struct PaletteState {
     pub query: String,
     pub selected: usize,
     pub results: Vec<PaletteRow>,
+    /// The query `results` was computed for. Results are recomputed only when
+    /// the query changed or a stratum-2 snippet is still pending (body load).
+    last_query: Option<String>,
     /// One-shot: the input grabs keyboard focus on the first rendered frame.
     wants_focus: bool,
 }
@@ -53,6 +67,7 @@ impl PaletteState {
             query: String::new(),
             selected: 0,
             results: Vec::new(),
+            last_query: None,
             wants_focus: true,
         }
     }
@@ -166,14 +181,29 @@ struct RowView {
     kind: jd_core::note::Kind,
 }
 
-/// Render the palette overlay. Returns `true` when the palette asked to close
-/// (Esc). Ctrl+K toggling and the open gate live in app.rs.
-pub fn palette_ui(ui: &mut egui::Ui, pal: &mut PaletteState, deps: &mut PaletteDeps<'_>) -> bool {
+/// Render the palette overlay. Returns the event the palette asked app.rs to
+/// apply this frame (Esc → Close; Enter/Ctrl+Enter → Activate), if any.
+/// Ctrl+K toggling and the open gate live in app.rs.
+pub fn palette_ui(
+    ui: &mut egui::Ui,
+    pal: &mut PaletteState,
+    deps: &mut PaletteDeps<'_>,
+) -> Option<PaletteEvent> {
     // ── Key handling (consumed BEFORE the TextEdit sees them — the editor's
     //    popup-first pattern; Esc must close ONLY the palette). ──
     let close = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     let down = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown));
     let up = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp));
+    // Ctrl+Enter FIRST (consume_key is exact on modifiers, but checking the
+    // modified chord before the plain one keeps the intent obvious).
+    let enter_open = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
+    let enter = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+
+    let mut event: Option<PaletteEvent> = if close {
+        Some(PaletteEvent::Close)
+    } else {
+        None
+    };
 
     let panel_width = 560.0_f32;
     egui::Area::new(egui::Id::new("palette_overlay"))
@@ -205,10 +235,23 @@ pub fn palette_ui(ui: &mut egui::Ui, pal: &mut PaletteState, deps: &mut PaletteD
                         pal.wants_focus = false;
                     }
 
-                    // ── Results: recompute every frame under ONE index read
-                    //    lock (also serves the row renderer's meta lookups). ──
+                    // ── Results: recompute under ONE index read lock (which
+                    //    also serves the row renderer's meta lookups), but
+                    //    ONLY when the query changed or a stratum-2 snippet is
+                    //    still pending (blank while its body loads — the Body
+                    //    event repaints and this branch fills it in). ──
                     let idx = deps.index.read().unwrap();
-                    pal.results = compute_results(&idx, &pal.query, deps.bodies, deps.commands);
+                    let query_changed = pal.last_query.as_deref() != Some(pal.query.as_str());
+                    let snippet_pending = pal.results.iter().any(|r| {
+                        matches!(r, PaletteRow::Body { snippet, .. } if snippet.text.is_empty())
+                    });
+                    if query_changed || snippet_pending {
+                        pal.results = compute_results(&idx, &pal.query, deps.bodies, deps.commands);
+                        pal.last_query = Some(pal.query.clone());
+                        if query_changed {
+                            pal.selected = 0;
+                        }
+                    }
 
                     // Selection movement + clamp.
                     if !pal.results.is_empty() {
@@ -221,6 +264,18 @@ pub fn palette_ui(ui: &mut egui::Ui, pal: &mut PaletteState, deps: &mut PaletteD
                         pal.selected = pal.selected.min(pal.results.len() - 1);
                     } else {
                         pal.selected = 0;
+                    }
+
+                    // Enter activates the selected row (Ctrl+Enter = also open
+                    // the editor). Esc wins if both arrived in one frame.
+                    if (enter || enter_open)
+                        && event.is_none()
+                        && let Some(row) = pal.results.get(pal.selected)
+                    {
+                        event = Some(PaletteEvent::Activate {
+                            row: row.clone(),
+                            open_after: enter_open,
+                        });
                     }
 
                     ui.add_space(8.0);
@@ -239,13 +294,17 @@ pub fn palette_ui(ui: &mut egui::Ui, pal: &mut PaletteState, deps: &mut PaletteD
                         .collect();
                     drop(idx);
 
-                    for (i, view) in views.iter().enumerate() {
-                        render_row(ui, view, i == pal.selected, panel_width, deps.theme);
-                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(420.0)
+                        .show(ui, |ui| {
+                            for (i, view) in views.iter().enumerate() {
+                                render_row(ui, view, i == pal.selected, panel_width, deps.theme);
+                            }
+                        });
                 });
         });
 
-    close
+    event
 }
 
 /// Build the display snapshot for one row (index lock held by the caller).

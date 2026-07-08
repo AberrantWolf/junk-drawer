@@ -850,6 +850,26 @@ impl JdUi {
         }
 
         // ------------------------------------------------------------------
+        // Highlight pulse (WP4 Task 2): a ~600ms fading ring at a card the
+        // palette panned to. Computed here as (id, 0..1 age fraction) for
+        // desk_ui; expired entries are cleared. Repaint while active so the
+        // fade animates.
+        // ------------------------------------------------------------------
+        const PULSE_SECS: f32 = 0.6;
+        let highlight_pulse: Option<(NoteId, f32)> =
+            self.state.highlight_pulse.and_then(|(id, t0)| {
+                let frac = t0.elapsed().as_secs_f32() / PULSE_SECS;
+                (frac < 1.0).then_some((id, frac))
+            });
+        if self.state.highlight_pulse.is_some() {
+            if highlight_pulse.is_none() {
+                self.state.highlight_pulse = None;
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
+
+        // ------------------------------------------------------------------
         // Edit menu bar (top panel) — must be added before Bottom/SidePanels
         // and CentralPanel so egui allocates its space correctly.
         // Actions: Undo/Redo delegate to execute_undo/execute_redo.
@@ -1033,6 +1053,7 @@ impl JdUi {
                             editor_open: self.state.editor.is_some(),
                             confirm_pending: self.state.pending_confirm.is_some(),
                             palette_open: self.state.palette.is_some(),
+                            highlight_pulse,
                             desks: &desk_list,
                             current_desk_id: desk_id,
                             rail_row_hits: &self.rail_row_hits,
@@ -1102,7 +1123,7 @@ impl JdUi {
                     theme: &self.theme,
                     commands: &self.vault.commands,
                     index: &self.vault.index,
-                    reduced_motion: false,
+                    reduced_motion: self.state.reduced_motion,
                 };
                 Some(crate::editor::editor_ui(ui, ed, &mut deps))
             } else {
@@ -1308,9 +1329,13 @@ impl JdUi {
             }
         }
 
-        // 4e. Palette overlay (WP4 Task 1). Rendered above the surfaces; the
-        // Ctrl+K gate (section 3) guarantees no editor/confirm is live while
-        // it is open. Esc inside palette_ui closes ONLY the palette.
+        // 4e. Palette overlay (WP4). Rendered above the surfaces. The Ctrl+K
+        // gate (section 3) prevents the palette from OPENING while the editor
+        // or confirm modal is live; the converse (an editor/confirm appearing
+        // while the palette is up) is prevented by the palette_open gates on
+        // the surfaces' keyboard AND mouse paths (double-click, context menu).
+        // Esc inside palette_ui closes ONLY the palette; Enter/Ctrl+Enter
+        // activate the selected row (Task 2).
         if let Some(pal) = &mut self.state.palette {
             let mut deps = crate::palette::PaletteDeps {
                 index: &self.vault.index,
@@ -1318,11 +1343,17 @@ impl JdUi {
                 commands: &self.vault.commands,
                 theme: &self.theme,
             };
-            let close = crate::palette::palette_ui(ui, pal, &mut deps);
-            if close {
+            let event = crate::palette::palette_ui(ui, pal, &mut deps);
+            if let Some(event) = event {
+                // Close first (both Close and Activate dismiss the palette),
+                // keeping the query text for the NewScrap seed body.
+                let query = pal.query.clone();
                 self.state.palette = None;
                 // Release the keyboard focus held by the palette input.
                 ui.ctx().memory_mut(|mem| mem.stop_text_input());
+                if let crate::palette::PaletteEvent::Activate { row, open_after } = event {
+                    self.apply_palette_activation(row, open_after, &query);
+                }
             }
         }
 
@@ -1482,6 +1513,152 @@ impl JdUi {
                         self.state.last_error = Some(format!("Reveal: {e}"));
                     }
                 }
+            }
+        }
+    }
+
+    /// Apply a palette row activation (WP4 Task 2). Public so kitests can
+    /// drive activations directly.
+    ///
+    /// - Title/Body row, card NOT on the target desk → `place_card` at the
+    ///   desk's viewport center (journaled "Place card").
+    /// - Title/Body row, card ALREADY on the target desk → pan/zoom to center
+    ///   it. SACRED: the card's position is untouched and nothing is journaled
+    ///   (navigation). A ~600ms highlight pulse is armed unless reduced_motion.
+    /// - `open_after` (Ctrl+Enter) → additionally open the editor
+    ///   (session.open_card path).
+    /// - From a non-desk surface (Inbox/Drawer/Trash): the FIRST desk is the
+    ///   target; we switch to it (direct field set, not journaled — the rail
+    ///   Switch idiom) and, on placement, echo the desk by name (the WP3
+    ///   split-fallback idiom).
+    /// - NewScrap → the Ctrl+N create path with the query as the seed body:
+    ///   Create{Fleeting, Inbox} + pending_create{viewport center, open_editor}.
+    pub fn apply_palette_activation(
+        &mut self,
+        row: crate::palette::PaletteRow,
+        open_after: bool,
+        query: &str,
+    ) {
+        use crate::palette::PaletteRow;
+        match row {
+            PaletteRow::Title { id, .. } | PaletteRow::Body { id, .. } => {
+                // Resolve the target desk: the current desk, or the FIRST desk
+                // when the palette was opened from a non-desk surface.
+                let (target_desk, from_non_desk) = match self.state.session.current_surface {
+                    Some(SurfaceId::Desk(d)) => (Some(d), false),
+                    _ => (self.state.session.desks.first().map(|d| d.id), true),
+                };
+                let Some(desk_id) = target_desk else { return };
+                if from_non_desk {
+                    // Navigation: direct field set, not journaled.
+                    self.state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+                    self.state.session_dirty_at = Some(std::time::Instant::now());
+                }
+                let already_at = self
+                    .state
+                    .session
+                    .desks
+                    .iter()
+                    .find(|d| d.id == desk_id)
+                    .and_then(|d| d.cards.iter().find(|c| c.id == id))
+                    .map(|c| c.pos);
+                if let Some(pos) = already_at {
+                    // SACRED: already on this desk → pan to center the card.
+                    // Its position is byte-identical after; NO journal entry.
+                    let half = {
+                        let idx = self.vault.index.read().unwrap();
+                        idx.get(id)
+                            .map(|m| {
+                                crate::card::shape::card_size(crate::card::shape::shape_for(
+                                    m.status, m.kind,
+                                )) * 0.5
+                            })
+                            .unwrap_or(egui::vec2(150.0, 100.0))
+                    };
+                    if let Some(d) = self
+                        .state
+                        .session
+                        .desks
+                        .iter_mut()
+                        .find(|d| d.id == desk_id)
+                    {
+                        d.viewport.center = CoreVec2 {
+                            x: pos.x + half.x,
+                            y: pos.y + half.y,
+                        };
+                    }
+                    self.state.session_dirty_at = Some(std::time::Instant::now());
+                    // Highlight pulse (~600ms fading ring); skipped under
+                    // reduced motion (UiState::reduced_motion is the source
+                    // of truth EditorDeps also reads).
+                    if !self.state.reduced_motion {
+                        self.state.highlight_pulse = Some((id, std::time::Instant::now()));
+                    }
+                } else {
+                    // Not on this desk → place at the viewport center (journaled).
+                    let center = self
+                        .state
+                        .session
+                        .desks
+                        .iter()
+                        .find(|d| d.id == desk_id)
+                        .map(|d| d.viewport.center)
+                        .unwrap_or_default();
+                    self.place_card(desk_id, id, center);
+                    if from_non_desk {
+                        let desk_name = self
+                            .state
+                            .session
+                            .desks
+                            .iter()
+                            .find(|d| d.id == desk_id)
+                            .map(|d| d.name.as_str())
+                            .unwrap_or("desk");
+                        self.state.status_echo = Some((
+                            format!("Placed on desk '{desk_name}'"),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
+                self.state.focus = Some(id);
+                if open_after {
+                    self.open_card_editor(id);
+                }
+            }
+            PaletteRow::NewScrap => {
+                let body = query.trim();
+                if body.is_empty() {
+                    return;
+                }
+                // The Ctrl+N create path with a seed body: pending_create
+                // places the new scrap at the first desk's viewport center
+                // (handle_pending_create targets desks.first()) + opens the
+                // editor; the note itself lands in inbox/ as Fleeting.
+                let at = self
+                    .state
+                    .session
+                    .desks
+                    .first()
+                    .map(|d| d.viewport.center)
+                    .unwrap_or_default();
+                self.state.pending_create = Some(crate::state::PendingCreate {
+                    at,
+                    open_editor: true,
+                });
+                let seed = NewNote {
+                    body: body.to_owned(),
+                    status: Status::Fleeting,
+                    kind: Kind::Note,
+                    source: None,
+                    tags: Vec::new(),
+                };
+                let _ = self.vault.commands.send(VaultCommand::Op {
+                    op: VaultOp::Create {
+                        seed,
+                        dest: Dest::Inbox,
+                    },
+                    source: OpSource::User,
+                });
             }
         }
     }

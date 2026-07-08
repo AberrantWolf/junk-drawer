@@ -458,7 +458,10 @@ pub fn inbox_ui(ui: &mut egui::Ui, deps: &mut InboxUiDeps<'_>) -> Vec<InboxEvent
         if resp.clicked() && *deps.focus != Some(id) {
             *deps.focus = Some(id);
         }
-        if resp.double_clicked() {
+        // Gated while the palette overlay is open (same discipline as the
+        // keyboard block): a double-click behind the palette must not open
+        // the editor.
+        if resp.double_clicked() && !deps.palette_open {
             events.push(InboxEvent::OpenCard(id));
         }
         if is_focused && !deps.editor_open && !deps.palette_open {
