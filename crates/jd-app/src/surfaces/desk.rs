@@ -1289,15 +1289,18 @@ mod tests {
         }
 
         /// Fixture: A(1) is the anchor. B is directly linked, C backlinks,
-        /// D shares two tags, E shares one. Bodies are single unique words so
-        /// D/E get zero cosine; B/C pick up only the tiny link-token overlap.
+        /// D shares two tags, E shares one, F has no link/backlink/tag but
+        /// shares a distinctive body token with A (cosine-only candidate).
+        /// D and F have symmetric document frequencies so their cosines are
+        /// equal; the 0.5 structural gap (tag vs no relation) is the tiebreaker.
         fn fixture() -> Index {
             build(&[
-                (1, "Alpha", &["t1", "t2"], "[[Beta]]"),
+                (1, "Alpha", &["t1", "t2"], "[[Beta]] quantum"),
                 (2, "Beta", &[], "banana"),
                 (3, "Gamma", &[], "[[Alpha]]"),
                 (4, "Delta", &["t1", "t2"], "durian"),
                 (5, "Eps", &["t1"], "elder"),
+                (6, "Phi", &[], "quantum flux"),
             ])
         }
 
@@ -1309,8 +1312,8 @@ mod tests {
             let order: Vec<NoteId> = got.iter().map(|(id, _)| *id).collect();
             assert_eq!(
                 order,
-                vec![gid(2), gid(3), gid(4), gid(5)],
-                "direct link > backlink > two shared tags > one shared tag"
+                vec![gid(2), gid(3), gid(4), gid(5), gid(6)],
+                "direct link > backlink > two shared tags > one shared tag > cosine-only"
             );
             let score = |n: u8| got.iter().find(|(id, _)| *id == gid(n)).unwrap().1;
             // D and E share no body/title tokens with A: pure tag weights.
@@ -1319,6 +1322,8 @@ mod tests {
             // B/C: structural weight plus a small cosine (link-token overlap).
             assert!(score(2) >= 3.0 && score(2) < 4.0);
             assert!(score(3) >= 2.5 && score(3) < 3.5);
+            // F: cosine-only, no structural relation. Score is cosine (0,1].
+            assert!(score(6) > 0.0 && score(6) <= 1.0);
         }
 
         #[test]
