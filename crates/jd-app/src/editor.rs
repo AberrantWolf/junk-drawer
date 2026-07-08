@@ -191,6 +191,10 @@ pub struct EditorState {
     /// and returns `SplitAndClose` (treated as `CloseAndSave` in app.rs — the
     /// actual save is the SaveBody inside the Batch).
     pub split_requested: bool,
+    /// The buffer content as of open or the last dispatched save. Gates
+    /// autosave and close-save: an undo back to this exact content must NOT
+    /// dispatch a SaveBody (which would journal a phantom "Edit" entry).
+    pub saved_buffer: String,
 }
 
 impl EditorState {
@@ -210,6 +214,7 @@ impl EditorState {
         let undo = saved_undo.unwrap_or_else(|| crate::text_undo::TextUndo::new(&body));
         EditorState {
             id,
+            saved_buffer: body.clone(),
             buffer: body,
             dirty: false,
             last_edit: None,
@@ -934,13 +939,19 @@ pub fn editor_ui(
         && let Some(last_edit) = ed.last_edit
         && last_edit.elapsed().as_secs_f32() > 1.0
     {
-        let _ = deps.commands.send(VaultCommand::Op {
-            op: jd_core::command::VaultOp::SaveBody {
-                id: ed.id,
-                content: ed.buffer.clone(),
-            },
-            source: jd_core::command::OpSource::User,
-        });
+        // No-op guard: an undo chain back to the as-opened / last-saved content
+        // means there is nothing to save — dispatching would journal a phantom
+        // "Edit" entry. Just clear dirty.
+        if ed.buffer != ed.saved_buffer {
+            let _ = deps.commands.send(VaultCommand::Op {
+                op: jd_core::command::VaultOp::SaveBody {
+                    id: ed.id,
+                    content: ed.buffer.clone(),
+                },
+                source: jd_core::command::OpSource::User,
+            });
+            ed.saved_buffer = ed.buffer.clone();
+        }
         ed.dirty = false;
         // Keep last_edit so the next edit cycle anchors correctly.
     }

@@ -809,10 +809,12 @@ fn promotion_full_pedagogy_path() {
             jd_core::note::Status::Permanent,
             "promoted note must be Permanent"
         );
-        let rel = meta.rel_path.to_string_lossy();
+        // Path::starts_with compares components, so it is separator-agnostic
+        // (Windows rel paths are "notes\\file.md").
         assert!(
-            rel.contains("notes/") || rel.starts_with("notes/"),
-            "promoted note must be in notes/, got: {rel}"
+            meta.rel_path.starts_with("notes"),
+            "promoted note must be in notes/, got: {}",
+            meta.rel_path.display()
         );
     }
 
@@ -851,7 +853,7 @@ fn promotion_full_pedagogy_path() {
 /// Multi-line scrap: Enter at end of line 2 does NOT trigger promotion.
 #[test]
 fn multiline_scrap_enter_does_not_promote() {
-    let (_, mut h, id) = app_with_fleeting_on_desk("line one");
+    let (_v, mut h, id) = app_with_fleeting_on_desk("line one");
 
     open_editor(&mut h, id);
 
@@ -894,7 +896,7 @@ fn multiline_scrap_enter_does_not_promote() {
 /// Sets pending_promotion, then Ctrl+Z → pending unset, no Batch dispatched.
 #[test]
 fn ctrl_z_while_pending_reverts_without_vault_op() {
-    let (_, mut h, _id) = app_with_fleeting_on_desk("my idea");
+    let (_v, mut h, _id) = app_with_fleeting_on_desk("my idea");
 
     open_editor(&mut h, _id);
 
@@ -970,7 +972,7 @@ fn ctrl_z_while_pending_reverts_without_vault_op() {
 /// Second Ctrl+Z → pending false, single line.
 #[test]
 fn ctrl_z_partial_undo_preserves_pending_promotion() {
-    let (_, mut h, _id) = app_with_fleeting_on_desk("my scrap title");
+    let (_v, mut h, _id) = app_with_fleeting_on_desk("my scrap title");
 
     open_editor(&mut h, _id);
 
@@ -1043,7 +1045,7 @@ fn ctrl_z_partial_undo_preserves_pending_promotion() {
 /// Finding 4: empty fleeting buffer + Enter must NOT trigger promotion.
 #[test]
 fn empty_buffer_enter_does_not_promote() {
-    let (_, mut h, _id) = app_with_fleeting_on_desk("");
+    let (_v, mut h, _id) = app_with_fleeting_on_desk("");
 
     open_editor(&mut h, _id);
 
@@ -1074,7 +1076,7 @@ fn empty_buffer_enter_does_not_promote() {
 /// Directly set last_edit to a past time while pending and assert no SaveBody op arrives.
 #[test]
 fn autosave_suppressed_while_pending_promotion() {
-    let (_, mut h, _id) = app_with_fleeting_on_desk("autosave scrap");
+    let (_v, mut h, _id) = app_with_fleeting_on_desk("autosave scrap");
 
     open_editor(&mut h, _id);
 

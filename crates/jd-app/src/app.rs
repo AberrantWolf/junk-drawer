@@ -1172,7 +1172,10 @@ impl JdUi {
                     ]),
                     source: jd_core::command::OpSource::User,
                 });
-            } else if editor.dirty {
+            } else if editor.dirty && editor.buffer != editor.saved_buffer {
+                // No-op guard (mirrors the autosave guard in editor_ui): a buffer
+                // undone back to the as-opened / last-saved content must not
+                // dispatch a SaveBody — it would journal a phantom "Edit" entry.
                 let _ = self.vault.commands.send(VaultCommand::Op {
                     op: jd_core::command::VaultOp::SaveBody {
                         id: editor.id,

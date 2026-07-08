@@ -913,10 +913,11 @@ fn inbox_promote_event_opens_editor_with_pending_promotion() {
     {
         let idx = h.state().vault.index.read().unwrap();
         let meta = idx.get(id).expect("note must be in index after promote");
-        let rel = meta.rel_path.to_string_lossy();
+        // Component-wise starts_with: separator-agnostic (Windows uses "notes\\").
         assert!(
-            rel.contains("notes/") || rel.starts_with("notes/"),
-            "promoted note must be in notes/, got: {rel}"
+            meta.rel_path.starts_with("notes"),
+            "promoted note must be in notes/, got: {}",
+            meta.rel_path.display()
         );
         let abs = vault.path().join(&meta.rel_path);
         drop(idx);
@@ -3328,10 +3329,11 @@ fn m3_story_capture_promote_toss_undo_take_to_desk_put_away_restart() {
         let idx = h.state().vault.index.read().unwrap();
         let meta = idx.get(first).expect("promoted note in index");
         assert_eq!(meta.status, jd_core::note::Status::Permanent);
-        let rel = meta.rel_path.to_string_lossy().into_owned();
+        // Component-wise starts_with: separator-agnostic (Windows uses "notes\\").
         assert!(
-            rel.starts_with("notes/") || rel.contains("notes/"),
-            "promoted note must live in notes/, got {rel}"
+            meta.rel_path.starts_with("notes"),
+            "promoted note must live in notes/, got {}",
+            meta.rel_path.display()
         );
         let abs = vault.path().join(&meta.rel_path);
         drop(idx);
@@ -3548,10 +3550,11 @@ fn m3_story_capture_promote_toss_undo_take_to_desk_put_away_restart() {
             Some("a promising thought"),
             "promoted note must carry its title after restart"
         );
-        let rel = meta.rel_path.to_string_lossy().into_owned();
+        // Component-wise starts_with: separator-agnostic (Windows uses "notes\\").
         assert!(
-            rel.starts_with("notes/") || rel.contains("notes/"),
-            "promoted note must still be in notes/ after restart, got {rel}"
+            meta.rel_path.starts_with("notes"),
+            "promoted note must still be in notes/ after restart, got {}",
+            meta.rel_path.display()
         );
         let abs = vault.path().join(&meta.rel_path);
         drop(idx);
