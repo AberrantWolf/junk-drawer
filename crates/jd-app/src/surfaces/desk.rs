@@ -677,8 +677,10 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
         })
     });
 
-    // Drag start
+    // Drag start. Gated while the palette overlay is open (same discipline as
+    // double-click/keyboard): a press behind the palette must not start a drag.
     if primary_pressed
+        && !state.palette_open
         && let Some(id) = pointer_over_card
         && let Some(card) = desk.cards.iter().find(|c| c.id == id)
     {
@@ -900,7 +902,11 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
 
         // Checkbox click-to-toggle: if the face detected a checkbox click, emit
         // the toggle event (ordinal identifies the Nth task box in the raw body).
-        if let Some(ordinal) = checkbox_ordinal {
+        // Gated while the palette overlay is open (same discipline as the
+        // double-click gate below): a click behind the palette must not mutate.
+        if let Some(ordinal) = checkbox_ordinal
+            && !state.palette_open
+        {
             events.push(DeskEvent::ToggleTaskBox {
                 id: card.id,
                 ordinal,

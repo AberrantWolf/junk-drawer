@@ -661,6 +661,211 @@ fn double_click_behind_open_palette_does_not_open_editor() {
     assert_eq!(h.state().state.session.open_card, Some(note_id));
 }
 
+/// A primary drag on a desk card BEHIND the open palette must not move the
+/// card (position byte-identical, no journal entry). After the palette
+/// closes, the same drag moves it (proves the simulated drag actually works).
+#[test]
+fn drag_behind_open_palette_does_not_move_card() {
+    let (_vault, mut h, ids) = app_with_notes(&[("Alpha idea", "first body")]);
+    let note_id = ids[0];
+
+    // Place the card away from the palette overlay (bottom-left region).
+    let desk_id = h.state().state.session.desks[0].id;
+    let _ = h.state_mut().state.session.apply(&SessionOp::Place {
+        desk: desk_id,
+        id: note_id,
+        pos: Vec2 {
+            x: -400.0,
+            y: 150.0,
+        },
+    });
+    h.run_ok();
+
+    // Screen position of the card center (same coordinate math as the
+    // double-click test above).
+    let desk = &h.state().state.session.desks[0];
+    let placed = desk.cards.iter().find(|c| c.id == note_id).unwrap();
+    let cam = jd_app::surfaces::desk::DeskCamera {
+        center: egui::vec2(desk.viewport.center.x, desk.viewport.center.y),
+        zoom: desk.viewport.zoom,
+    };
+    let panel = egui::Rect::from_min_max(egui::pos2(160.0, 24.0), egui::pos2(1200.0, 776.0));
+    let screen_min = cam.to_screen(panel, egui::pos2(placed.pos.x, placed.pos.y));
+    let grab_pos = screen_min + egui::vec2(150.0, 100.0);
+    let drop_pos = grab_pos + egui::vec2(60.0, 40.0);
+
+    let drag = |h: &mut Harness<'_, JdUi>, from: egui::Pos2, to: egui::Pos2| {
+        h.event(egui::Event::PointerButton {
+            pos: from,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+        h.event(egui::Event::PointerMoved(to));
+        h.step();
+        h.event(egui::Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+        h.run_ok();
+    };
+
+    let journal_len_before = h.state().state.journal.len();
+    let pos_before = placed.pos;
+
+    open_palette(&mut h);
+    drag(&mut h, grab_pos, drop_pos);
+
+    let after = h.state().state.session.desks[0]
+        .cards
+        .iter()
+        .find(|c| c.id == note_id)
+        .unwrap()
+        .pos;
+    assert!(
+        after.x.to_bits() == pos_before.x.to_bits() && after.y.to_bits() == pos_before.y.to_bits(),
+        "a drag behind the open palette must not move the card, got {after:?}"
+    );
+    assert_eq!(
+        h.state().state.journal.len(),
+        journal_len_before,
+        "a drag behind the open palette must not journal"
+    );
+
+    // Close the palette; the same drag now moves the card (and journals).
+    h.key_press(egui::Key::Escape);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.palette.is_none(),
+        50,
+        "palette closes",
+    );
+    drag(&mut h, grab_pos, drop_pos);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.journal.len() > journal_len_before,
+        100,
+        "drag after the palette closes journals a move",
+    );
+    let after = h.state().state.session.desks[0]
+        .cards
+        .iter()
+        .find(|c| c.id == note_id)
+        .unwrap()
+        .pos;
+    assert!(
+        after.x.to_bits() != pos_before.x.to_bits() || after.y.to_bits() != pos_before.y.to_bits(),
+        "the same drag must move the card once the palette is closed"
+    );
+}
+
+/// A click on a card's task checkbox BEHIND the open palette must not toggle
+/// it: no SaveBody round-trips the worker, so the journal length is unchanged
+/// after pumping. The checkbox position is proven first with the palette
+/// closed (the same click toggles and journals).
+#[test]
+fn checkbox_click_behind_open_palette_does_not_toggle() {
+    let (_vault, mut h, ids) = app_with_notes(&[("Task card", "- [ ] milk")]);
+    let note_id = ids[0];
+
+    // Place the card away from the palette overlay (bottom-left region).
+    let desk_id = h.state().state.session.desks[0].id;
+    let _ = h.state_mut().state.session.apply(&SessionOp::Place {
+        desk: desk_id,
+        id: note_id,
+        pos: Vec2 {
+            x: -400.0,
+            y: 150.0,
+        },
+    });
+    h.run_ok();
+
+    // The face requests the body on render; wait for the cache so the
+    // checkbox glyph (and its hit rect) exists.
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.bodies.get_cached(note_id).is_some(),
+        200,
+        "card body cached",
+    );
+
+    let desk = &h.state().state.session.desks[0];
+    let placed = desk.cards.iter().find(|c| c.id == note_id).unwrap();
+    let cam = jd_app::surfaces::desk::DeskCamera {
+        center: egui::vec2(desk.viewport.center.x, desk.viewport.center.y),
+        zoom: desk.viewport.zoom,
+    };
+    let panel = egui::Rect::from_min_max(egui::pos2(160.0, 24.0), egui::pos2(1200.0, 776.0));
+    let screen_min = cam.to_screen(panel, egui::pos2(placed.pos.x, placed.pos.y));
+
+    let click = |h: &mut Harness<'_, JdUi>, pos: egui::Pos2| {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+        h.run_ok();
+    };
+
+    // Palette CLOSED first: probe a column of points down the body area
+    // (galley starts at rect.min + (10, 10); the checkbox glyph is the first
+    // char of the second line) until the toggle journals a SaveBody. This
+    // pins the exact click position the gated leg reuses.
+    let len_before_probe = h.state().state.journal.len();
+    let probe_x = screen_min.x + 16.0;
+    let mut checkbox_pos: Option<egui::Pos2> = None;
+    let mut y = screen_min.y + 20.0;
+    while y < screen_min.y + 120.0 {
+        let pos = egui::pos2(probe_x, y);
+        click(&mut h, pos);
+        // Short pump: SaveBody round-trips the worker before OpDone journals.
+        for _ in 0..20 {
+            if h.state().state.journal.len() > len_before_probe {
+                break;
+            }
+            h.step();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if h.state().state.journal.len() > len_before_probe {
+            checkbox_pos = Some(pos);
+            break;
+        }
+        y += 4.0;
+    }
+    let checkbox_pos = checkbox_pos.expect("a probe click must hit the checkbox glyph");
+    let journal_len_before = h.state().state.journal.len();
+
+    // Palette OPEN: the very same click must NOT toggle (no SaveBody OpDone,
+    // journal length unchanged after pumping).
+    open_palette(&mut h);
+    click(&mut h, checkbox_pos);
+    for _ in 0..40 {
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        h.state().state.journal.len(),
+        journal_len_before,
+        "a checkbox click behind the open palette must not toggle/journal"
+    );
+    assert!(
+        h.state().state.palette.is_some(),
+        "the palette must remain open"
+    );
+}
+
 /// While the palette is open, desk surface keys do nothing: ArrowRight must
 /// NOT move card focus. After Esc closes the palette, the same key works.
 #[test]
@@ -703,4 +908,56 @@ fn surface_keys_suppressed_while_palette_open() {
         Some(note_id),
         "desk focus must work again after the palette closes"
     );
+}
+
+/// A mouse click on a Title result row acts like Enter on it: the card is
+/// placed at the desk's viewport center, journaled "Place card", and the
+/// palette closes (mirrors `enter_places_card_on_current_desk_at_viewport_center`).
+#[test]
+fn click_on_result_row_places_card_and_closes_palette() {
+    let (_vault, mut h, ids) = app_with_notes(&[("Alpha idea", "first body")]);
+    let note_id = ids[0];
+
+    let center_before = h.state().state.session.desks[0].viewport.center;
+
+    open_palette(&mut h);
+    type_in_palette(&mut h, "alpha");
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            a.state
+                .palette
+                .as_ref()
+                .is_some_and(|p| !p.results.is_empty())
+        },
+        200,
+        "palette results ready",
+    );
+
+    // Click the Title row via its AccessKit node (Button, labeled).
+    h.get_by_label("Result: 'Alpha idea'").click();
+    h.run_ok();
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.palette.is_none(),
+        50,
+        "palette closes on row click",
+    );
+
+    let desk = &h.state().state.session.desks[0];
+    let placed = desk
+        .cards
+        .iter()
+        .find(|c| c.id == note_id)
+        .expect("card must be placed on the current desk");
+    assert_eq!(placed.pos.x, center_before.x, "placed at viewport center x");
+    assert_eq!(placed.pos.y, center_before.y, "placed at viewport center y");
+    assert_eq!(
+        h.state().state.journal.undo_label(),
+        Some("Place card"),
+        "placement must be journaled as 'Place card'"
+    );
+    // A plain click does not open the editor (Cmd-click would).
+    assert!(h.state().state.editor.is_none(), "editor must stay closed");
+    assert!(h.state().state.session.open_card.is_none());
 }

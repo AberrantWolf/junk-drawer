@@ -182,7 +182,8 @@ struct RowView {
 }
 
 /// Render the palette overlay. Returns the event the palette asked app.rs to
-/// apply this frame (Esc → Close; Enter/Ctrl+Enter → Activate), if any.
+/// apply this frame (Esc → Close; Enter/Ctrl+Enter or a row click →
+/// Activate, Cmd-click = open_after), if any.
 /// Ctrl+K toggling and the open gate live in app.rs.
 pub fn palette_ui(
     ui: &mut egui::Ui,
@@ -298,7 +299,25 @@ pub fn palette_ui(
                         .max_height(420.0)
                         .show(ui, |ui| {
                             for (i, view) in views.iter().enumerate() {
-                                render_row(ui, view, i == pal.selected, panel_width, deps.theme);
+                                let resp = render_row(
+                                    ui,
+                                    view,
+                                    i == pal.selected,
+                                    panel_width,
+                                    deps.theme,
+                                );
+                                // Mouse activation: a click on a row acts like
+                                // Enter on it (Cmd-click = also open the
+                                // editor, mirroring Ctrl+Enter).
+                                if resp.clicked()
+                                    && event.is_none()
+                                    && let Some(row) = pal.results.get(i)
+                                {
+                                    event = Some(PaletteEvent::Activate {
+                                        row: row.clone(),
+                                        open_after: ui.input(|inp| inp.modifiers.command),
+                                    });
+                                }
                             }
                         });
                 });
@@ -363,7 +382,7 @@ fn render_row(
     selected: bool,
     width: f32,
     th: &crate::theme::Theme,
-) {
+) -> egui::Response {
     let row_h = if view.detail.is_some() { 46.0 } else { 30.0 };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::click());
     {
@@ -373,7 +392,7 @@ fn render_row(
         });
     }
     if !ui.is_rect_visible(rect) {
-        return;
+        return resp;
     }
     let painter = ui.painter();
     if selected {
@@ -442,6 +461,8 @@ fn render_row(
             th.text_weak,
         );
     }
+
+    resp
 }
 
 // ---------------------------------------------------------------------------

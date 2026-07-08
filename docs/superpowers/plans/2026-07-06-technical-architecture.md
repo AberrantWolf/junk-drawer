@@ -880,6 +880,7 @@ WP1b/WP1c parallelize after WP1a. WP5 needs only WP2's surfaces scaffolding + WP
 - Whitespace-only "New scrap: '…'" palette activation silently no-ops (guarded, no echo) — decide whether it deserves a status echo.
 - Palette placement from a non-desk surface pans to the FIRST desk with a status echo; a "most recently used desk" target may be friendlier — revisit with WP5's Map navigation.
 - Ghost fan does not avoid overlapping other placed cards (only the anchor); the freest-edge heuristic keeps it usually clear — revisit if the Map's layout tooling (WP5) makes a cheap avoid-pass available.
+- The overlay-gating matrix is now uniform for the desk: every mouse mutation path (drag-start, checkbox toggle, double-click-to-open, keyboard, context menu) checks `palette_open`. WP5's map surface must gate its own mouse mutations on `palette_open` from day one — the palette overlay does not swallow pointer events for the surface beneath it.
 
 ---
 
