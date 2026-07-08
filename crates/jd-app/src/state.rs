@@ -156,6 +156,11 @@ pub struct UiState {
     /// Split undo trashes the split-off and the undo of the SaveBody restores
     /// the original body, so placement is part of the same user act).
     pub pending_split: Option<jd_core::id::NoteId>,
+    /// WP4 Task 1: the Ctrl+K palette overlay. Some = open. Only one overlay
+    /// at a time: Ctrl+K is gated on editor closed + no confirm pending, and
+    /// while the palette is open it suppresses surface keyboard handling
+    /// (same gate pattern as editor_open/confirm_pending).
+    pub palette: Option<crate::palette::PaletteState>,
     /// WP3 Task 9: orphaned Create OpDone that arrived before ScanComplete.
     /// When pending_create is set and a Create OpDone arrives but no desk exists
     /// yet, the new note's id is buffered here instead of being lost. On
@@ -185,6 +190,7 @@ impl Default for UiState {
             pending_set_source: None,
             pending_copy_text: None,
             pending_split: None,
+            palette: None,
             orphaned_create_id: None,
         }
     }

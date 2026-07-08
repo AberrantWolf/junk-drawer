@@ -646,6 +646,25 @@ impl JdUi {
         //    other shortcuts (Ctrl+N, Del, surface keys) are suppressed.
         //    Otherwise: Ctrl+N → create a new fleeting scrap in Inbox.
         if self.state.editor.is_none() {
+            // ------------------------------------------------------------------
+            // Ctrl+K: toggle the palette (WP4 Task 1).
+            // Spec says "anywhere in-app", but our overlay discipline is one
+            // overlay at a time: Ctrl+K with the editor open is a WP6 question,
+            // so it is gated off here (whole block runs only when the editor is
+            // closed) and while a confirm modal is pending.
+            // consume_key so the K never leaks into the palette's TextEdit.
+            // ------------------------------------------------------------------
+            let ctrl_k = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K));
+            if ctrl_k && self.state.pending_confirm.is_none() {
+                if self.state.palette.take().is_some() {
+                    // Toggled closed: release keyboard focus held by the input.
+                    ui.ctx().memory_mut(|mem| mem.stop_text_input());
+                } else {
+                    self.state.palette = Some(crate::palette::PaletteState::new());
+                }
+            }
+            let palette_open = self.state.palette.is_some();
+
             let ctrl_n = ui.input(|i| {
                 i.events.iter().any(|e| {
                     matches!(
@@ -659,7 +678,7 @@ impl JdUi {
                     )
                 })
             });
-            if ctrl_n && self.state.pending_confirm.is_none() {
+            if ctrl_n && self.state.pending_confirm.is_none() && !palette_open {
                 // Determine where to place the new card: pointer world pos if
                 // the pointer is over the panel, otherwise panel center.
                 let place_at = self
@@ -719,6 +738,7 @@ impl JdUi {
             let del_pressed = ui.input(|i| i.key_pressed(egui::Key::Delete));
             if del_pressed
                 && self.state.pending_confirm.is_none()
+                && !palette_open
                 && matches!(
                     self.state.session.current_surface,
                     Some(jd_core::session::SurfaceId::Desk(_))
@@ -744,8 +764,10 @@ impl JdUi {
 
             // ------------------------------------------------------------------
             // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: undo/redo (Task 6).
+            // Suppressed while the palette is open: its TextEdit owns Ctrl+Z
+            // (text-field undo), which must not fire the app journal.
             // ------------------------------------------------------------------
-            if self.state.pending_confirm.is_none() {
+            if self.state.pending_confirm.is_none() && !palette_open {
                 let ctrl_z = ui.input(|i| {
                     i.events.iter().any(|e| {
                         matches!(
@@ -1010,6 +1032,7 @@ impl JdUi {
                             drag: &mut self.drag,
                             editor_open: self.state.editor.is_some(),
                             confirm_pending: self.state.pending_confirm.is_some(),
+                            palette_open: self.state.palette.is_some(),
                             desks: &desk_list,
                             current_desk_id: desk_id,
                             rail_row_hits: &self.rail_row_hits,
@@ -1045,6 +1068,7 @@ impl JdUi {
                         ordered_ids: &ordered_ids,
                         editor_open: self.state.editor.is_some(),
                         confirm_pending: self.state.pending_confirm.is_some(),
+                        palette_open: self.state.palette.is_some(),
                     };
                     let evts = crate::surfaces::inbox::inbox_ui(ui, &mut deps);
                     self.apply_inbox_events(evts);
@@ -1284,7 +1308,25 @@ impl JdUi {
             }
         }
 
-        // 4e. Clipboard copy (Task 7: Copy Link).
+        // 4e. Palette overlay (WP4 Task 1). Rendered above the surfaces; the
+        // Ctrl+K gate (section 3) guarantees no editor/confirm is live while
+        // it is open. Esc inside palette_ui closes ONLY the palette.
+        if let Some(pal) = &mut self.state.palette {
+            let mut deps = crate::palette::PaletteDeps {
+                index: &self.vault.index,
+                bodies: &mut self.state.bodies,
+                commands: &self.vault.commands,
+                theme: &self.theme,
+            };
+            let close = crate::palette::palette_ui(ui, pal, &mut deps);
+            if close {
+                self.state.palette = None;
+                // Release the keyboard focus held by the palette input.
+                ui.ctx().memory_mut(|mem| mem.stop_text_input());
+            }
+        }
+
+        // 4f. Clipboard copy (Task 7: Copy Link).
         // pending_copy_text is set by apply_card_menu_event; we copy it here
         // where we have a ui context.
         if let Some(text) = self.state.pending_copy_text.take() {

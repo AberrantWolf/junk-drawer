@@ -250,6 +250,10 @@ pub struct DeskUiDeps<'a> {
     /// True while a delete-confirm modal is pending; suppresses all surface
     /// keyboard handling so the modal's Enter/Esc are the only consumers.
     pub confirm_pending: bool,
+    /// True while the Ctrl+K palette overlay is open; suppresses all surface
+    /// keyboard handling (same gate pattern as confirm_pending) and stops the
+    /// focused card from stealing keyboard focus from the palette input.
+    pub palette_open: bool,
     /// All desks (id + name) for the "Take to Desk ▸" submenu.
     pub desks: &'a [(jd_core::session::DeskId, String)],
     /// The current desk id — used to determine whether a card is "on a desk"
@@ -303,7 +307,7 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
         })
         .unwrap_or(false);
 
-    if !state.editor_open && !state.confirm_pending && !card_popup_open {
+    if !state.editor_open && !state.confirm_pending && !state.palette_open && !card_popup_open {
         for (key, dir) in [
             (egui::Key::ArrowLeft, FocusDir::Left),
             (egui::Key::ArrowRight, FocusDir::Right),
@@ -680,7 +684,7 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
         // While the editor modal is open, its TextEdit owns keyboard focus;
         // stealing it here every frame would prevent Event::Text from reaching
         // the TextEdit (desk renders inside CentralPanel, before the modal overlay).
-        if is_focused && !state.editor_open {
+        if is_focused && !state.editor_open && !state.palette_open {
             resp.request_focus();
         }
 
