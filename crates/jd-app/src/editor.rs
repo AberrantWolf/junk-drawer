@@ -900,7 +900,26 @@ pub fn editor_ui(
     });
 
     // Esc to close (Modal::should_close handles Esc + backdrop click).
-    if modal_resp.should_close() {
+    //
+    // First-frame fallback: egui 0.35 publishes `Memory::top_modal_layer` only at
+    // END of pass, so on the modal's FIRST rendered frame `is_top_modal` is false
+    // and `should_close()` ignores a pending Esc — the event then dies with that
+    // frame. This happens when the editor opens synchronously (cached body) in
+    // the same step that delivers a queued Esc: the close intent is silently lost
+    // (CI-reproducible via workflow_kittest). Treat Esc as close intent whenever
+    // no OTHER modal is above us and no popup is open. The autocomplete popup's
+    // Esc was already consumed inside the content closure (popup-dismiss keeps
+    // priority), so it can never reach this fallback.
+    let editor_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("editor_modal"));
+    // NOTE: `||` short-circuits — the fallback consume only runs when
+    // `should_close()` returned false (it consumes the Esc itself otherwise).
+    if modal_resp.should_close()
+        || (!modal_resp.any_popup_open
+            && ui
+                .ctx()
+                .memory(|mem| mem.top_modal_layer().is_none_or(|l| l == editor_layer))
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)))
+    {
         close_requested = true;
     }
 

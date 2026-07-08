@@ -1835,6 +1835,49 @@ fn promotion_single_ctrl_z_full_reversal() {
     );
 }
 
+/// Regression (CI-only flake): Esc pressed on the editor modal's FIRST rendered
+/// frame must still close the editor.
+///
+/// When the body is already cached (inbox previews requested it earlier),
+/// `InboxEvent::Promote` opens the editor synchronously OUTSIDE a frame, so the
+/// next stepped frame is the modal's first render — and egui 0.35 publishes
+/// `Memory::top_modal_layer` only at end-of-pass, making `Modal::should_close()`
+/// ignore an Esc delivered in that exact frame (`is_top_modal` lags one frame).
+/// Without the first-frame Esc fallback in editor.rs the Esc dies and the
+/// editor never closes.
+#[test]
+fn editor_esc_on_first_modal_frame_closes() {
+    let (_v, mut h, ids) = app_with_staggered_fleeting();
+    let id = ids[0];
+
+    // Wait for the inbox preview's ReadBody to land in the cache, so the
+    // Promote below opens the editor synchronously (outside any frame).
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.bodies.get_cached(id).is_some(),
+        200,
+        "body cached",
+    );
+
+    {
+        use jd_app::surfaces::inbox::InboxEvent;
+        h.state_mut().apply_inbox_event(InboxEvent::Promote(id));
+    }
+    assert!(
+        h.state().state.editor.is_some(),
+        "cached body must open the editor synchronously"
+    );
+
+    // Esc is delivered in the very next frame — the modal's first render.
+    h.key_press(egui::Key::Escape);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_none(),
+        100,
+        "editor closes on first-frame Esc",
+    );
+}
+
 /// Toss a fleeting card (vault op), Ctrl+Z (undo → restored), Ctrl+Y (redo → tossed
 /// again), Ctrl+Z (undo again → restored).  Proves the async redo-inverse from the
 /// UndoRedo OpDone is correctly re-stacked in both directions.
