@@ -526,8 +526,33 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
             }
         }
 
-        // Enter → open focused card
-        if ui.input(|i| i.key_pressed(egui::Key::Enter))
+        // Ctrl+Enter → promote the focused card if it is fleeting (spec
+        // Appendix A: "Promote scrap (card focus or its editor)" — desk cards
+        // CAN be fleeting). For a permanent card Ctrl+Enter has no defined
+        // action on card focus (the "close editor" meaning applies IN-editor
+        // only), so it is a deliberate no-op — but the key is consumed either
+        // way so it cannot leak into the just-opened editor this same frame
+        // (see the matching consume in inbox.rs) or fire plain OpenCard below.
+        let ctrl_enter =
+            ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
+        if ctrl_enter
+            && let Some(id) = *state.focus
+            && state
+                .face_metas
+                .iter()
+                .any(|m| m.id == id && m.status == jd_core::note::Status::Fleeting)
+        {
+            // Same promote path as the card context menu / inbox Ctrl+Enter.
+            events.push(DeskEvent::CardMenu(crate::menus::CardMenuEvent::Promote(
+                id,
+            )));
+        }
+
+        // Enter → open focused card (plain Enter only; Ctrl+Enter is the
+        // promote path above — the !command guard keeps a Ctrl+Enter whose
+        // Key event was already consumed from opening the card via the
+        // still-set modifier state).
+        if ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.command)
             && let Some(id) = *state.focus
         {
             events.push(DeskEvent::OpenCard(id));

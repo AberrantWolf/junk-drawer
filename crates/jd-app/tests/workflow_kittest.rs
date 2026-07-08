@@ -773,9 +773,21 @@ fn ctrl_d_places_card_on_desk_stays_fleeting() {
     );
 }
 
-/// Ctrl+Enter on focused scrap does NOT open the editor; it fires Promote instead.
+/// Ctrl+Enter on a focused inbox scrap fires Promote — which (since the
+/// promotion task) opens the editor in PROMOTION mode, never as a plain
+/// OpenCard.
+///
+/// Regression notes: the original assertion ("must not open the editor") was
+/// stale after the promotion task, but PASSED whenever the body was already
+/// cached at keypress time: the editor opened AND was closed in the same frame,
+/// because editor_ui consumed the very Ctrl+Enter that opened it (leaving
+/// open_card = None). When the body was NOT cached (CI timing), the editor
+/// opened on the deferred Body event a frame later — keypress long gone —
+/// stayed open, and the stale assertion failed. inbox_ui now consume_key's
+/// Ctrl+Enter so the promotion editor always stays open; this test asserts
+/// that.
 #[test]
-fn ctrl_enter_promotes_not_opens_editor() {
+fn ctrl_enter_opens_promotion_editor_not_plain_open() {
     let (_v, mut h, ids) = app_with_staggered_fleeting();
 
     // Focus the first scrap.
@@ -790,14 +802,114 @@ fn ctrl_enter_promotes_not_opens_editor() {
         "before Ctrl+Enter, no card must be open"
     );
 
+    // Deterministically drive the DEFERRED-open path (the one CI hit): drop
+    // the body cache so the editor opens on the Body event, frames after the
+    // keypress. The desk sibling test covers the warm same-frame path.
+    h.state_mut().state.bodies.invalidate_all();
+
     // Press Ctrl+Enter via key_press_modifiers.
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+    common::pump(
+        &mut h,
+        &mut |a: &jd_app::app::JdUi| a.state.editor.is_some(),
+        200,
+        "promotion editor opens after Ctrl+Enter",
+    );
+
+    // After: the editor is open FOR PROMOTION (not a plain open).
+    assert_eq!(
+        h.state().state.session.open_card,
+        Some(ids[0]),
+        "Ctrl+Enter opens the focused scrap"
+    );
+    assert!(
+        h.state()
+            .state
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.pending_promotion),
+        "the editor must be in promotion mode (pending_promotion)"
+    );
+}
+
+/// Ctrl+Enter on a focused FLEETING card on the DESK also promotes (spec
+/// Appendix A: "Promote scrap (card focus or its editor)" — desk cards can
+/// be fleeting). Sibling of the inbox test above; drives the desk surface.
+#[test]
+fn ctrl_enter_on_desk_fleeting_opens_promotion_editor() {
+    let (_v, mut h, ids) = app_with_fleeting(1);
+    let id = ids[0];
+
+    // Place the fleeting card on the desk, focus it, stay on the DESK surface.
+    {
+        let app = h.state_mut();
+        let desk_id = app.state.session.desks[0].id;
+        let _ = app.state.session.apply(&SessionOp::Place {
+            desk: desk_id,
+            id,
+            pos: Vec2 { x: 300.0, y: 200.0 },
+        });
+        app.state.focus = Some(id);
+        app.state.session.current_surface = Some(SurfaceId::Desk(desk_id));
+    }
     h.run_ok();
 
-    // After: editor must still be closed (Promote fired, not OpenCard).
     assert!(
         h.state().state.session.open_card.is_none(),
-        "Ctrl+Enter must NOT open the editor"
+        "before Ctrl+Enter, no card must be open"
+    );
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_some(),
+        200,
+        "promotion editor opens after Ctrl+Enter on desk fleeting card",
+    );
+
+    assert_eq!(
+        h.state().state.session.open_card,
+        Some(id),
+        "Ctrl+Enter opens the focused desk scrap"
+    );
+    assert!(
+        h.state()
+            .state
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.pending_promotion),
+        "the editor must be in promotion mode (pending_promotion)"
+    );
+}
+
+/// Ctrl+Enter on a focused PERMANENT desk card is a no-op: it must neither
+/// promote (already permanent) nor fall through to plain OpenCard. The
+/// "Ctrl+Enter closes the editor" meaning applies IN-editor only; on card
+/// focus for a permanent card the spec defines no action.
+#[test]
+fn ctrl_enter_on_desk_permanent_is_noop() {
+    let (_v, mut h, note_id, _desk_id) = app_with_permanent_card();
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+    // Give the app a generous number of frames to (incorrectly) react.
+    for _ in 0..20 {
+        h.step();
+    }
+
+    assert!(
+        h.state().state.session.open_card.is_none(),
+        "Ctrl+Enter on a permanent desk card must not open the card"
+    );
+    assert!(
+        h.state().state.editor.is_none(),
+        "Ctrl+Enter on a permanent desk card must not open the editor"
+    );
+    // Still permanent, still in the index.
+    let idx = h.state().vault.index.read().unwrap();
+    assert_eq!(
+        idx.get(note_id).map(|m| m.status),
+        Some(jd_core::note::Status::Permanent),
+        "card must remain permanent"
     );
 }
 

@@ -8,7 +8,7 @@
 //! Focus: linear list order (Up/Down AND Left/Right move linearly).
 //! Keyboard acts:
 //!   Enter       → open editor (same OpenCard path as the desk).
-//!   Ctrl+Enter  → promote path (wired; Task 4 will fill the impl).
+//!   Ctrl+Enter  → promote (opens the editor in promotion mode).
 //!   Del         → Toss (no confirm; journaled via OpDone as usual).
 //!   Ctrl+D      → desk picker popup (place on chosen desk at viewport center;
 //!                  card STAYS fleeting/inboxed — placement only).
@@ -30,7 +30,7 @@ use crate::surfaces::desk::FaceMeta;
 pub enum InboxEvent {
     /// Open the card editor for `id` (Enter / double-click).
     OpenCard(NoteId),
-    /// Promote-without-typing (Ctrl+Enter); Task 4 fills the impl.
+    /// Promote (Ctrl+Enter): opens the editor with pending_promotion set.
     Promote(NoteId),
     /// Toss the card (Del); no confirm, journaled via OpDone.
     Toss(NoteId),
@@ -188,23 +188,15 @@ pub fn inbox_ui(ui: &mut egui::Ui, deps: &mut InboxUiDeps<'_>) -> Vec<InboxEvent
             events.push(InboxEvent::OpenCard(id));
         }
 
-        // Ctrl+Enter → promote (wired; no-op until Task 4)
-        let ctrl_enter = ui.input(|i| {
-            i.events.iter().any(|e| {
-                matches!(
-                    e,
-                    egui::Event::Key {
-                        key: egui::Key::Enter,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if modifiers.command
-                )
-            })
-        });
+        // Ctrl+Enter → promote (opens the editor in promotion mode).
+        // MUST consume_key (not just scan i.events): apply_inbox_events opens
+        // the promotion editor later in this SAME frame, and editor_ui's own
+        // Ctrl+Enter consume_key would otherwise see this same keypress and
+        // instantly close (and commit) the editor it just opened.
+        let ctrl_enter =
+            ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
         if ctrl_enter && let Some(id) = *deps.focus {
             events.push(InboxEvent::Promote(id));
-            // wired in promotion task
         }
 
         // Del → Toss (no confirm)
