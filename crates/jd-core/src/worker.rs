@@ -18,7 +18,7 @@ use crate::time::Timestamp;
 use crate::vault::Vault;
 use crate::vault::io::{atomic_save, filename_for};
 use crate::vault::recovery::{clear_buffer, journal_buffer};
-use crate::vault::scan::{parse_note_file, scan};
+use crate::vault::scan::{QuarantinedFile, parse_note_file, scan};
 use crate::vault::trash::{purge_older_than, restore, trash_note};
 use crate::vault::watcher::{VaultWatcher, WatchEvent};
 
@@ -60,7 +60,9 @@ pub enum VaultEvent {
         total: usize,
     },
     ScanComplete {
-        quarantined_count: usize,
+        /// Files the scan could not read (WP4: the list itself rides the
+        /// event; a count derives via `.len()`).
+        quarantined: Vec<QuarantinedFile>,
     },
     Error {
         context: String,
@@ -234,7 +236,7 @@ fn run_initial_scan(
     }
 
     emit(VaultEvent::ScanComplete {
-        quarantined_count: outcome.quarantined.len(),
+        quarantined: outcome.quarantined,
     });
 }
 

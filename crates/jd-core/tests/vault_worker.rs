@@ -380,6 +380,33 @@ fn scan_progress_is_granular_on_boot() {
     );
 }
 
+/// WP4 Task 3: ScanComplete carries the quarantine list itself (not just a
+/// count) so the app can surface rel_path + reason in Needs Attention.
+#[test]
+fn scan_complete_carries_the_quarantine_list() {
+    let t = TempDir::new();
+    {
+        let v = Vault::open(t.path()).unwrap();
+        std::fs::write(v.root().join("notes/good.md"), "fine\n").unwrap();
+        // Invalid UTF-8 → read fails → quarantined (same shape as vault_scan.rs).
+        std::fs::write(v.root().join("notes/bad.md"), [0xFF, 0xFE, 0x00, 0x01]).unwrap();
+    }
+    let (h, _) = boot(&t);
+    let quarantined = drain_until(&h, |e| match e {
+        VaultEvent::ScanComplete { quarantined } => Some(quarantined.clone()),
+        _ => None,
+    });
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(
+        quarantined[0].rel_path,
+        std::path::Path::new("notes/bad.md")
+    );
+    assert!(
+        !quarantined[0].error.is_empty(),
+        "the quarantine reason must ride the event"
+    );
+}
+
 #[test]
 fn shutdown_is_clean() {
     let t = TempDir::new();

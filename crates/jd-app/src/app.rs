@@ -180,8 +180,11 @@ impl JdUi {
     pub fn drain_events(&mut self) {
         while let Ok(ev) = self.vault.events.try_recv() {
             match ev {
-                VaultEvent::ScanComplete { .. } => {
+                VaultEvent::ScanComplete { quarantined } => {
                     self.state.scan_done = true;
+                    // WP4 Task 3: Needs-Attention plumbing — keep the full list
+                    // (rel_path + reason); each scan replaces it wholesale.
+                    self.state.quarantined = quarantined;
                     self.state.bodies.invalidate_all();
                     // First-run: create a default desk if none exist.
                     if self.state.session.desks.is_empty() {
@@ -454,6 +457,12 @@ impl JdUi {
                 }
                 VaultEvent::Error { context, message } => {
                     self.state.last_error = Some(format!("{context}: {message}"));
+                }
+                // WP4 Task 3: Needs-Attention plumbing. Session-scoped and
+                // deduped (already-known ids fall through to the catch-all);
+                // the conflict copy itself already sits on disk.
+                VaultEvent::Conflict { id, .. } if !self.state.conflicts.contains(&id) => {
+                    self.state.conflicts.push(id);
                 }
                 _ => {}
             }
@@ -2519,6 +2528,96 @@ mod tests {
                 .iter()
                 .any(|d| d.cards.iter().any(|c| c.id == new_id)),
             "orphaned card must be placed on the bootstrap desk"
+        );
+    }
+
+    /// Minimal on-drop-cleaned temp dir for the drain_events test below
+    /// (mirrors jd-core's tests/common; jd-app keeps zero test-only deps).
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn new() -> TestDir {
+            let p = std::env::temp_dir().join(format!(
+                "jd-app-test-{}-{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            TestDir(p)
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// WP4 Task 3: drain_events stores the ScanComplete quarantine list and
+    /// appends+dedups Conflict note ids (Needs-Attention plumbing for Task 4).
+    ///
+    /// Uses a real JdUi over a temp vault, then swaps in a hand-fed event
+    /// channel so we control exactly which VaultEvents drain_events sees.
+    #[test]
+    fn drain_events_tracks_quarantine_and_conflicts() {
+        use jd_core::vault::scan::QuarantinedFile;
+        use std::sync::mpsc;
+
+        let dir = TestDir::new();
+        let mut ui = JdUi::new(&dir.0).unwrap();
+
+        // Replace the worker handle with a hand-built one we feed directly.
+        let (event_tx, event_rx) = mpsc::channel();
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        ui.vault = VaultHandle {
+            commands: cmd_tx,
+            events: event_rx,
+            index: std::sync::Arc::new(std::sync::RwLock::new(jd_core::index::Index::new())),
+        };
+
+        let qfile = QuarantinedFile {
+            rel_path: "notes/bad.md".into(),
+            error: "invalid UTF-8".into(),
+        };
+        event_tx
+            .send(VaultEvent::ScanComplete {
+                quarantined: vec![qfile.clone()],
+            })
+            .unwrap();
+        // Conflict for nid(1) twice (must dedup) and nid(2) once.
+        for n in [1u8, 1, 2] {
+            event_tx
+                .send(VaultEvent::Conflict {
+                    id: nid(n),
+                    conflict_copy: std::path::PathBuf::from("notes/x (conflict).md"),
+                })
+                .unwrap();
+        }
+        ui.drain_events();
+
+        assert_eq!(ui.state.quarantined, vec![qfile], "quarantine list stored");
+        assert_eq!(
+            ui.state.conflicts,
+            vec![nid(1), nid(2)],
+            "conflicts append in arrival order and dedup"
+        );
+
+        // A later rescan replaces the quarantine list wholesale.
+        event_tx
+            .send(VaultEvent::ScanComplete {
+                quarantined: vec![],
+            })
+            .unwrap();
+        ui.drain_events();
+        assert!(
+            ui.state.quarantined.is_empty(),
+            "next ScanComplete replaces the list"
+        );
+        assert_eq!(
+            ui.state.conflicts,
+            vec![nid(1), nid(2)],
+            "conflicts are session-scoped, not cleared by rescan"
         );
     }
 }

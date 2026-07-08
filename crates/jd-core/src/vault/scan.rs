@@ -13,6 +13,9 @@ use crate::time::Timestamp;
 use crate::vault::Vault;
 use crate::vault::io::is_our_tempfile;
 
+/// A file the scan could not read (e.g. invalid UTF-8). Rides
+/// `VaultEvent::ScanComplete` so the UI can surface rel_path + reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuarantinedFile {
     pub rel_path: PathBuf,
     pub error: String,

@@ -169,6 +169,15 @@ pub struct UiState {
     /// palette highlight pulse both read this). Currently defaults to false;
     /// WP6 owns surfacing it as a setting.
     pub reduced_motion: bool,
+    /// WP4 Task 3: files the last scan could not read, from ScanComplete.
+    /// Replaced wholesale on every scan (initial + RescanAll); the count for
+    /// the Needs Attention chip (Task 4) derives via `.len()`.
+    pub quarantined: Vec<jd_core::vault::scan::QuarantinedFile>,
+    /// WP4 Task 3: notes that hit a save conflict this session, appended on
+    /// `VaultEvent::Conflict` and deduped. Session-scoped by design: the list
+    /// is never cleared while the app runs (a per-note clear on the next
+    /// user save is a possible later refinement) and starts empty on launch.
+    pub conflicts: Vec<NoteId>,
     /// WP3 Task 9: orphaned Create OpDone that arrived before ScanComplete.
     /// When pending_create is set and a Create OpDone arrives but no desk exists
     /// yet, the new note's id is buffered here instead of being lost. On
@@ -201,6 +210,8 @@ impl Default for UiState {
             palette: None,
             highlight_pulse: None,
             reduced_motion: false,
+            quarantined: Vec::new(),
+            conflicts: Vec::new(),
             orphaned_create_id: None,
         }
     }
