@@ -489,9 +489,18 @@ pub fn map_ui(ui: &mut egui::Ui, state: &MapState, deps: &mut MapUiDeps<'_>) -> 
     // is a READ and renders regardless.
     // ------------------------------------------------------------------
     let picker_open = crate::surfaces::desk_picker::is_open(ui, map_picker_id());
+    // Stale-slot sweep: the popup slot is only meaningful while its node IS
+    // the current focus. Clear it the moment they diverge (focus moved by
+    // the palette, a delete, anything app-side) so a LATER return of focus
+    // to that node cannot resurrect a popup nobody asked for.
+    if let Some(pid) = ui.memory(|m| m.data.get_temp::<NoteId>(map_popup_for_id()))
+        && Some(pid) != *deps.focus
+    {
+        ui.memory_mut(|m| m.data.remove::<NoteId>(map_popup_for_id()));
+    }
     let node_popup_open = ui
         .memory(|m| m.data.get_temp::<NoteId>(map_popup_for_id()))
-        .is_some_and(|pid| Some(pid) == *deps.focus);
+        .is_some();
     let inputs_blocked = deps.editor_open
         || deps.confirm_pending
         || deps.palette_open
@@ -575,7 +584,13 @@ pub fn map_ui(ui: &mut egui::Ui, state: &MapState, deps: &mut MapUiDeps<'_>) -> 
                 )
             })
         });
-        if shift_f10 && deps.focus.is_some() {
+        // Arm only when the focused node still EXISTS (is in this frame's
+        // metas): a focus id pointing at a deleted note would otherwise
+        // leave the one-shot flag armed with no node to consume it.
+        if shift_f10
+            && let Some(f) = *deps.focus
+            && deps.metas.iter().any(|m| m.id == f)
+        {
             ui.memory_mut(|m| m.data.insert_temp(map_context_menu_open_id(), true));
         }
     }

@@ -509,6 +509,76 @@ fn map_mutations_gated_while_palette_open() {
     assert!(h.state().state.editor.is_none());
 }
 
+/// Shift+F10 on the focused node opens the context menu (anchored Popup):
+/// its items are queryable by label; arrows do NOT move focus while it is
+/// open (the popup is in the gate matrix); Esc closes it — and ONLY it
+/// (focus, surface, and the absence of other overlays all survive).
+#[test]
+fn shift_f10_node_menu_arrows_gated_esc_closes_only_it() {
+    let (_vault, mut h, ids) = app_with_seeds(five_note_fixture());
+    let alpha = ids[2];
+    to_map(&mut h);
+    pump_settled(&mut h);
+
+    h.state_mut().state.focus = Some(alpha);
+    h.run_ok();
+    assert!(
+        h.query_by_label("Toss").is_none(),
+        "no context menu before Shift+F10"
+    );
+
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::F10);
+    h.run_ok();
+    // The menu's items are real, queryable widgets (card_menu_items).
+    let _ = h.get_by_label("Toss");
+    let _ = h.get_by_label("Copy Link");
+    let _ = h.get_by_label("Reveal in File Manager");
+
+    // Arrows must NOT move focus while the popup is open (gate matrix).
+    h.key_press(egui::Key::ArrowDown);
+    h.run_ok();
+    assert_eq!(
+        h.state().state.focus,
+        Some(alpha),
+        "arrow keys must not move focus while the node popup is open"
+    );
+    assert!(
+        h.query_by_label("Toss").is_some(),
+        "the popup must survive the (gated) arrow press"
+    );
+
+    // Esc closes the popup — and only the popup.
+    h.key_press(egui::Key::Escape);
+    h.run_ok();
+    assert!(
+        h.query_by_label("Toss").is_none(),
+        "Esc must close the node popup"
+    );
+    assert_eq!(
+        h.state().state.focus,
+        Some(alpha),
+        "Esc must close ONLY the popup — selection survives"
+    );
+    assert_eq!(
+        h.state().state.session.current_surface,
+        Some(SurfaceId::Map),
+        "still on the map"
+    );
+    assert!(h.state().state.editor.is_none());
+    assert!(h.state().state.palette.is_none());
+
+    // And focus can move again once it is closed (Alpha is mid-order in the
+    // newest-modified traversal, so ArrowDown lands somewhere else).
+    h.key_press(egui::Key::ArrowDown);
+    h.run_ok();
+    assert_ne!(
+        h.state().state.focus,
+        Some(alpha),
+        "traversal must work again after the popup closes"
+    );
+    assert_ne!(h.state().state.focus, None);
+}
+
 /// Orphans (degree 0) sit on a ring OUTSIDE the settled cluster: farther
 /// from the cluster centroid than any linked node.
 #[test]
@@ -556,4 +626,200 @@ fn map_orphans_ringed_outside_cluster() {
             "orphan {id} at ring distance {d} must exceed the cluster's max radius {max_linked}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// M5 scenario (spec §14: "The Map") — the whole story in one test.
+// ---------------------------------------------------------------------------
+
+/// 8 notes, two link-clusters + 1 orphan:
+///   cluster 1: Alpha (hub, degree 3) → Beta, Gamma, Delta
+///   cluster 2: Zeta (degree 2) ← Epsilon, Eta
+///   orphan:    Omega
+fn m5_fixture() -> Vec<(NewNote, Dest)> {
+    vec![
+        permanent("Beta", "cluster one"),
+        permanent("Gamma", "cluster one"),
+        permanent("Delta", "cluster one"),
+        permanent("Alpha", "the hub: [[Beta]] [[Gamma]] [[Delta]]"),
+        permanent("Zeta", "cluster two center"),
+        permanent("Epsilon", "see [[Zeta]]"),
+        permanent("Eta", "see [[Zeta]]"),
+        permanent("Omega", "the orphan"),
+    ]
+}
+
+/// M5 end to end: map settles → select the hub (highest degree) → mini panel
+/// → Ctrl+D to a desk (journaled Place) → restart → cached positions bitwise
+/// identical → a NEW note linked into cluster 1 eases in near its neighbor
+/// while the bulk stays hard-frozen → the orphan sits on the ring.
+#[test]
+fn m5_scenario_settle_select_place_restart_newcomer_orphan() {
+    let vault = common::temp_vault();
+    let cache_path = vault.path().join(".junkdrawer").join("map.jd");
+
+    // ---- Session 1: settle, select the hub, take it to a desk. ----
+    let ids = {
+        let (mut h, ids) = harness_over(&vault, m5_fixture());
+        let alpha = ids[3];
+        to_map(&mut h);
+        pump_settled(&mut h);
+
+        // The hub is the highest-degree node — and it is Alpha (degree 3).
+        let hub = *h
+            .state()
+            .map
+            .as_ref()
+            .unwrap()
+            .degrees
+            .iter()
+            .max_by_key(|(_, d)| **d)
+            .expect("degrees nonempty")
+            .0;
+        assert_eq!(hub, alpha, "Alpha (degree 3) is the unique hub");
+
+        // Select it; the mini panel shows it.
+        h.get_by_label("Map node: 'Alpha'").click();
+        h.run_ok();
+        assert_eq!(h.state().state.focus, Some(alpha));
+        assert!(
+            h.query_by_label_contains("Card: 'Alpha'").is_some(),
+            "mini panel must show the selected hub"
+        );
+
+        // Ctrl+D → shared desk picker → Enter → journaled Place.
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
+        h.run_ok();
+        assert_eq!(
+            h.query_all_by_label("Desk: Desk").count(),
+            2,
+            "desk picker must open (rail row + picker row)"
+        );
+        h.key_press(egui::Key::Enter);
+        h.run_ok();
+        assert!(
+            h.state().state.session.desks[0]
+                .cards
+                .iter()
+                .any(|c| c.id == alpha),
+            "hub must land on the desk"
+        );
+        assert_eq!(
+            h.state().state.journal.undo_label(),
+            Some("Place card"),
+            "take-to-desk must be the journaled 'Place card'"
+        );
+
+        common::pump(
+            &mut h,
+            &mut |_: &JdUi| cache_path.exists(),
+            1000,
+            "map cache debounce save",
+        );
+        ids
+    };
+    let alpha = ids[3];
+    let omega = ids[7];
+    let saved = MapCache::load(&Vault::open(vault.path()).unwrap());
+    assert_eq!(
+        saved.len(),
+        7,
+        "the 7 linked nodes are cached, Omega is not"
+    );
+
+    // ---- Session 2: restart — cached positions are bitwise identical. ----
+    let (mut h, _none) = harness_over(&vault, vec![]);
+    to_map(&mut h);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.map.is_some(),
+        200,
+        "map build on restart",
+    );
+    h.run_ok();
+    {
+        let map = h.state().map.as_ref().unwrap();
+        assert!(map.layout.is_settled(), "fully-cached map is born settled");
+        for (id, saved_pos) in &saved {
+            assert_eq!(
+                map.layout.positions().get(id),
+                Some(saved_pos),
+                "restarted position must be BITWISE identical to the cache for {id}"
+            );
+        }
+    }
+
+    // ---- New note linked into cluster 1, created via the worker while the
+    //      map is live: add_node eases it in near its neighbor. ----
+    h.state_mut()
+        .vault
+        .commands
+        .send(VaultCommand::Op {
+            op: VaultOp::Create {
+                seed: common::new_note("Theta", "joins cluster one: [[Alpha]]"),
+                dest: Dest::Notes,
+            },
+            source: OpSource::User,
+        })
+        .unwrap();
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.map.as_ref().is_some_and(|m| m.nodes.len() == 9),
+        1000,
+        "created note joins the live map",
+    );
+    let theta = *h
+        .state()
+        .map
+        .as_ref()
+        .unwrap()
+        .nodes
+        .iter()
+        .find(|id| !ids.contains(id))
+        .expect("the newcomer is the one unknown node");
+    pump_settled(&mut h);
+
+    let map = h.state().map.as_ref().unwrap();
+    let positions = map.layout.positions();
+    let theta_pos = positions[&theta];
+    let alpha_pos = positions[&alpha];
+    assert!(
+        dist(theta_pos, alpha_pos) < 2.0 * jd_core::maplayout::REST_LENGTH,
+        "newcomer must ease in NEAR its neighbor (got {} px, limit {})",
+        dist(theta_pos, alpha_pos),
+        2.0 * jd_core::maplayout::REST_LENGTH
+    );
+    // Bulk unmoved: add_node's reheat is newcomer-only, the cached nodes
+    // (Alpha, the direct neighbor, included) stay HARD-frozen — bitwise.
+    for (id, saved_pos) in &saved {
+        assert_eq!(
+            positions.get(id),
+            Some(saved_pos),
+            "cached node {id} must stay bitwise put through the newcomer's ease-in"
+        );
+    }
+
+    // ---- The orphan sits on the ring, outside the whole linked field. ----
+    assert_eq!(map.orphans, vec![omega], "Omega is the one orphan");
+    let centroid = {
+        let mut c = Vec2::default();
+        let n = positions.len() as f32;
+        for p in positions.values() {
+            c.x += p.x / n;
+            c.y += p.y / n;
+        }
+        c
+    };
+    let max_linked = positions
+        .values()
+        .map(|p| dist(*p, centroid))
+        .fold(0.0f32, f32::max);
+    let ring = jd_app::surfaces::map::orphan_ring_positions(positions, &map.orphans);
+    assert_eq!(ring.len(), 1);
+    assert!(
+        dist(ring[0].1, centroid) > max_linked,
+        "orphan ring distance {} must exceed the cluster max radius {}",
+        dist(ring[0].1, centroid),
+        max_linked
+    );
 }
