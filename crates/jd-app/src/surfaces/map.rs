@@ -142,16 +142,50 @@ impl MapState {
             .copied()
             .partition(|id| degrees.get(id).copied().unwrap_or(0) > 0);
 
-        let mut layout = ForceLayout::new(&linked, &edges, &pinned, LayoutParams::default());
-
-        // Stable across sessions: when EVERY linked node has a cached
-        // position, the map is born settled. One zero-dt step moves nothing
-        // (max displacement 0 < settle_eps) and trips the layout's settle
-        // path, freezing it — a later add_node then does its proper LOCAL
-        // reheat instead of waking the whole (still-hot) graph.
-        if !linked.is_empty() && linked.iter().all(|id| pinned.contains_key(id)) {
-            layout.step(0.0);
-        }
+        // Stable across sessions: whenever ANY linked node has a cached
+        // position, build the layout from the CACHED nodes (+ the edges among
+        // them) only, freeze it with one zero-dt step (max displacement 0 <
+        // settle_eps trips the layout's settle path), then `add_node` each
+        // uncached newcomer in sorted order. add_node's reheat is LOCAL, so
+        // the cached bulk stays hard-frozen while newcomers ease in near
+        // their neighbor centroids — versus the old whole-graph rebuild,
+        // where ONE newcomer gave EVERY node INITIAL_TEMPERATURE (measured
+        // bulk drift mean 22.1 px / max 77.6 px on a 60-node graph, vs
+        // 0.04 px mean with this path). add_node silently drops edges to
+        // not-yet-present ids, but sorted insertion covers every
+        // newcomer↔newcomer edge: each pair (A, B) is wired when the LATER
+        // of the two is added, since its neighbor list includes the earlier.
+        let cached: Vec<NoteId> = linked
+            .iter()
+            .copied()
+            .filter(|id| pinned.contains_key(id))
+            .collect();
+        let layout = if cached.is_empty() {
+            // No usable cache (first session / fully stale): cold build,
+            // everything at INITIAL_TEMPERATURE.
+            ForceLayout::new(&linked, &edges, &pinned, LayoutParams::default())
+        } else {
+            let cached_set: HashSet<NoteId> = cached.iter().copied().collect();
+            let cached_edges: Vec<(NoteId, NoteId)> = edges
+                .iter()
+                .copied()
+                .filter(|(a, b)| cached_set.contains(a) && cached_set.contains(b))
+                .collect();
+            let mut layout =
+                ForceLayout::new(&cached, &cached_edges, &pinned, LayoutParams::default());
+            layout.step(0.0); // freeze the cached bulk (born settled)
+            let mut adj: HashMap<NoteId, Vec<NoteId>> = HashMap::new();
+            for (a, b) in &edges {
+                adj.entry(*a).or_default().push(*b);
+                adj.entry(*b).or_default().push(*a);
+            }
+            // Sorted order (`linked` is sorted; filter preserves order).
+            for id in linked.iter().filter(|id| !cached_set.contains(*id)) {
+                let ns = adj.get(id).map(Vec::as_slice).unwrap_or(&[]);
+                layout.add_node(*id, ns);
+            }
+            layout
+        };
         let settled = layout.is_settled();
 
         // Zoom-to-fit on first build (per-session orientation; camera is not
@@ -192,8 +226,12 @@ impl MapState {
             return;
         }
         // Resolved neighbors in BOTH directions, restricted to nodes already
-        // in the layout (add_node ignores unknown ids; orphan neighbors will
-        // wire up when THEY get re-indexed).
+        // in the layout (add_node ignores unknown ids). KNOWN GAP (Task 3+
+        // scope): a new note linked only to orphans is classified an orphan
+        // here and the edge is LOST for this session — when the orphan
+        // neighbor later re-indexes, its event hits the known-id guard above
+        // and returns, so nothing re-wires. The next full rebuild
+        // (MapState::build) heals it.
         let mut neighbors: std::collections::BTreeSet<NoteId> = std::collections::BTreeSet::new();
         for (_, resolved) in idx.outlinks(id) {
             if let Some(t) = resolved
@@ -219,6 +257,10 @@ impl MapState {
             }
             self.degrees.insert(id, ns.len());
             self.settled = false;
+            // Disarm any pending debounced save: positions are about to
+            // ease, and flushing a mid-ease snapshot would cache transient
+            // positions. Re-armed by the next settle transition in app.rs.
+            self.cache_dirty_at = None;
         }
         self.nodes.push(id);
         self.known.insert(id);
@@ -244,8 +286,13 @@ pub fn orphan_ring_positions(
 ) -> Vec<(NoteId, Vec2)> {
     let mut centroid = Vec2::default();
     if !positions.is_empty() {
+        // Sum in sorted-id order: float addition is not associative, so
+        // iterating the HashMap directly would make the centroid (and thus
+        // the ring) sub-pixel nondeterministic across runs.
+        let mut sorted: Vec<(&NoteId, &Vec2)> = positions.iter().collect();
+        sorted.sort_unstable_by_key(|(id, _)| **id);
         let n = positions.len() as f32;
-        for p in positions.values() {
+        for (_, p) in sorted {
             centroid.x += p.x / n;
             centroid.y += p.y / n;
         }

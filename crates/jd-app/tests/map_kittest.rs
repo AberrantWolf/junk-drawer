@@ -228,6 +228,64 @@ fn map_restart_loads_saved_positions() {
     }
 }
 
+/// Restart with ONE extra linked note in the vault: the cached nodes stay
+/// put (< 2px each, loaded vs post-build) while the newcomer joins the
+/// layout locally — a partial cache must NOT re-cook the whole map.
+#[test]
+fn map_restart_with_newcomer_keeps_cached_nodes_put() {
+    let vault = common::temp_vault();
+    let cache_path = vault.path().join(".junkdrawer").join("map.jd");
+    {
+        let (mut h, _ids) = harness_over(&vault, five_note_fixture());
+        to_map(&mut h);
+        pump_settled(&mut h);
+        common::pump(
+            &mut h,
+            &mut |_: &JdUi| cache_path.exists(),
+            1000,
+            "map cache debounce save",
+        );
+    }
+    let saved = MapCache::load(&Vault::open(vault.path()).unwrap());
+    assert_eq!(saved.len(), 3, "cache holds the 3 linked nodes");
+
+    // Restart: fresh JdUi over the same vault, with ONE extra linked note.
+    let (mut h, new_ids) = harness_over(&vault, vec![permanent("Zeta", "links to [[Alpha]]")]);
+    let zeta = new_ids[0];
+    to_map(&mut h);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.map.is_some(),
+        200,
+        "map build on restart",
+    );
+    pump_settled(&mut h);
+    let _ = h.get_by_label("Map node: 'Zeta'"); // newcomer rendered
+    let map = h.state().map.as_ref().unwrap();
+    assert!(
+        map.layout.positions().contains_key(&zeta),
+        "newcomer must join the layout (it is linked, not an orphan)"
+    );
+    let (mut sum, mut max_drift) = (0.0f32, 0.0f32);
+    for (id, saved_pos) in &saved {
+        let now = map.layout.positions().get(id).copied().unwrap_or_else(|| {
+            panic!("cached node {id} missing from restarted layout");
+        });
+        let d = dist(*saved_pos, now);
+        sum += d;
+        max_drift = max_drift.max(d);
+        assert!(
+            d < 2.0,
+            "cached node {id} drifted {d} px (>= 2 px) after partial-cache rebuild"
+        );
+    }
+    println!(
+        "cached-node drift (loaded vs post-build+settle): mean {:.4} px, max {:.4} px",
+        sum / saved.len() as f32,
+        max_drift
+    );
+}
+
 /// Orphans (degree 0) sit on a ring OUTSIDE the settled cluster: farther
 /// from the cluster centroid than any linked node.
 #[test]

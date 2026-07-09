@@ -49,14 +49,16 @@ const INITIAL_TEMPERATURE: f32 = 240.0;
 const COOLING: f32 = 0.995;
 
 /// `add_node` reheat is LOCAL: only the newcomer's per-node temperature is
-/// raised to this. The frozen bulk stays hard-frozen (temperature 0 — the
-/// forces at the frozen positions still saturate, so any nonzero cap would
-/// let the whole graph creep), and the newcomer's direct neighbors get the
-/// temperature floor (`settle_eps / 2`) so they can flex to make room.
-/// Measured on the 1k/2k bench graph (settle, add one linked node): bulk
-/// mean drift 0.009 px, max 9.2 px (a direct neighbor), resettle in 75
-/// steps — versus mean 29.5 px / max 290 px / 957 steps of visible bulk
-/// motion when the reheat was global.
+/// raised to this. EVERY existing node — direct neighbors included — stays
+/// hard-frozen (temperature 0): the forces at the frozen positions still
+/// saturate, so any nonzero cap lets nodes creep. Neighbors used to get the
+/// temperature floor (`settle_eps / 2`) "to flex", but the floor never
+/// decays to zero, so a direct neighbor accrued unbounded drift over the
+/// newcomer's ease-in (measured 7.7 px on a 5-node graph, 9.2 px on the 1k
+/// bench) — breaking the WP5 "stable across sessions" bound (< 2 px per
+/// cached node). Frozen neighbors give exact 0 px drift; only the newcomer
+/// moves. (Global reheat, for scale: mean 29.5 px / max 290 px of bulk
+/// motion on the 1k/2k bench.)
 const REHEAT_TEMPERATURE: f32 = 60.0;
 
 /// Placement jitter half-range (px) around a neighbor centroid.
@@ -395,22 +397,17 @@ impl ForceLayout {
                 }
             }
         }
-        // LOCAL reheat (see REHEAT docs). Waking a FROZEN layout: the bulk
-        // stays hard-frozen (temperature 0), direct neighbors get the floor
-        // so they can flex a hair to make room, and everything starts cold
-        // (defense in depth alongside the zeroing at settle: a reheat must
-        // release no stored energy). A still-running layout keeps its
-        // temperatures and momentum. Either way the newcomer gets at least
+        // LOCAL reheat (see REHEAT docs). Waking a FROZEN layout: every
+        // existing node — direct neighbors included — stays hard-frozen
+        // (temperature 0; a floored neighbor would creep unboundedly, see
+        // REHEAT docs), and everything starts cold (defense in depth
+        // alongside the zeroing at settle: a reheat must release no stored
+        // energy). A still-running layout keeps its temperatures and
+        // momentum. Either way the newcomer gets at least
         // REHEAT_TEMPERATURE to ease in.
         if self.settled {
             self.temperature.fill(0.0);
             self.vel.fill((0.0, 0.0));
-            let floor = self.params.settle_eps * 0.5;
-            for e in edges {
-                if let Some(&j) = self.index_of.get(e) {
-                    self.temperature[j] = floor;
-                }
-            }
         }
         self.temperature[i] = self.temperature[i].max(REHEAT_TEMPERATURE);
         self.settled = false;
