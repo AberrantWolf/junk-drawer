@@ -48,8 +48,15 @@ const MAX_SPEED: f32 = 4000.0;
 const INITIAL_TEMPERATURE: f32 = 240.0;
 const COOLING: f32 = 0.995;
 
-/// `add_node` reheats to at least this so newcomers can ease in without
-/// unfreezing the whole map violently.
+/// `add_node` reheat is LOCAL: only the newcomer's per-node temperature is
+/// raised to this. The frozen bulk stays hard-frozen (temperature 0 — the
+/// forces at the frozen positions still saturate, so any nonzero cap would
+/// let the whole graph creep), and the newcomer's direct neighbors get the
+/// temperature floor (`settle_eps / 2`) so they can flex to make room.
+/// Measured on the 1k/2k bench graph (settle, add one linked node): bulk
+/// mean drift 0.009 px, max 9.2 px (a direct neighbor), resettle in 75
+/// steps — versus mean 29.5 px / max 290 px / 957 steps of visible bulk
+/// motion when the reheat was global.
 const REHEAT_TEMPERATURE: f32 = 60.0;
 
 /// Placement jitter half-range (px) around a neighbor centroid.
@@ -105,11 +112,16 @@ pub struct ForceLayout {
     /// Mirror of `pos` keyed by id, kept in sync for `positions()`.
     positions: HashMap<NoteId, Vec2>,
     settled: bool,
-    /// Fruchterman-Reingold-style cooling: per-step node displacement is
-    /// clamped to this temperature, which decays geometrically. Guarantees
+    /// Fruchterman-Reingold-style cooling, PER NODE (parallel to `ids`):
+    /// each node's per-step displacement is clamped to its temperature,
+    /// which decays geometrically to a floor of `settle_eps / 2`. Guarantees
     /// termination even when spring forces permanently saturate the speed
-    /// clamp (bang-bang oscillation around a minimum never settles otherwise).
-    temperature: f32,
+    /// clamp (bang-bang oscillation around a minimum never settles
+    /// otherwise). Note the temperature, not the speed clamp, governs the
+    /// motion after ~256 steps (240 · 0.995^k < MAX_SPEED·dt ≈ 66.7 at
+    /// k ≈ 256). Per-node (rather than global) so `add_node` can reheat
+    /// just the newcomer while the settled bulk stays at the floor.
+    temperature: Vec<f32>,
     /// Deterministic counter for spiral placement of orphans.
     spiral_count: u64,
 }
@@ -201,7 +213,7 @@ impl ForceLayout {
             edges: es,
             positions,
             settled: n == 0,
-            temperature: INITIAL_TEMPERATURE,
+            temperature: vec![INITIAL_TEMPERATURE; n],
             spiral_count,
         }
     }
@@ -300,20 +312,32 @@ impl ForceLayout {
             }
             self.vel[i] = (vx, vy);
             let (mut sx, mut sy) = (vx * dt, vy * dt);
-            // Temperature clamp (see field docs): bounds each node's step.
+            // Per-node temperature clamp (see field docs): bounds this
+            // node's step, then decays toward the floor.
+            let t = self.temperature[i];
             let step2 = sx * sx + sy * sy;
-            if step2 > self.temperature * self.temperature {
-                let k = self.temperature / step2.sqrt();
+            if step2 > t * t {
+                let k = t / step2.sqrt();
                 sx *= k;
                 sy *= k;
+            }
+            // Decay toward the floor; a hard-frozen node (t == 0, set by the
+            // local reheat in `add_node`) stays frozen — max() must not lift
+            // it back to the floor.
+            if t > 0.0 {
+                self.temperature[i] = (t * COOLING).max(self.params.settle_eps * 0.5);
             }
             self.pos[i].x += sx;
             self.pos[i].y += sy;
             max_disp = max_disp.max((sx * sx + sy * sy).sqrt());
         }
-        self.temperature = (self.temperature * COOLING).max(self.params.settle_eps * 0.5);
         if max_disp < self.params.settle_eps {
             self.settled = true;
+            // A frozen layout carries no energy: velocities integrated
+            // forces UNCLAMPED while the temperature capped visible motion,
+            // so without this a later reheat would release the stored
+            // momentum as a bulk lurch.
+            self.vel.fill((0.0, 0.0));
         }
         for (id, p) in self.ids.iter().zip(self.pos.iter()) {
             self.positions.insert(*id, *p);
@@ -357,6 +381,7 @@ impl ForceLayout {
             self.ids.push(id);
             self.pos.push(p);
             self.vel.push((0.0, 0.0));
+            self.temperature.push(REHEAT_TEMPERATURE);
             self.positions.insert(id, p);
         }
         let i = self.index_of[&id];
@@ -370,9 +395,25 @@ impl ForceLayout {
                 }
             }
         }
+        // LOCAL reheat (see REHEAT docs). Waking a FROZEN layout: the bulk
+        // stays hard-frozen (temperature 0), direct neighbors get the floor
+        // so they can flex a hair to make room, and everything starts cold
+        // (defense in depth alongside the zeroing at settle: a reheat must
+        // release no stored energy). A still-running layout keeps its
+        // temperatures and momentum. Either way the newcomer gets at least
+        // REHEAT_TEMPERATURE to ease in.
+        if self.settled {
+            self.temperature.fill(0.0);
+            self.vel.fill((0.0, 0.0));
+            let floor = self.params.settle_eps * 0.5;
+            for e in edges {
+                if let Some(&j) = self.index_of.get(e) {
+                    self.temperature[j] = floor;
+                }
+            }
+        }
+        self.temperature[i] = self.temperature[i].max(REHEAT_TEMPERATURE);
         self.settled = false;
-        // Reheat just enough for the newcomer to ease in (see REHEAT docs).
-        self.temperature = self.temperature.max(REHEAT_TEMPERATURE);
     }
 }
 

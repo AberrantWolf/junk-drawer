@@ -53,6 +53,57 @@ fn one_step_at_twenty_k_under_sixteen_ms() {
     );
 }
 
+/// Regression (WP5 review): `add_node` on a settled layout must be a LOCAL
+/// event — frozen layouts carry no stored energy, and the reheat touches
+/// only the newcomer (and its direct neighbors, at the temperature floor).
+/// Before the fix, unclamped settle-time velocities plus a global reheat
+/// moved the bulk up to 290 px (mean 29.5 px) over ~957 steps of visible
+/// motion. Bounds carry margin over the measured post-fix numbers (bulk
+/// mean 0.009 px, max 9.2 px, resettle 75 steps on the 1k graph).
+#[test]
+fn add_node_reheat_leaves_bulk_frozen() {
+    let (ids, edges) = synthetic_graph(200, 400, 0x4D41_5052); // "MAPR"
+    let mut layout = ForceLayout::new(&ids, &edges, &HashMap::new(), LayoutParams::default());
+    for _ in 0..20_000 {
+        layout.step(1.0 / 60.0);
+        if layout.is_settled() {
+            break;
+        }
+    }
+    assert!(layout.is_settled(), "graph must settle before the probe");
+    let frozen = layout.positions().clone();
+
+    layout.add_node(nid(999_999), &[nid(0)]);
+    let mut resettle = None;
+    for i in 0..400 {
+        layout.step(1.0 / 60.0);
+        if layout.is_settled() {
+            resettle = Some(i + 1);
+            break;
+        }
+    }
+    let resettle = resettle.expect("reheat must resettle within 400 steps");
+    assert!(
+        resettle <= 200,
+        "resettle took {resettle} steps (bound 200)"
+    );
+
+    let cur = layout.positions();
+    let (mut max_drift, mut sum) = (0.0f32, 0.0f64);
+    for id in &ids {
+        let (a, b) = (frozen[id], cur[id]);
+        let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
+        max_drift = max_drift.max(d);
+        sum += d as f64;
+    }
+    let mean = sum / ids.len() as f64;
+    assert!(mean < 2.0, "bulk mean drift {mean:.3} px (bound 2.0)");
+    assert!(
+        max_drift < 20.0,
+        "bulk max drift {max_drift:.2} px (bound 20.0)"
+    );
+}
+
 /// Non-gated sanity: a 1k-node graph actually settles (the map freezes).
 #[test]
 fn one_k_graph_settles() {
