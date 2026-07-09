@@ -21,12 +21,18 @@
 //! the map recenters via zoom-to-fit on first build each session (cheap and
 //! always orienting).
 //!
-//! Gate matrix note for Task 3 (interactions): this task renders only — the
-//! sole input is camera pan/zoom, which is never journaled and (matching the
-//! desk's gate matrix, where scroll pan/zoom is ungated) runs regardless of
-//! palette/editor/confirm. Any FUTURE mouse mutation (click-select, Ctrl+D
-//! take-to-desk, context menus) must be gated on palette_open + editor_open +
-//! confirm_pending from day one, exactly like the desk's card paths.
+//! Gate matrix (Task 3, the desk's uniform matrix): EVERY mutation —
+//! click-select (a mutation of focus/selection), keyboard traversal, Enter
+//! open, Ctrl+D take-to-desk, Shift+F10 context menu — is gated on
+//! palette_open + editor_open + confirm_pending + the map's own popups
+//! (desk picker, node context menu). Camera pan/zoom is never journaled and
+//! (matching the desk, where scroll pan/zoom is ungated) runs regardless.
+//! The palette-dim highlight is a READ and is exempt from the gates.
+//!
+//! EQUIVALENCE RULE (hard): the map is a LENS, never the only path — every
+//! interaction here mirrors a canonical one (click/Enter/Ctrl+D/Shift+F10 =
+//! the Drawer's; the Ctrl+K dim = the palette's own result list). Nothing is
+//! learnable or doable ONLY from the map.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -37,11 +43,16 @@ use jd_core::id::NoteId;
 use jd_core::index::Index;
 use jd_core::maplayout::{ForceLayout, LayoutParams};
 use jd_core::note::{Kind, Status};
+use jd_core::session::SessionState;
 
+use crate::card::shape::{CardStyle, RuledLines, card_size, shape_for};
+// The Drawer's mini pattern: card_face at 0.6 scale (the corner panel is the
+// same widget the drawer grid uses).
+use crate::surfaces::drawer::MINI_SCALE;
 // DeskCamera is pure world↔screen math with no desk state — shared, not moved,
 // so the desk keeps its own module-local usage untouched.
 pub use crate::surfaces::desk::DeskCamera;
-use crate::surfaces::desk::{ZOOM_MAX, ZOOM_MIN};
+use crate::surfaces::desk::{FaceMeta, ZOOM_MAX, ZOOM_MIN};
 
 // ---------------------------------------------------------------------------
 // Tuning constants
@@ -71,6 +82,13 @@ pub const DIVIDER_R_BONUS: f32 = 2.0;
 
 /// Minimum on-screen radius so far-out zooms keep dots visible/hoverable.
 const SCREEN_R_MIN: f32 = 2.0;
+
+/// Non-matching nodes render at this alpha while the palette is open on the
+/// map (palette hits stay full-opacity; clears when the palette closes).
+pub const DIM_ALPHA: f32 = 0.25;
+
+/// Corner margin for the selected-node mini card panel.
+const MINI_PANEL_MARGIN: f32 = 16.0;
 
 pub fn node_radius(degree: usize, is_divider: bool) -> f32 {
     let r = (4.0 + 2.0 * (degree as f32).sqrt()).clamp(NODE_R_MIN, NODE_R_MAX);
@@ -105,6 +123,13 @@ pub struct MapState {
     pub camera: DeskCamera,
     /// Ease-in clocks for nodes added while the map exists (render-only).
     pub appeared: HashMap<NoteId, Instant>,
+    /// Palette-on-map dim highlight (the testable seam): `Some(set)` while
+    /// the palette is open on the map with a non-empty query — nodes in the
+    /// set render at DIM_ALPHA, palette hits stay lit. `None` (no dimming)
+    /// when the palette is closed or its query is still empty. Recomputed
+    /// each frame in app.rs from `dimmed_node_ids` (pure); render-only,
+    /// exempt from the mutation gates (it is a READ).
+    pub dimmed: Option<HashSet<NoteId>>,
 }
 
 impl MapState {
@@ -212,6 +237,7 @@ impl MapState {
             cache_dirty_at: None,
             camera,
             appeared: HashMap::new(),
+            dimmed: None,
         }
     }
 
@@ -337,6 +363,45 @@ fn orphan_angle(id: &NoteId) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Palette-dim highlight — pure (the kittests' testable seam)
+// ---------------------------------------------------------------------------
+
+/// The dim set for the palette-on-map highlight: every map node NOT in the
+/// palette's current results. Pure — ids in, dim flags out; the render just
+/// applies it (DIM_ALPHA for members, full opacity otherwise). Result ids
+/// that aren't map nodes are ignored. No results → everything dims (the
+/// query matched nothing).
+pub fn dimmed_node_ids(nodes: &[NoteId], palette_result_ids: &[NoteId]) -> HashSet<NoteId> {
+    let lit: HashSet<NoteId> = palette_result_ids.iter().copied().collect();
+    nodes
+        .iter()
+        .copied()
+        .filter(|id| !lit.contains(id))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// egui memory keys (popup state, the drawer/desk idiom)
+// ---------------------------------------------------------------------------
+
+/// Desk-picker state key (shared component, one picker per surface).
+fn map_picker_id() -> egui::Id {
+    egui::Id::new("map_desk_picker")
+}
+
+/// Shift+F10 "open context menu on the selected node" one-shot flag.
+pub fn map_context_menu_open_id() -> egui::Id {
+    egui::Id::new("map_node_context_menu_open")
+}
+
+/// The node whose context popup is open — ONE slot holding the NoteId, so a
+/// focus move implicitly closes it (no per-node stale flags to sweep, which
+/// matters at map scale).
+fn map_popup_for_id() -> egui::Id {
+    egui::Id::new("map_node_popup_for")
+}
+
+// ---------------------------------------------------------------------------
 // Per-node metadata (prefetched in app.rs under the frame's ONE read lock)
 // ---------------------------------------------------------------------------
 
@@ -352,6 +417,25 @@ pub struct MapUiDeps<'a> {
     pub theme: &'a crate::theme::Theme,
     /// Prefetched in `nodes` order (notes deleted since build simply drop out).
     pub metas: &'a [MapNodeMeta],
+    /// Selection = the app-wide focus (view state, like the drawer's).
+    pub focus: &'a mut Option<NoteId>,
+    /// Keyboard traversal order: newest-modified first (Drawer parity),
+    /// prefetched in app.rs under the same index read lock as `metas`.
+    pub ordered_ids: &'a [NoteId],
+    /// FaceMeta for the selected node (mini panel + context-menu enablement),
+    /// prefetched under the same lock. None → no node selected.
+    pub selected_meta: Option<&'a FaceMeta>,
+    /// Top tags (≤2, "#tag") of the selected node, for the mini panel.
+    pub selected_tags: &'a [String],
+    /// Body cache for the mini panel's card_face (the drawer idiom).
+    pub bodies: &'a mut crate::state::BodyCache,
+    pub commands: &'a std::sync::mpsc::Sender<jd_core::worker::VaultCommand>,
+    pub line_cache: &'a mut crate::editor::LineCache,
+    /// Current session — desk picker rows + the context menu's desk submenu.
+    pub session: &'a SessionState,
+    pub editor_open: bool,
+    pub confirm_pending: bool,
+    pub palette_open: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +449,17 @@ pub enum MapEvent {
     /// Camera moved/zoomed — NOT journaled, NOT persisted; app.rs writes it
     /// back onto MapState.
     ViewportMoved { cam: DeskCamera },
+    /// Enter on the focused node — the existing surface-agnostic open path.
+    OpenCard(NoteId),
+    /// Ctrl+D → desk picker pick: place at that desk's viewport center (the
+    /// journaled "Place card", same as the Drawer).
+    PlaceOnDesk {
+        id: NoteId,
+        desk: jd_core::session::DeskId,
+    },
+    /// Shift+F10 context menu action on the selected node (card_menu_items
+    /// is surface-agnostic; on_desk = false here).
+    CardMenu(crate::menus::CardMenuEvent),
 }
 
 // ---------------------------------------------------------------------------
@@ -381,10 +476,109 @@ pub enum MapEvent {
 /// already WCAG-checked ≥3:1 against desk_bg (see theme.rs), so even the
 /// light fills (divider_tab_bg) keep a compliant boundary — same discipline
 /// as card outlines. Edges are thin card_border lines beneath the nodes.
-pub fn map_ui(ui: &mut egui::Ui, state: &MapState, deps: &MapUiDeps<'_>) -> Vec<MapEvent> {
+pub fn map_ui(ui: &mut egui::Ui, state: &MapState, deps: &mut MapUiDeps<'_>) -> Vec<MapEvent> {
     let mut events: Vec<MapEvent> = Vec::new();
     let panel = ui.max_rect();
     let mut cam = state.camera;
+
+    // ------------------------------------------------------------------
+    // Gate matrix (the desk's uniform matrix, day one): every mutation —
+    // keyboard AND mouse (click-select mutates focus) — is blocked while
+    // the palette / editor / confirm modal / our own popups are up. Camera
+    // pan/zoom below stays ungated (desk parity); the palette-dim highlight
+    // is a READ and renders regardless.
+    // ------------------------------------------------------------------
+    let picker_open = crate::surfaces::desk_picker::is_open(ui, map_picker_id());
+    let node_popup_open = ui
+        .memory(|m| m.data.get_temp::<NoteId>(map_popup_for_id()))
+        .is_some_and(|pid| Some(pid) == *deps.focus);
+    let inputs_blocked = deps.editor_open
+        || deps.confirm_pending
+        || deps.palette_open
+        || picker_open
+        || node_popup_open;
+
+    // ------------------------------------------------------------------
+    // Keyboard (Drawer parity — the map is a lens over the same cards):
+    // linear focus traversal newest-modified first, Enter opens in place,
+    // Ctrl+D → shared desk picker, Shift+F10 → context menu.
+    // ------------------------------------------------------------------
+    let ids = deps.ordered_ids;
+    if !inputs_blocked {
+        let go_prev =
+            ui.input(|i| i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowLeft));
+        let go_next = ui
+            .input(|i| i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowRight));
+        if go_prev || go_next {
+            let current_idx = deps.focus.and_then(|f| ids.iter().position(|id| *id == f));
+            let next_idx = if go_next {
+                match current_idx {
+                    None if !ids.is_empty() => Some(0),
+                    Some(i) if i + 1 < ids.len() => Some(i + 1),
+                    _ => None,
+                }
+            } else {
+                match current_idx {
+                    None if !ids.is_empty() => Some(ids.len() - 1),
+                    Some(i) if i > 0 => Some(i - 1),
+                    _ => None,
+                }
+            };
+            if let Some(idx) = next_idx {
+                *deps.focus = Some(ids[idx]);
+            }
+        }
+
+        // Enter → open editor in place (the surface-agnostic overlay).
+        if ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.command)
+            && let Some(id) = *deps.focus
+            && ids.contains(&id)
+        {
+            events.push(MapEvent::OpenCard(id));
+        }
+
+        // Ctrl+D → desk picker for the focused node (shared component).
+        let ctrl_d = ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::D,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.command
+                )
+            })
+        });
+        if ctrl_d
+            && let Some(id) = *deps.focus
+            && ids.contains(&id)
+            && !deps.session.desks.is_empty()
+        {
+            crate::surfaces::desk_picker::open_for(ui, map_picker_id(), id);
+        }
+
+        // Shift+F10 → context menu on the selected node (anchored Popup —
+        // egui 0.35 cannot open a context_menu programmatically; the desk's
+        // memory-flag pattern).
+        let shift_f10 = ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::F10,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.shift
+                )
+            })
+        });
+        if shift_f10 && deps.focus.is_some() {
+            ui.memory_mut(|m| m.data.insert_temp(map_context_menu_open_id(), true));
+        }
+    }
 
     // ------------------------------------------------------------------
     // Pan and zoom — identical bindings to the desk (scroll pan, Shift for
@@ -477,6 +671,7 @@ pub fn map_ui(ui: &mut egui::Ui, state: &MapState, deps: &MapUiDeps<'_>) -> Vec<
     // Nodes: sized by degree, tinted per visual language (see fn docs),
     // hover tooltip, AccessKit label — the allocate_rect + widget_info
     // pattern proven by the desk's ghost minis.
+    let mut selected_resp: Option<egui::Response> = None;
     for meta in deps.metas {
         let Some(p) = world.get(&meta.id) else {
             continue;
@@ -489,12 +684,21 @@ pub fn map_ui(ui: &mut egui::Ui, state: &MapState, deps: &MapUiDeps<'_>) -> Vec<
         let r_screen = (r_world * cam.zoom).max(SCREEN_R_MIN);
         let center = cam.to_screen(panel, egui::pos2(p.x, p.y));
 
-        // Ease-in opacity (render-only; entries expire in app.rs).
-        let opacity = state
+        // Ease-in opacity (render-only; entries expire in app.rs), then the
+        // palette-dim highlight (a READ — applied regardless of the gates):
+        // palette hits stay lit, everything else drops to DIM_ALPHA.
+        let mut opacity = state
             .appeared
             .get(&meta.id)
             .map(|t0| (t0.elapsed().as_secs_f32() / FADE_IN_SECS).clamp(0.0, 1.0))
             .unwrap_or(1.0);
+        if state
+            .dimmed
+            .as_ref()
+            .is_some_and(|dim| dim.contains(&meta.id))
+        {
+            opacity *= DIM_ALPHA;
+        }
 
         let fill = if is_divider {
             deps.theme.divider_tab_bg
@@ -522,7 +726,149 @@ pub fn map_ui(ui: &mut egui::Ui, state: &MapState, deps: &MapUiDeps<'_>) -> Vec<
             egui::Stroke::new(1.0, deps.theme.card_border.gamma_multiply(opacity)),
         );
 
+        // Click-select (a MUTATION of focus — gated, unlike the dim read).
+        if resp.clicked() && !inputs_blocked && *deps.focus != Some(meta.id) {
+            *deps.focus = Some(meta.id);
+        }
+
+        let is_focused = *deps.focus == Some(meta.id);
+        if is_focused {
+            // Selection ring (focus_ring, the card discipline) + keyboard
+            // focus for a11y, held only while no overlay owns the keyboard.
+            ui.painter().circle_stroke(
+                center,
+                r_screen + 3.0,
+                egui::Stroke::new(2.0, deps.theme.focus_ring),
+            );
+            if !inputs_blocked {
+                resp.request_focus();
+            }
+            selected_resp = Some(resp.clone());
+        }
+
         resp.on_hover_text(meta.label.as_str());
+    }
+
+    // ------------------------------------------------------------------
+    // Shift+F10 context menu on the selected node — the desk's anchored
+    // Popup pattern; ONE memory slot holds the open node's id, so a focus
+    // move implicitly closes it. card_menu_items is surface-agnostic
+    // (on_desk = false: a map node is not a desk placement).
+    // ------------------------------------------------------------------
+    if let (Some(sel_id), Some(sel_resp)) = (*deps.focus, &selected_resp) {
+        let wants_open: bool =
+            ui.memory(|m| m.data.get_temp(map_context_menu_open_id()).unwrap_or(false));
+        if wants_open {
+            ui.memory_mut(|m| {
+                m.data.insert_temp(map_context_menu_open_id(), false);
+                m.data.insert_temp(map_popup_for_id(), sel_id);
+            });
+        }
+        let popup_open = ui
+            .memory(|m| m.data.get_temp::<NoteId>(map_popup_for_id()))
+            .is_some_and(|pid| pid == sel_id);
+        if popup_open {
+            let desk_refs: Vec<(jd_core::session::DeskId, &str)> = deps
+                .session
+                .desks
+                .iter()
+                .map(|d| (d.id, d.name.as_str()))
+                .collect();
+            let menu_ctx = crate::menus::CardMenuCtx {
+                id: sel_id,
+                status: deps
+                    .selected_meta
+                    .map(|m| m.status)
+                    .unwrap_or(Status::Fleeting),
+                kind: deps.selected_meta.map(|m| m.kind).unwrap_or(Kind::Note),
+                title: deps.selected_meta.map(|m| m.title.as_str()).unwrap_or(""),
+                desks: &desk_refs,
+                on_desk: false,
+                editor_open: deps.editor_open,
+                confirm_pending: deps.confirm_pending,
+                palette_open: deps.palette_open,
+            };
+            let popup_id = egui::Id::new("map_node_context_popup").with(sel_id);
+            egui::Popup::from_response(sel_resp)
+                .id(popup_id)
+                .open(true)
+                .at_position(sel_resp.rect.left_bottom())
+                .show(|ui| {
+                    if let Some(ev) = crate::menus::card_menu_items(ui, &menu_ctx) {
+                        events.push(MapEvent::CardMenu(ev));
+                        ui.memory_mut(|m| m.data.remove::<NoteId>(map_popup_for_id()));
+                    }
+                });
+            // Close on click-elsewhere and on Esc (consumed — defense in
+            // depth against the same-frame surface handlers).
+            if sel_resp.clicked_elsewhere()
+                || ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                ui.memory_mut(|m| m.data.remove::<NoteId>(map_popup_for_id()));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Mini card panel (bottom-right corner) for the selected node — the
+    // Drawer's mini pattern: the SAME card_face widget at MINI_SCALE, plus
+    // its top tags. Read-only company for the dots; opening still goes
+    // through Enter / the canonical paths.
+    // ------------------------------------------------------------------
+    if let Some(meta) = deps.selected_meta
+        && *deps.focus == Some(meta.id)
+    {
+        let shape = shape_for(meta.status, meta.kind);
+        let size = card_size(shape) * MINI_SCALE;
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(
+                panel.max.x - size.x - MINI_PANEL_MARGIN,
+                panel.max.y - size.y - MINI_PANEL_MARGIN,
+            ),
+            size,
+        );
+        let body_str = deps
+            .bodies
+            .get_or_request(meta.id, deps.commands)
+            .map(|b| b.text.as_str());
+        let face = crate::card::CardFace {
+            id: meta.id,
+            title: meta.title.as_str(),
+            body: body_str,
+            shape,
+            style: CardStyle::Paper,
+            lines: RuledLines::Natural,
+            source: meta.source.as_deref(),
+            links: meta.links,
+            tags: meta.tags,
+            focused: false,
+        };
+        let _ = crate::card::card_face(ui, rect, &face, deps.theme, deps.line_cache);
+        if !deps.selected_tags.is_empty() {
+            ui.painter().text(
+                egui::pos2(rect.min.x, rect.min.y - 6.0),
+                egui::Align2::LEFT_BOTTOM,
+                deps.selected_tags.join(" "),
+                egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                deps.theme.text_weak,
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Desk picker (shared component) — rendered above everything; a pick
+    // becomes the journaled place-on-desk in app.rs.
+    // ------------------------------------------------------------------
+    if picker_open
+        && let Some((id, desk)) = crate::surfaces::desk_picker::desk_picker_ui(
+            ui,
+            map_picker_id(),
+            panel,
+            deps.session,
+            deps.theme,
+        )
+    {
+        events.push(MapEvent::PlaceOnDesk { id, desk });
     }
 
     events
@@ -574,6 +920,31 @@ mod tests {
         }
         // Distinct ids land at distinct bearings.
         assert_ne!(a[0].1, a[1].1);
+    }
+
+    #[test]
+    fn dimmed_set_is_nodes_minus_palette_results() {
+        let nodes = [nid(1), nid(2), nid(3)];
+        // Result ids not on the map (nid(9)) are ignored.
+        let dimmed = dimmed_node_ids(&nodes, &[nid(2), nid(9)]);
+        assert!(dimmed.contains(&nid(1)));
+        assert!(!dimmed.contains(&nid(2)), "palette hits stay lit");
+        assert!(dimmed.contains(&nid(3)));
+        assert_eq!(dimmed.len(), 2);
+    }
+
+    #[test]
+    fn dimmed_set_with_no_results_dims_everything() {
+        let nodes = [nid(1), nid(2)];
+        let dimmed = dimmed_node_ids(&nodes, &[]);
+        assert_eq!(dimmed.len(), 2, "no hits → the whole field dims");
+    }
+
+    #[test]
+    fn dimmed_set_with_all_matching_dims_nothing() {
+        let nodes = [nid(1), nid(2)];
+        let dimmed = dimmed_node_ids(&nodes, &[nid(1), nid(2)]);
+        assert!(dimmed.is_empty());
     }
 
     #[test]

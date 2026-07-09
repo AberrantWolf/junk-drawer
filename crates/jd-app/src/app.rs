@@ -1285,47 +1285,99 @@ impl JdUi {
                         }
                     }
 
-                    // Prefetch node metas under ONE index read lock (the
-                    // FaceMeta idiom); notes deleted since build drop out.
-                    let metas: Vec<MapNodeMeta> = {
+                    // Palette-dim highlight (Task 3): while the palette is
+                    // open ON the map with a non-empty query, nodes in its
+                    // current results stay lit and everything else dims.
+                    // Pure computation (dimmed_node_ids); clears (None) when
+                    // the palette closes or its query is empty. This is a
+                    // READ — deliberately exempt from the mutation gates.
+                    if let Some(map) = self.map.as_mut() {
+                        map.dimmed = match &self.state.palette {
+                            Some(pal) if !pal.query.trim().is_empty() => {
+                                Some(crate::surfaces::map::dimmed_node_ids(
+                                    &map.nodes,
+                                    &pal.result_ids(),
+                                ))
+                            }
+                            _ => None,
+                        };
+                    }
+
+                    // Prefetch under ONE index read lock (the FaceMeta
+                    // idiom): node metas (notes deleted since build drop
+                    // out), the keyboard traversal order (newest-modified
+                    // first — Drawer parity), and the selected node's
+                    // FaceMeta + top tags for the mini panel / context menu.
+                    let (metas, ordered_ids, selected_meta, selected_tags): (
+                        Vec<MapNodeMeta>,
+                        Vec<NoteId>,
+                        Option<FaceMeta>,
+                        Vec<String>,
+                    ) = {
                         let idx = self.vault.index.read().unwrap();
-                        self.map
-                            .as_ref()
-                            .map(|map| {
-                                map.nodes
+                        let mut metas: Vec<MapNodeMeta> = Vec::new();
+                        let mut order: Vec<(
+                            jd_core::time::Timestamp,
+                            jd_core::time::Timestamp,
+                            NoteId,
+                        )> = Vec::new();
+                        if let Some(map) = self.map.as_ref() {
+                            for &id in &map.nodes {
+                                if let Some(m) = idx.get(id) {
+                                    metas.push(MapNodeMeta {
+                                        id,
+                                        label: m
+                                            .title
+                                            .clone()
+                                            .unwrap_or_else(|| m.first_line.clone()),
+                                        status: m.status,
+                                        kind: m.kind,
+                                    });
+                                    order.push((m.modified, m.created, id));
+                                }
+                            }
+                        }
+                        // Newest-modified first (tie: created desc, then id
+                        // asc — the drawer_ids ordering contract).
+                        order.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+                        let ordered_ids: Vec<NoteId> = order.into_iter().map(|t| t.2).collect();
+                        let sel = self
+                            .state
+                            .focus
+                            .and_then(|id| idx.get(id))
+                            .filter(|m| ordered_ids.contains(&m.id));
+                        let selected_meta = sel.map(|m| FaceMeta::from_note_meta(m, &idx));
+                        let selected_tags: Vec<String> = sel
+                            .map(|m| {
+                                m.tags
                                     .iter()
-                                    .filter_map(|&id| {
-                                        idx.get(id).map(|m| MapNodeMeta {
-                                            id,
-                                            label: m
-                                                .title
-                                                .clone()
-                                                .unwrap_or_else(|| m.first_line.clone()),
-                                            status: m.status,
-                                            kind: m.kind,
-                                        })
-                                    })
+                                    .take(2)
+                                    .map(|t| format!("#{}", t.as_str()))
                                     .collect()
                             })
-                            .unwrap_or_default()
+                            .unwrap_or_default();
+                        (metas, ordered_ids, selected_meta, selected_tags)
                     };
 
                     if let Some(map) = self.map.as_ref() {
-                        let deps = MapUiDeps {
+                        let mut deps = MapUiDeps {
                             theme: &self.theme,
                             metas: &metas,
+                            focus: &mut self.state.focus,
+                            ordered_ids: &ordered_ids,
+                            selected_meta: selected_meta.as_ref(),
+                            selected_tags: &selected_tags,
+                            bodies: &mut self.state.bodies,
+                            commands: &self.vault.commands,
+                            line_cache: &mut self.line_cache,
+                            session: &self.state.session,
+                            editor_open: self.state.editor.is_some(),
+                            confirm_pending: self.state.pending_confirm.is_some(),
+                            palette_open: self.state.palette.is_some(),
                         };
-                        let evts = crate::surfaces::map::map_ui(ui, map, &deps);
+                        let evts = crate::surfaces::map::map_ui(ui, map, &mut deps);
                         for ev in evts {
-                            match ev {
-                                // Camera: single mutation site; not journaled,
-                                // not persisted (fit-on-build orients instead).
-                                MapEvent::ViewportMoved { cam } => {
-                                    if let Some(m) = self.map.as_mut() {
-                                        m.camera = cam;
-                                    }
-                                }
-                            }
+                            self.apply_map_event(ev);
                         }
                     }
                 }
@@ -2147,6 +2199,43 @@ impl JdUi {
     fn apply_drawer_events(&mut self, events: Vec<DrawerEvent>) {
         for ev in events {
             self.apply_drawer_event(ev);
+        }
+    }
+
+    /// Apply a single `MapEvent` — public so kitests can dispatch events directly.
+    pub fn apply_map_event(&mut self, ev: MapEvent) {
+        match ev {
+            // Camera: single mutation site; not journaled, not persisted
+            // (fit-on-build orients instead).
+            MapEvent::ViewportMoved { cam } => {
+                if let Some(m) = self.map.as_mut() {
+                    m.camera = cam;
+                }
+            }
+            MapEvent::OpenCard(id) => {
+                // Same open path as the desk/drawer; the editor overlay is
+                // surface-agnostic, so it opens in place over the Map.
+                self.open_card_editor(id);
+            }
+            MapEvent::PlaceOnDesk { id, desk } => {
+                // Place at that desk's viewport center (journaled "Place
+                // card") — placement only, status untouched (Drawer parity).
+                let pos = self
+                    .state
+                    .session
+                    .desks
+                    .iter()
+                    .find(|d| d.id == desk)
+                    .map(|d| d.viewport.center)
+                    .unwrap_or_default();
+                self.place_card(desk, id, pos);
+            }
+            MapEvent::CardMenu(ev) => {
+                // A map node is never "on" a desk from the map's viewpoint:
+                // current_desk = None (TakeToDesk places at viewport center;
+                // PutAway is disabled by on_desk = false in the menu ctx).
+                self.apply_card_menu_event(ev, None);
+            }
         }
     }
 

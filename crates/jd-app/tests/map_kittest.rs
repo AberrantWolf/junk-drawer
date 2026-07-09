@@ -1,4 +1,5 @@
-//! WP5 Task 2: the Map surface — nodes, edges, settle-freeze, position cache.
+//! WP5 Tasks 2+3: the Map surface — nodes, edges, settle-freeze, position
+//! cache, and interactions (select, open, take-to-desk, palette dim).
 //!
 //! Everything drives the real UI through egui_kittest/AccessKit, mirroring
 //! the drawer_kittest patterns (pump for worker events, a11y-label queries).
@@ -284,6 +285,228 @@ fn map_restart_with_newcomer_keeps_cached_nodes_put() {
         sum / saved.len() as f32,
         max_drift
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: interactions
+// ---------------------------------------------------------------------------
+
+/// Clicking a node selects it (focus) and the mini card panel — the drawer's
+/// card_face mini — appears, a11y-labeled with the card's title.
+#[test]
+fn click_node_selects_and_shows_mini_panel() {
+    let (_vault, mut h, ids) = app_with_seeds(five_note_fixture());
+    to_map(&mut h);
+    pump_settled(&mut h);
+
+    assert!(
+        h.query_by_label_contains("Card: 'Alpha'").is_none(),
+        "no mini panel before any selection"
+    );
+
+    h.get_by_label("Map node: 'Alpha'").click();
+    h.run_ok();
+    assert_eq!(
+        h.state().state.focus,
+        Some(ids[2]),
+        "click must select (focus) the Alpha node"
+    );
+    // The mini panel renders the real card widget for the selection.
+    assert!(
+        h.query_by_label_contains("Card: 'Alpha'").is_some(),
+        "mini card panel must show the selected card's face"
+    );
+}
+
+/// Keyboard traversal (newest-modified first, Drawer parity): ArrowDown
+/// focuses the first node; Enter opens the editor IN PLACE (still on the
+/// Map surface — the existing surface-agnostic open path).
+#[test]
+fn enter_on_focused_node_opens_editor_in_place() {
+    let (_vault, mut h, _ids) = app_with_seeds(five_note_fixture());
+    to_map(&mut h);
+    pump_settled(&mut h);
+
+    h.key_press(egui::Key::ArrowDown);
+    h.run_ok();
+    let focused = h
+        .state()
+        .state
+        .focus
+        .expect("ArrowDown must focus the first node in traversal order");
+
+    h.key_press(egui::Key::Enter);
+    h.run_ok();
+    assert_eq!(
+        h.state().state.session.open_card,
+        Some(focused),
+        "Enter must engage the open path for the focused node"
+    );
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.editor.is_some(),
+        200,
+        "editor opens once the body arrives",
+    );
+    assert_eq!(
+        h.state().state.session.current_surface,
+        Some(SurfaceId::Map),
+        "editor must open in place — still on the Map"
+    );
+}
+
+/// Ctrl+D on the focused node opens the shared desk picker; Enter places the
+/// card on the chosen desk via the journaled "Place card" path.
+#[test]
+fn ctrl_d_places_focused_node_on_desk_journaled() {
+    let (_vault, mut h, ids) = app_with_seeds(five_note_fixture());
+    let alpha = ids[2];
+    to_map(&mut h);
+    pump_settled(&mut h);
+
+    h.state_mut().state.focus = Some(alpha);
+    h.run_ok();
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
+    h.run_ok();
+    // The shared picker is up: a second "Desk: <name>" node appears (the
+    // rail's desk row is the first).
+    assert_eq!(
+        h.query_all_by_label("Desk: Desk").count(),
+        2,
+        "desk picker must open with its desk row"
+    );
+
+    h.key_press(egui::Key::Enter);
+    h.run_ok();
+
+    assert!(
+        h.state().state.session.desks[0]
+            .cards
+            .iter()
+            .any(|c| c.id == alpha),
+        "card must be placed on the chosen desk"
+    );
+    assert_eq!(
+        h.state().state.journal.undo_label(),
+        Some("Place card"),
+        "take-to-desk must be the journaled 'Place card'"
+    );
+}
+
+/// Palette-on-map dim highlight: typing a query lights the palette's current
+/// results and dims everything else (the MapState.dimmed seam, computed by
+/// the pure dimmed_node_ids); closing the palette clears it.
+#[test]
+fn palette_on_map_dims_nonmatches_and_clears_on_close() {
+    let (_vault, mut h, ids) = app_with_seeds(five_note_fixture());
+    to_map(&mut h);
+    pump_settled(&mut h);
+
+    // Open the palette (Ctrl+K) and let the input grab focus.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.palette.is_some(),
+        50,
+        "palette opens on Ctrl+K",
+    );
+    for _ in 0..3 {
+        h.step();
+    }
+    // Empty query: no dimming yet (no filter to apply).
+    assert!(
+        h.state().map.as_ref().unwrap().dimmed.is_none(),
+        "empty palette query must not dim the map"
+    );
+
+    // Type "alpha": Title hit Alpha + Body hits Beta, Gamma ("linked from
+    // alpha"); Delta and Epsilon match nothing.
+    h.get_by_role(egui::accesskit::Role::TextInput).focus();
+    h.get_by_role(egui::accesskit::Role::TextInput).click();
+    h.run_ok();
+    h.get_by_role(egui::accesskit::Role::TextInput)
+        .type_text("alpha");
+    h.step();
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| {
+            a.map
+                .as_ref()
+                .is_some_and(|m| m.dimmed.as_ref().is_some_and(|d| d.len() == 2))
+        },
+        200,
+        "dim set settles to the two non-matching orphans",
+    );
+    let dimmed = h.state().map.as_ref().unwrap().dimmed.clone().unwrap();
+    for (i, name) in [(0, "Beta"), (1, "Gamma"), (2, "Alpha")] {
+        assert!(!dimmed.contains(&ids[i]), "{name} matches → stays lit");
+    }
+    for (i, name) in [(3, "Delta"), (4, "Epsilon")] {
+        assert!(dimmed.contains(&ids[i]), "{name} must dim");
+    }
+
+    // Esc closes the palette → the dim clears.
+    h.key_press(egui::Key::Escape);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.palette.is_none(),
+        50,
+        "palette closes on Esc",
+    );
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.map.as_ref().is_some_and(|m| m.dimmed.is_none()),
+        50,
+        "dim highlight clears when the palette closes",
+    );
+}
+
+/// Gate matrix: while the palette is open, map mutations are blocked —
+/// click-select does nothing, keyboard traversal does nothing, Enter opens
+/// nothing (the dim READ above is the one exemption).
+#[test]
+fn map_mutations_gated_while_palette_open() {
+    let (_vault, mut h, _ids) = app_with_seeds(five_note_fixture());
+    to_map(&mut h);
+    pump_settled(&mut h);
+    assert_eq!(h.state().state.focus, None);
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    common::pump(
+        &mut h,
+        &mut |a: &JdUi| a.state.palette.is_some(),
+        50,
+        "palette opens on Ctrl+K",
+    );
+    h.run_ok();
+
+    // Click-select is a mutation → gated.
+    h.get_by_label("Map node: 'Alpha'").click();
+    h.run_ok();
+    assert_eq!(
+        h.state().state.focus,
+        None,
+        "click-select must do nothing while the palette is open"
+    );
+
+    // Keyboard traversal + Enter → gated (map_ui sees raw keys BEFORE the
+    // palette consumes them at end-of-frame, so this exercises OUR gate).
+    h.key_press(egui::Key::ArrowDown);
+    h.run_ok();
+    assert_eq!(
+        h.state().state.focus,
+        None,
+        "arrow traversal must be gated while the palette is open"
+    );
+    h.key_press(egui::Key::Enter);
+    h.run_ok();
+    assert_eq!(
+        h.state().state.session.open_card,
+        None,
+        "Enter must not open a card from the map while the palette is open"
+    );
+    assert!(h.state().state.editor.is_none());
 }
 
 /// Orphans (degree 0) sit on a ring OUTSIDE the settled cluster: farther

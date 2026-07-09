@@ -71,6 +71,18 @@ impl PaletteState {
             wants_focus: true,
         }
     }
+
+    /// Ids of the current result rows (Title + Body strata; NewScrap carries
+    /// no id). Lightweight read for the map's palette-dim highlight (WP5).
+    pub fn result_ids(&self) -> Vec<NoteId> {
+        self.results
+            .iter()
+            .filter_map(|r| match r {
+                PaletteRow::Title { id, .. } | PaletteRow::Body { id, .. } => Some(*id),
+                PaletteRow::NewScrap => None,
+            })
+            .collect()
+    }
 }
 
 impl Default for PaletteState {
