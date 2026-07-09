@@ -21,6 +21,7 @@ use crate::state::{UiState, UndoRedoKind};
 use crate::surfaces::desk::{DeskEvent, DeskUiDeps, DragState, FaceMeta};
 use crate::surfaces::drawer::{DrawerEvent, DrawerUiDeps};
 use crate::surfaces::inbox::{InboxEvent, InboxUiDeps};
+use crate::surfaces::map::{MapEvent, MapNodeMeta, MapState, MapUiDeps};
 use crate::surfaces::trash::{TrashEvent, TrashUiDeps};
 
 /// Repaint hook: the worker wakes us between frames; the egui Context only
@@ -66,6 +67,10 @@ pub struct JdUi {
     /// desk_ui's drag-release path to decide CardDroppedOnInbox / CardDroppedOnDesk.
     /// Public so kitests can inspect or seed it directly.
     pub rail_row_hits: Vec<(egui::Rect, RailDropTarget)>,
+    /// WP5: the Map surface's state (layout + camera + cache debounce).
+    /// Built lazily on the first Map visit; lives for the whole session so
+    /// the settled layout survives surface switches. Public for kitests.
+    pub map: Option<MapState>,
 }
 
 impl JdUi {
@@ -96,6 +101,7 @@ impl JdUi {
             drag: None,
             last_panel_rect: None,
             rail_row_hits: Vec::new(),
+            map: None,
         })
     }
 
@@ -177,6 +183,24 @@ impl JdUi {
         }
     }
 
+    /// WP5: feed newly-appeared notes (OpDone created / External changed) to
+    /// the live map. No-op when the map hasn't been built, for ids the map
+    /// already knows, and for ids not (yet) in the index. Takes its own short
+    /// index read lock: drain_events runs before the render pass's snapshot
+    /// lock, so this does not violate the ONE-lock-per-frame render idiom.
+    fn map_add_new_notes(&mut self, ids: &[NoteId]) {
+        let Some(map) = self.map.as_mut() else {
+            return;
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let idx = self.vault.index.read().unwrap();
+        for &id in ids {
+            map.add_note(id, &idx, self.state.reduced_motion);
+        }
+    }
+
     /// Frame-loop step 1 (architecture §3): drain ALL pending worker events.
     pub fn drain_events(&mut self) {
         while let Ok(ev) = self.vault.events.try_recv() {
@@ -244,6 +268,9 @@ impl JdUi {
                     self.state.bodies.insert(id, content);
                 }
                 VaultEvent::External { changed, removed } => {
+                    // WP5: externally-appeared notes join the live map (no-op
+                    // for ids the layout already knows, or when no map exists).
+                    self.map_add_new_notes(&changed);
                     for id in changed {
                         self.state.bodies.invalidate(id);
                     }
@@ -256,6 +283,10 @@ impl JdUi {
                     }
                 }
                 VaultEvent::OpDone { result, source } => {
+                    // WP5: created notes join the live map (ease-in; orphans
+                    // ring-placed) — before any other handling so the node
+                    // exists even if placement paths fire this same drain.
+                    self.map_add_new_notes(&result.created);
                     // Invalidate bodies for created notes.
                     for id in &result.created {
                         self.state.bodies.invalidate(*id);
@@ -1199,9 +1230,104 @@ impl JdUi {
                     crate::surfaces::placeholder::placeholder_ui(ui);
                 }
 
-                // Map (WP5) — placeholder per scope boundaries.
+                // WP5 Task 2: the Map surface.
                 Some(SurfaceId::Map) => {
-                    crate::surfaces::placeholder::placeholder_ui(ui);
+                    // Build lazily on the first visit: nodes = all indexed
+                    // notes, edges = resolved links, pinned = cached positions.
+                    // Zoom-to-fit happens inside build (per-session; the
+                    // camera is deliberately not persisted).
+                    if self.map.is_none() {
+                        let pinned = jd_core::maplayout::MapCache::load(&self.vault_ref);
+                        let panel = ui.max_rect();
+                        let built = {
+                            let idx = self.vault.index.read().unwrap();
+                            MapState::build(&idx, pinned, panel)
+                        };
+                        self.map = Some(built);
+                    }
+
+                    if let Some(map) = self.map.as_mut() {
+                        // Physics budget while unsettled: up to
+                        // MAX_STEPS_PER_FRAME fixed-dt steps OR STEP_BUDGET_MS
+                        // of wall clock, whichever is hit first (the step
+                        // count paces small vaults; the wall clock protects
+                        // huge ones), then repaint to keep settling.
+                        if !map.layout.is_settled() {
+                            let t0 = std::time::Instant::now();
+                            for _ in 0..crate::surfaces::map::MAX_STEPS_PER_FRAME {
+                                map.layout.step(crate::surfaces::map::STEP_DT);
+                                if map.layout.is_settled()
+                                    || t0.elapsed()
+                                        >= std::time::Duration::from_millis(
+                                            crate::surfaces::map::STEP_BUDGET_MS,
+                                        )
+                                {
+                                    break;
+                                }
+                            }
+                            if !map.layout.is_settled() {
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                        // Settle transition (once per settle): arm the
+                        // debounced cache save — the session_dirty_at pattern.
+                        if map.layout.is_settled() && !map.settled {
+                            map.settled = true;
+                            map.cache_dirty_at = Some(std::time::Instant::now());
+                        }
+                        // Ease-in housekeeping: expire finished fades, keep
+                        // repainting while any node is still fading.
+                        map.appeared.retain(|_, t0| {
+                            t0.elapsed().as_secs_f32() < crate::surfaces::map::FADE_IN_SECS
+                        });
+                        if !map.appeared.is_empty() {
+                            ui.ctx().request_repaint();
+                        }
+                    }
+
+                    // Prefetch node metas under ONE index read lock (the
+                    // FaceMeta idiom); notes deleted since build drop out.
+                    let metas: Vec<MapNodeMeta> = {
+                        let idx = self.vault.index.read().unwrap();
+                        self.map
+                            .as_ref()
+                            .map(|map| {
+                                map.nodes
+                                    .iter()
+                                    .filter_map(|&id| {
+                                        idx.get(id).map(|m| MapNodeMeta {
+                                            id,
+                                            label: m
+                                                .title
+                                                .clone()
+                                                .unwrap_or_else(|| m.first_line.clone()),
+                                            status: m.status,
+                                            kind: m.kind,
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+
+                    if let Some(map) = self.map.as_ref() {
+                        let deps = MapUiDeps {
+                            theme: &self.theme,
+                            metas: &metas,
+                        };
+                        let evts = crate::surfaces::map::map_ui(ui, map, &deps);
+                        for ev in evts {
+                            match ev {
+                                // Camera: single mutation site; not journaled,
+                                // not persisted (fit-on-build orients instead).
+                                MapEvent::ViewportMoved { cam } => {
+                                    if let Some(m) = self.map.as_mut() {
+                                        m.camera = cam;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -1467,6 +1593,20 @@ impl JdUi {
         {
             let _ = self.state.session.save(&self.vault_ref);
             self.state.session_dirty_at = None;
+        }
+
+        // WP5: map cache save — the same debounce pattern. Armed on settle;
+        // written after 1s, or IMMEDIATELY when the user has left the Map
+        // surface (no reason to wait once the map is out of sight). Drop
+        // also flushes (alongside the session save-on-drop).
+        if let Some(map) = self.map.as_mut()
+            && let Some(dirty_at) = map.cache_dirty_at
+        {
+            let on_map = self.state.session.current_surface == Some(SurfaceId::Map);
+            if dirty_at.elapsed() > std::time::Duration::from_secs(1) || !on_map {
+                let _ = jd_core::maplayout::MapCache::save(&self.vault_ref, map.layout.positions());
+                map.cache_dirty_at = None;
+            }
         }
     }
 
@@ -2206,11 +2346,17 @@ impl JdUi {
     }
 }
 
-/// Save-on-drop: best-effort flush of any pending session changes.
+/// Save-on-drop: best-effort flush of any pending session changes,
+/// plus any unsaved map cache (WP5 — the settled positions are the point).
 impl Drop for JdUi {
     fn drop(&mut self) {
         if self.state.session_dirty_at.is_some() {
             let _ = self.state.session.save(&self.vault_ref);
+        }
+        if let Some(map) = &self.map
+            && map.cache_dirty_at.is_some()
+        {
+            let _ = jd_core::maplayout::MapCache::save(&self.vault_ref, map.layout.positions());
         }
     }
 }

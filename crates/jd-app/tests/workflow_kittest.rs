@@ -429,9 +429,10 @@ fn drop_card_to_desk_row_journals_one_entry_with_place_inverse() {
 }
 
 /// The Drawer is a real surface since WP4 Task 4 (chips row renders);
-/// Map still renders the placeholder label.
+/// the Map is a real surface since WP5 Task 2 (MapState builds on visit —
+/// map_kittest.rs covers its behavior; here we just assert the route).
 #[test]
-fn drawer_renders_and_map_renders_placeholder() {
+fn drawer_renders_and_map_builds() {
     let (_v, mut h, _ids) = app_with_fleeting(0);
 
     h.state_mut().state.session.current_surface = Some(SurfaceId::Drawer);
@@ -440,7 +441,10 @@ fn drawer_renders_and_map_renders_placeholder() {
 
     h.state_mut().state.session.current_surface = Some(SurfaceId::Map);
     h.run_ok();
-    h.get_by_label_contains("Coming in a later milestone");
+    assert!(
+        h.state().map.is_some(),
+        "visiting the Map surface must build MapState (even for an empty vault)"
+    );
 }
 
 /// Switching to the Inbox surface does not crash and is not the desk surface.
