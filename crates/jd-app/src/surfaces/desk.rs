@@ -102,6 +102,8 @@ pub fn card_a11y_label(
 
 pub const ZOOM_MIN: f32 = 0.5;
 pub const ZOOM_MAX: f32 = 2.0;
+/// Zoom multiplier per status-line −/+ button click (WP5x Task 2).
+pub const ZOOM_STEP: f32 = 1.25;
 
 /// Desk-space → screen-space: screen = (world - viewport.center) * zoom + panel_center.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -634,11 +636,26 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
             })
             .sum::<f32>()
     });
+    // Trackpad pinch arrives as Event::Zoom factors (macOS sends pinch as
+    // Zoom, NOT as Ctrl+MouseWheel — and reading raw MouseWheel events above
+    // bypasses egui's zoom_delta(), so pinch must be read explicitly here).
+    // All factors this frame multiply into one, sharing the Ctrl+scroll
+    // pointer-anchor math and ZOOM_MIN/ZOOM_MAX clamps below.
+    let pinch_factor: f32 = ui.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|ev| match ev {
+                egui::Event::Zoom(z) => Some(*z),
+                _ => None,
+            })
+            .product()
+    });
     let mut viewport_changed = false;
 
-    // Zoom: spec formula 1.0015^scroll_delta_points.
-    if ctrl_scroll_delta.abs() > 1e-6 {
-        let zoom_factor = 1.0015_f32.powf(ctrl_scroll_delta);
+    // Zoom: spec formula 1.0015^scroll_delta_points for Ctrl+scroll, times
+    // the pinch factor (either alone is 1.0 when absent).
+    let zoom_factor = 1.0015_f32.powf(ctrl_scroll_delta) * pinch_factor;
+    if (zoom_factor - 1.0).abs() > 1e-6 {
         let ptr_screen = ui
             .input(|i| i.pointer.latest_pos())
             .unwrap_or(panel.center());
@@ -728,12 +745,25 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
         drag.total_delta += pointer_delta.length();
     }
 
-    // Drag release → check rail drop targets first, then emit Move if beyond threshold
+    // Drag release → check rail drop targets first, then emit Move if beyond threshold.
+    //
+    // Release-frame render seam (WP5x Task 2, dogfood item 3): the events
+    // emitted here are applied by app.rs only AFTER desk_ui returns, so the
+    // session position is still the OLD one while THIS frame renders. Without
+    // a correction the released card flashes at its old location for exactly
+    // one frame (DragState is taken, so the live offset no longer applies).
+    // Fix: remember the drop screen position and render the released card
+    // there this frame; next frame the applied session pos takes over
+    // seamlessly. Rail drops get the same treatment — the card leaves the
+    // desk after this frame, and its last painted position should be where
+    // it was dropped, not a one-frame snap-back to its origin.
+    let mut release_render: Option<(NoteId, egui::Pos2)> = None;
     #[allow(clippy::collapsible_if)]
     if primary_released && let Some(drag) = state.drag.take() {
         if drag.total_delta >= 4.0
             && let Some(ptr) = pointer_pos
         {
+            release_render = Some((drag.id, ptr - drag.grab_offset));
             // Check if the pointer is over a rail row (drag-to-rail gesture).
             // Rail hits are in screen coordinates, same space as `ptr`.
             let rail_hit = state
@@ -857,6 +887,12 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
         let card_screen_min = if dragged_id == Some(card.id) {
             live_drag_screen
                 .unwrap_or_else(|| cam.to_screen(panel, egui::pos2(card.pos.x, card.pos.y)))
+        } else if let Some((rid, drop_pos)) = release_render
+            && rid == card.id
+        {
+            // Release frame: the pending Move applies only after this frame —
+            // render at the drop position so the card doesn't flash back.
+            drop_pos
         } else {
             cam.to_screen(panel, egui::pos2(card.pos.x, card.pos.y))
         };

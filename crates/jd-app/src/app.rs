@@ -44,6 +44,20 @@ impl Waker {
     }
 }
 
+/// A status-line zoom-control click (WP5x Task 2), routed to whichever
+/// surface (desk or map) is active this frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ZoomCommand {
+    /// − button: zoom ÷ ZOOM_STEP, anchored at the viewport center.
+    Out,
+    /// 100% button: zoom = 1.0, anchored at the viewport center.
+    Reset,
+    /// + button: zoom × ZOOM_STEP, anchored at the viewport center.
+    In,
+    /// Fit button: zoom-to-fit all content.
+    Fit,
+}
+
 pub struct JdUi {
     pub vault: VaultHandle,
     /// A second Vault handle for session load/save (worker::start consumed the
@@ -58,10 +72,11 @@ pub struct JdUi {
     line_cache: crate::editor::LineCache,
     /// Current card-drag state (None = no drag in progress).
     drag: Option<DragState>,
-    /// The desk panel rect captured from `ui.max_rect()` inside the CentralPanel
-    /// closure each frame, one frame before it is used by reveal() in FocusChanged.
-    /// None until the first frame has rendered.
-    last_panel_rect: Option<egui::Rect>,
+    /// The surface panel rect captured from `ui.max_rect()` inside the
+    /// CentralPanel closure each frame (desk AND map), one frame before it is
+    /// used by reveal() in FocusChanged. None until the first frame has
+    /// rendered. Public so kitests can do exact camera math (anchor checks).
+    pub last_panel_rect: Option<egui::Rect>,
     /// Rail row rects from the previous frame: (screen rect, drop target).
     /// Populated by rail_ui each frame via RailUiDeps::row_hits; consumed by
     /// desk_ui's drag-release path to decide CardDroppedOnInbox / CardDroppedOnDesk.
@@ -953,25 +968,54 @@ impl JdUi {
         // ------------------------------------------------------------------
         // Status line (bottom) — must be added before SidePanel and CentralPanel.
         // ------------------------------------------------------------------
-        let fit_clicked = egui::Panel::bottom("status_line")
+        // Zoom controls share the mouse-path gate matrix (editor / confirm /
+        // palette): a click behind an overlay must not move the camera.
+        let zoom_gated = self.state.editor.is_some()
+            || self.state.pending_confirm.is_some()
+            || self.state.palette.is_some();
+        let zoom_cmd: Option<ZoomCommand> = egui::Panel::bottom("status_line")
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Junk Drawer");
                     if let Some((ref echo_text, _)) = self.state.status_echo {
                         ui.label(echo_text.as_str());
                     }
-                    let fit = ui.button("Fit");
-                    // Zoom % — show for the active desk surface only.
-                    if let Some(SurfaceId::Desk(desk_id)) = self.state.session.current_surface
-                        && let Some(desk) =
-                            self.state.session.desks.iter().find(|d| d.id == desk_id)
-                    {
-                        ui.label(format!("{:.0}%", desk.viewport.zoom * 100.0));
+                    // [−] [100%] [+] [Fit] — a11y-labeled, gated as above.
+                    let mut cmd: Option<ZoomCommand> = None;
+                    for (text, a11y, c) in [
+                        ("\u{2212}", "Zoom out", ZoomCommand::Out),
+                        ("100%", "Zoom to 100%", ZoomCommand::Reset),
+                        ("+", "Zoom in", ZoomCommand::In),
+                        ("Fit", "Fit", ZoomCommand::Fit),
+                    ] {
+                        let resp = ui.add_enabled(!zoom_gated, egui::Button::new(text));
+                        resp.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, !zoom_gated, a11y)
+                        });
+                        if resp.clicked() && !zoom_gated {
+                            cmd = Some(c);
+                        }
+                    }
+                    // Zoom % — for the active desk, or the map camera.
+                    match self.state.session.current_surface {
+                        Some(SurfaceId::Desk(desk_id)) => {
+                            if let Some(desk) =
+                                self.state.session.desks.iter().find(|d| d.id == desk_id)
+                            {
+                                ui.label(format!("{:.0}%", desk.viewport.zoom * 100.0));
+                            }
+                        }
+                        Some(SurfaceId::Map) => {
+                            if let Some(map) = self.map.as_ref() {
+                                ui.label(format!("{:.0}%", map.camera.zoom * 100.0));
+                            }
+                        }
+                        _ => {}
                     }
                     if let Some(err) = &self.state.last_error {
                         ui.label(err.as_str());
                     }
-                    fit.clicked()
+                    cmd
                 })
                 .inner
             })
@@ -1060,24 +1104,14 @@ impl JdUi {
                         (face_metas, anchor, ghosts, edges)
                     };
 
-                    // Handle Fit button for this desk.
-                    if fit_clicked
-                        && let Some(desk) = self
-                            .state
-                            .session
-                            .desks
-                            .iter()
-                            .find(|d| d.id == desk_id)
-                            .cloned()
-                    {
+                    // Status-line zoom controls for this desk. −/+ step by
+                    // ZOOM_STEP and 100% resets to 1.0, all anchored at the
+                    // viewport center: the camera center IS the world point
+                    // under the panel center, so changing zoom alone keeps
+                    // that anchor fixed. Fit = zoom_to_fit (unchanged).
+                    if let Some(cmd) = zoom_cmd {
+                        use crate::surfaces::desk::{ZOOM_MAX, ZOOM_MIN, ZOOM_STEP};
                         let panel = ui.max_rect();
-                        let positions: Vec<(NoteId, CoreVec2)> =
-                            desk.cards.iter().map(|c| (c.id, c.pos)).collect();
-                        let mut cam = crate::surfaces::desk::DeskCamera {
-                            center: egui::vec2(desk.viewport.center.x, desk.viewport.center.y),
-                            zoom: desk.viewport.zoom,
-                        };
-                        cam.zoom_to_fit(&positions, panel);
                         if let Some(d) = self
                             .state
                             .session
@@ -1085,13 +1119,38 @@ impl JdUi {
                             .iter_mut()
                             .find(|d| d.id == desk_id)
                         {
-                            d.viewport.center = CoreVec2 {
-                                x: cam.center.x,
-                                y: cam.center.y,
-                            };
-                            d.viewport.zoom = cam.zoom;
+                            match cmd {
+                                ZoomCommand::Fit => {
+                                    let positions: Vec<(NoteId, CoreVec2)> =
+                                        d.cards.iter().map(|c| (c.id, c.pos)).collect();
+                                    let mut cam = crate::surfaces::desk::DeskCamera {
+                                        center: egui::vec2(
+                                            d.viewport.center.x,
+                                            d.viewport.center.y,
+                                        ),
+                                        zoom: d.viewport.zoom,
+                                    };
+                                    cam.zoom_to_fit(&positions, panel);
+                                    d.viewport.center = CoreVec2 {
+                                        x: cam.center.x,
+                                        y: cam.center.y,
+                                    };
+                                    d.viewport.zoom = cam.zoom;
+                                }
+                                ZoomCommand::Out => {
+                                    d.viewport.zoom =
+                                        (d.viewport.zoom / ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
+                                }
+                                ZoomCommand::In => {
+                                    d.viewport.zoom =
+                                        (d.viewport.zoom * ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
+                                }
+                                ZoomCommand::Reset => {
+                                    d.viewport.zoom = 1.0;
+                                }
+                            }
+                            self.state.session_dirty_at = Some(std::time::Instant::now());
                         }
-                        self.state.session_dirty_at = Some(std::time::Instant::now());
                     }
 
                     if let Some(desk) = self
@@ -1244,6 +1303,46 @@ impl JdUi {
                             MapState::build(&idx, pinned, panel)
                         };
                         self.map = Some(built);
+                    }
+
+                    // Capture the map panel rect (kitests use it for exact
+                    // camera math — the desk does the same each frame).
+                    self.last_panel_rect = Some(ui.max_rect());
+
+                    // Status-line zoom controls on the map (desk parity):
+                    // camera-only — never journaled, never persisted.
+                    if let Some(cmd) = zoom_cmd
+                        && let Some(map) = self.map.as_mut()
+                    {
+                        use crate::surfaces::desk::{ZOOM_MAX, ZOOM_MIN, ZOOM_STEP};
+                        match cmd {
+                            ZoomCommand::Fit => {
+                                // Same fit set as MapState::build: physics
+                                // positions plus the orphan ring.
+                                let mut fit: Vec<(NoteId, CoreVec2)> = map
+                                    .layout
+                                    .positions()
+                                    .iter()
+                                    .map(|(id, p)| (*id, *p))
+                                    .collect();
+                                fit.extend(crate::surfaces::map::orphan_ring_positions(
+                                    map.layout.positions(),
+                                    &map.orphans,
+                                ));
+                                map.camera.zoom_to_fit(&fit, ui.max_rect());
+                            }
+                            ZoomCommand::Out => {
+                                map.camera.zoom =
+                                    (map.camera.zoom / ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
+                            }
+                            ZoomCommand::In => {
+                                map.camera.zoom =
+                                    (map.camera.zoom * ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX);
+                            }
+                            ZoomCommand::Reset => {
+                                map.camera.zoom = 1.0;
+                            }
+                        }
                     }
 
                     if let Some(map) = self.map.as_mut() {
