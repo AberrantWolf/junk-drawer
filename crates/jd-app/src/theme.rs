@@ -9,7 +9,12 @@ use jd_core::lexer::SpanStyle;
 use crate::editor::{BODY_SIZE, MONO_SIZE, heading_size};
 
 pub const RULE_SPACING: f32 = 22.0;
-pub const RULE_TOP_OFFSET: f32 = 34.0;
+/// Natural red header rule, card-local y. The first heading line renders at
+/// 24px from content_top=10, so its bottom edge is ~y=39 — the red rule sits
+/// just below it.
+pub const RED_RULE_Y: f32 = 40.0;
+/// First body rule (blue for Natural, ink for Ink), below the red header rule.
+pub const RULE_TOP_OFFSET: f32 = RED_RULE_Y + 6.0;
 
 pub fn font_definitions() -> FontDefinitions {
     let mut d = FontDefinitions::default();
