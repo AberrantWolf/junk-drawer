@@ -348,6 +348,11 @@ mod tests {
                 );
             }
             let ui_pairs: &[(&str, Color32, Color32)] = &[
+                (
+                    "accent bar on rail active",
+                    theme.accent,
+                    theme.rail_active_bg,
+                ),
                 ("card border on desk", theme.card_border, theme.desk_bg),
                 ("focus ring on desk", theme.focus_ring, theme.desk_bg),
                 (

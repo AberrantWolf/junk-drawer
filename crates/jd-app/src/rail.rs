@@ -62,6 +62,7 @@ pub enum RailDropTarget {
 /// Everything `rail_ui` reads but does not own.
 pub struct RailUiDeps<'a> {
     pub session: &'a SessionState,
+    pub theme: &'a crate::theme::Theme,
     /// Number of fleeting notes in the index — computed once per frame in app.rs
     /// under the existing FaceMeta lock pattern.
     pub inbox_count: usize,
@@ -94,21 +95,40 @@ fn rename_state_id() -> egui::Id {
 // ---------------------------------------------------------------------------
 
 /// Render the left rail and return events for app.rs to apply.
-/// Full-width rail row: consistent height, themed hover/active fill, and a
-/// 3px accent bar on the active row. Returns the row's Response (behavioral
-/// drop-in for the old `selectable_label` — click/double-click/rect intact).
-fn rail_row(ui: &mut egui::Ui, selected: bool, text: &str) -> egui::Response {
-    let resp = ui.add_sized(
-        [ui.available_width(), crate::theme::RAIL_ROW_H],
-        egui::Button::selectable(selected, text),
+/// Full-width rail row: fixed height, LEFT-aligned text, themed hover/active
+/// fills and an accent bar on the active row. Painted directly (not
+/// `Button::selectable`) so the colors are the THEME's — egui's stock
+/// selection blue never appears — and every drawn pair is WCAG-tested.
+fn rail_row(
+    ui: &mut egui::Ui,
+    th: &crate::theme::Theme,
+    selected: bool,
+    text: &str,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), crate::theme::RAIL_ROW_H),
+        egui::Sense::click(),
     );
+    let fill = if selected {
+        th.rail_active_bg
+    } else if resp.hovered() {
+        th.rail_hover_bg
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, crate::theme::CARD_CORNER_RADIUS, fill);
     if selected {
-        let r = resp.rect;
-        let bar = egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + 3.0, r.max.y));
-        // Accent edge painted over the row's left margin (theme accent).
-        ui.painter()
-            .rect_filled(bar, 0.0, ui.visuals().hyperlink_color);
+        let bar = egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + 3.0, rect.max.y));
+        p.rect_filled(bar, 0.0, th.accent);
     }
+    p.text(
+        egui::pos2(rect.min.x + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::new(crate::editor::BODY_SIZE, egui::FontFamily::Proportional),
+        th.text,
+    );
     resp
 }
 
@@ -184,7 +204,7 @@ pub fn rail_ui(ui: &mut egui::Ui, deps: &mut RailUiDeps<'_>) -> Vec<RailEvent> {
             }
         } else {
             let label_text = format!("Desk: {desk_name}");
-            let resp = rail_row(ui, is_current, desk_name.as_str());
+            let resp = rail_row(ui, deps.theme, is_current, desk_name.as_str());
             // Override AccessKit label to include "Desk: " prefix per spec.
             resp.widget_info(|| {
                 egui::WidgetInfo::labeled(
@@ -259,7 +279,7 @@ pub fn rail_ui(ui: &mut egui::Ui, deps: &mut RailUiDeps<'_>) -> Vec<RailEvent> {
         n => format!("Inbox, {n} scraps"),
     };
     let inbox_selected = current == Some(SurfaceId::Inbox);
-    let inbox_resp = rail_row(ui, inbox_selected, inbox_label.as_str());
+    let inbox_resp = rail_row(ui, deps.theme, inbox_selected, inbox_label.as_str());
     inbox_resp.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::SelectableLabel,
@@ -279,7 +299,7 @@ pub fn rail_ui(ui: &mut egui::Ui, deps: &mut RailUiDeps<'_>) -> Vec<RailEvent> {
         ("Trash", SurfaceId::Trash),
     ] {
         let is_sel = current == Some(surface);
-        let resp = rail_row(ui, is_sel, label);
+        let resp = rail_row(ui, deps.theme, is_sel, label);
         resp.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::SelectableLabel, is_sel, label)
         });

@@ -481,6 +481,9 @@ pub fn desk_ui(ui: &mut egui::Ui, desk: &Desk, state: &mut DeskUiDeps<'_>) -> Ve
     let mut events: Vec<DeskEvent> = Vec::new();
     let panel = ui.max_rect();
 
+    // The desk felt: warmer than the surrounding chrome (theme.desk_bg).
+    ui.painter().rect_filled(panel, 0.0, state.theme.desk_bg);
+
     // Build camera from the desk's viewport.
     let mut cam = DeskCamera {
         center: egui::vec2(desk.viewport.center.x, desk.viewport.center.y),

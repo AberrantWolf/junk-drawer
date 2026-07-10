@@ -1006,13 +1006,12 @@ impl JdUi {
                         ui.label(egui::RichText::new(err.as_str()).color(self.theme.error_text));
                     }
                     // Zoom cluster, right-aligned as one quiet group:
-                    // [−] [1:1] [+] | [Fit] | 125%   (readout hidden at 100%).
+                    // [−] [1:1] [+] | [Fit] | 125%
                     let mut cmd: Option<ZoomCommand> = None;
                     let zoom_enabled = !zoom_gated && zoomable_surface;
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(6.0);
-                        // Zoom % readout (shown only when != 100 to avoid
-                        // confusion with the reset button; Task 2 review nit).
+                        // Zoom % readout.
                         let zoom = match self.state.session.current_surface {
                             Some(SurfaceId::Desk(desk_id)) => self
                                 .state
@@ -1077,6 +1076,7 @@ impl JdUi {
             .show(ui, |ui| {
                 let mut deps = RailUiDeps {
                     session: &self.state.session,
+                    theme: &self.theme,
                     inbox_count,
                     id_gen: &mut self.id_gen,
                     row_hits: &mut self.rail_row_hits,
