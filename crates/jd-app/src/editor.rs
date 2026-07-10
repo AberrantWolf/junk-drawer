@@ -566,13 +566,8 @@ pub fn editor_ui(
         .frame(
             egui::Frame::default()
                 .fill(deps.theme.card_paper_cream)
-                .shadow(egui::Shadow {
-                    offset: [0, 4],
-                    blur: 16,
-                    spread: 0,
-                    color: egui::Color32::from_black_alpha(80),
-                })
-                .corner_radius(8.0)
+                .shadow(crate::theme::overlay_shadow())
+                .corner_radius(crate::theme::OVERLAY_CORNER_RADIUS)
                 .inner_margin(egui::Margin::same(16)),
         )
         .backdrop_color(egui::Color32::from_black_alpha(80));

@@ -226,13 +226,8 @@ pub fn palette_ui(
             egui::Frame::default()
                 .fill(deps.theme.card_plain_bg)
                 .stroke(egui::Stroke::new(1.0, deps.theme.card_border))
-                .corner_radius(8.0)
-                .shadow(egui::Shadow {
-                    offset: [0, 4],
-                    blur: 16,
-                    spread: 0,
-                    color: egui::Color32::from_black_alpha(80),
-                })
+                .corner_radius(crate::theme::OVERLAY_CORNER_RADIUS)
+                .shadow(crate::theme::overlay_shadow())
                 .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui| {
                     ui.set_width(panel_width);

@@ -823,3 +823,106 @@ fn m5_scenario_settle_select_place_restart_newcomer_orphan() {
         max_linked
     );
 }
+
+// ---------------------------------------------------------------------------
+// WP5x Task 2: pinch zoom + status-line zoom controls on the map
+// ---------------------------------------------------------------------------
+
+/// Trackpad pinch (`egui::Event::Zoom`) zooms the map camera: multiplied,
+/// pointer-anchored, clamped — desk parity.
+#[test]
+fn pinch_zoom_zooms_the_map_anchored_and_clamped() {
+    use jd_app::surfaces::desk::{ZOOM_MAX, ZOOM_MIN};
+    let (_vault, mut h, _ids) = app_with_seeds(five_note_fixture());
+    to_map(&mut h);
+
+    // Known starting zoom (build zoom-to-fits; pin it for exact math).
+    h.state_mut().map.as_mut().unwrap().camera.zoom = 1.0;
+    let ptr = egui::pos2(700.0, 400.0);
+    h.event(egui::Event::PointerMoved(ptr));
+    h.run_ok();
+
+    let panel = h
+        .state()
+        .last_panel_rect
+        .expect("panel rect captured on map");
+    let cam_before = h.state().map.as_ref().unwrap().camera;
+    let world_before = cam_before.to_world(panel, ptr);
+
+    h.event(egui::Event::Zoom(1.5));
+    h.run_ok();
+
+    let cam_after = h.state().map.as_ref().unwrap().camera;
+    assert!(
+        (cam_after.zoom - cam_before.zoom * 1.5).abs() < 1e-3,
+        "pinch multiplies map zoom, got {}",
+        cam_after.zoom
+    );
+    let world_after = cam_after.to_world(panel, ptr);
+    assert!(
+        (world_after - world_before).length() < 1.0,
+        "world point under pointer must stay fixed; before {world_before:?}, after {world_after:?}"
+    );
+
+    h.event(egui::Event::Zoom(100.0));
+    h.run_ok();
+    let z = h.state().map.as_ref().unwrap().camera.zoom;
+    assert!(
+        (z - ZOOM_MAX).abs() < 1e-3,
+        "map pinch clamps at ZOOM_MAX, got {z}"
+    );
+    h.event(egui::Event::Zoom(1e-4));
+    h.run_ok();
+    let z = h.state().map.as_ref().unwrap().camera.zoom;
+    assert!(
+        (z - ZOOM_MIN).abs() < 1e-3,
+        "map pinch clamps at ZOOM_MIN, got {z}"
+    );
+}
+
+/// The status-line zoom buttons drive the MAP camera when the map is the
+/// active surface: −/+ step ×1.25, 100% resets, Fit re-frames the nodes.
+#[test]
+fn zoom_buttons_work_on_the_map() {
+    let (_vault, mut h, _ids) = app_with_seeds(five_note_fixture());
+    to_map(&mut h);
+    h.state_mut().map.as_mut().unwrap().camera.zoom = 1.0;
+    h.run_ok();
+
+    h.get_by_label("Zoom in").click();
+    h.run_ok();
+    let z = h.state().map.as_ref().unwrap().camera.zoom;
+    assert!((z - 1.25).abs() < 1e-3, "+ steps map zoom ×1.25, got {z}");
+
+    h.get_by_label("Zoom out").click();
+    h.run_ok();
+    let z = h.state().map.as_ref().unwrap().camera.zoom;
+    assert!((z - 1.0).abs() < 1e-3, "− steps map zoom ÷1.25, got {z}");
+
+    h.get_by_label("Zoom in").click();
+    h.run_ok();
+    h.get_by_label("Zoom to 100%").click();
+    h.run_ok();
+    let z = h.state().map.as_ref().unwrap().camera.zoom;
+    assert!((z - 1.0).abs() < 1e-6, "100% resets map zoom, got {z}");
+
+    // Fit: from a deliberately lost camera, Fit re-frames the content.
+    {
+        let cam = &mut h.state_mut().map.as_mut().unwrap().camera;
+        cam.center = egui::vec2(1.0e6, 1.0e6);
+        cam.zoom = 2.0;
+    }
+    h.get_by_label("Fit").click();
+    h.run_ok();
+    let cam = h.state().map.as_ref().unwrap().camera;
+    assert!(
+        cam.center.length() < 10_000.0,
+        "Fit recenters on the nodes, got {:?}",
+        cam.center
+    );
+    assert!(
+        (0.01..=2.0).contains(&cam.zoom),
+        "Fit zoom within the fit range, got {}",
+        cam.zoom
+    );
+}

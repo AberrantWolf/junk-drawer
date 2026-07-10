@@ -62,6 +62,7 @@ pub enum RailDropTarget {
 /// Everything `rail_ui` reads but does not own.
 pub struct RailUiDeps<'a> {
     pub session: &'a SessionState,
+    pub theme: &'a crate::theme::Theme,
     /// Number of fleeting notes in the index — computed once per frame in app.rs
     /// under the existing FaceMeta lock pattern.
     pub inbox_count: usize,
@@ -94,6 +95,43 @@ fn rename_state_id() -> egui::Id {
 // ---------------------------------------------------------------------------
 
 /// Render the left rail and return events for app.rs to apply.
+/// Full-width rail row: fixed height, LEFT-aligned text, themed hover/active
+/// fills and an accent bar on the active row. Painted directly (not
+/// `Button::selectable`) so the colors are the THEME's — egui's stock
+/// selection blue never appears — and every drawn pair is WCAG-tested.
+fn rail_row(
+    ui: &mut egui::Ui,
+    th: &crate::theme::Theme,
+    selected: bool,
+    text: &str,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), crate::theme::RAIL_ROW_H),
+        egui::Sense::click(),
+    );
+    let fill = if selected {
+        th.rail_active_bg
+    } else if resp.hovered() {
+        th.rail_hover_bg
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, crate::theme::CARD_CORNER_RADIUS, fill);
+    if selected {
+        let bar = egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + 3.0, rect.max.y));
+        p.rect_filled(bar, 0.0, th.accent);
+    }
+    p.text(
+        egui::pos2(rect.min.x + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::new(crate::editor::BODY_SIZE, egui::FontFamily::Proportional),
+        th.text,
+    );
+    resp
+}
+
 /// The rail is always visible regardless of the current surface.
 ///
 /// Row rects are recorded into `deps.row_hits` (cleared first) each frame so
@@ -166,7 +204,7 @@ pub fn rail_ui(ui: &mut egui::Ui, deps: &mut RailUiDeps<'_>) -> Vec<RailEvent> {
             }
         } else {
             let label_text = format!("Desk: {desk_name}");
-            let resp = ui.selectable_label(is_current, desk_name.as_str());
+            let resp = rail_row(ui, deps.theme, is_current, desk_name.as_str());
             // Override AccessKit label to include "Desk: " prefix per spec.
             resp.widget_info(|| {
                 egui::WidgetInfo::labeled(
@@ -241,7 +279,7 @@ pub fn rail_ui(ui: &mut egui::Ui, deps: &mut RailUiDeps<'_>) -> Vec<RailEvent> {
         n => format!("Inbox, {n} scraps"),
     };
     let inbox_selected = current == Some(SurfaceId::Inbox);
-    let inbox_resp = ui.selectable_label(inbox_selected, inbox_label.as_str());
+    let inbox_resp = rail_row(ui, deps.theme, inbox_selected, inbox_label.as_str());
     inbox_resp.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::SelectableLabel,
@@ -261,7 +299,7 @@ pub fn rail_ui(ui: &mut egui::Ui, deps: &mut RailUiDeps<'_>) -> Vec<RailEvent> {
         ("Trash", SurfaceId::Trash),
     ] {
         let is_sel = current == Some(surface);
-        let resp = ui.selectable_label(is_sel, label);
+        let resp = rail_row(ui, deps.theme, is_sel, label);
         resp.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::SelectableLabel, is_sel, label)
         });

@@ -625,9 +625,21 @@ pub fn map_ui(ui: &mut egui::Ui, state: &MapState, deps: &mut MapUiDeps<'_>) -> 
             })
             .sum::<f32>()
     });
+    // Trackpad pinch arrives as Event::Zoom factors (desk parity — see
+    // desk.rs: the raw-MouseWheel Ctrl+scroll path bypasses egui's
+    // zoom_delta(), so pinch must be read explicitly).
+    let pinch_factor: f32 = ui.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|ev| match ev {
+                egui::Event::Zoom(z) => Some(*z),
+                _ => None,
+            })
+            .product()
+    });
     let mut viewport_changed = false;
-    if ctrl_scroll_delta.abs() > 1e-6 {
-        let zoom_factor = 1.0015_f32.powf(ctrl_scroll_delta);
+    let zoom_factor = 1.0015_f32.powf(ctrl_scroll_delta) * pinch_factor;
+    if (zoom_factor - 1.0).abs() > 1e-6 {
         let ptr_screen = ui
             .input(|i| i.pointer.latest_pos())
             .unwrap_or(panel.center());

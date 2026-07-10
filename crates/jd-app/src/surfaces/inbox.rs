@@ -99,7 +99,12 @@ fn card_pos(index: usize, id: NoteId, style: CardStyle, panel: egui::Rect) -> eg
 
     // Grid: 3 columns for Paper, 1 for Plain
     let (cols, col_gap, row_gap, margin) = match style {
-        CardStyle::Paper => (3_usize, 24.0_f32, 24.0_f32, 24.0_f32),
+        CardStyle::Paper => (
+            3_usize,
+            crate::theme::INBOX_PILE_GAP,
+            crate::theme::INBOX_PILE_GAP,
+            crate::theme::INBOX_PILE_MARGIN,
+        ),
         CardStyle::Plain => (1_usize, 0.0_f32, 16.0_f32, 32.0_f32),
     };
 

@@ -334,8 +334,8 @@ fn cell_size() -> egui::Vec2 {
     card_size(crate::card::shape::CardShape::Literature) * MINI_SCALE
 }
 
-const GRID_GAP: f32 = 16.0;
-const GRID_MARGIN: f32 = 16.0;
+const GRID_GAP: f32 = crate::theme::DRAWER_GRID_GAP;
+const GRID_MARGIN: f32 = crate::theme::DRAWER_GRID_MARGIN;
 
 /// Top-left position of the mini at `index`, row-major over `cols` columns,
 /// with the grid starting at `top` (below the chips row).

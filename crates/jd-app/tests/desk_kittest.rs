@@ -109,12 +109,23 @@ fn card_center_on_screen(h: &Harness<'_, JdUi>, id: NoteId) -> egui::Pos2 {
         center: egui::vec2(vp.center.x, vp.center.y),
         zoom: vp.zoom,
     };
-    // Panel rect: the harness window is 1200×800; the status bar is at the
-    // bottom (~24 px). The central panel fills the remainder.
-    let panel = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0 - 24.0));
+    // Panel rect: use the REAL desk panel captured by the app last frame
+    // (chrome dimensions are theme constants that have changed before and
+    // will change again — a synthetic rect here is a proven fragility).
+    let panel = h
+        .state()
+        .last_panel_rect
+        .expect("panel rect captured (render at least one frame first)");
     let world = egui::pos2(placed.pos.x, placed.pos.y);
-    // Add the card size / 2 to land on the center of the card
-    let card_half = egui::vec2(150.0, 100.0); // approximate half-size
+    // Land on the card's center using its REAL shape size (a hardcoded
+    // index-card half-size missed the shorter scrap once Task 2's per-shape
+    // hit-testing + the WP5x scrap resize landed).
+    let card_half = {
+        use jd_app::card::shape::{card_size, shape_for};
+        let idx = h.state().vault.index.read().unwrap();
+        let m = idx.get(id).expect("note in index");
+        card_size(shape_for(m.status, m.kind)) * 0.5 * cam.zoom
+    };
     let top_left = cam.to_screen(panel, world);
     top_left + card_half
 }
@@ -1032,5 +1043,206 @@ fn session_save_is_debounced_not_per_frame() {
     assert!(
         mtime_after > mtime_before,
         "session.jd mtime must advance after debounce save; before={mtime_before:?} after={mtime_after:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WP5x Task 2: drag-release flash, pinch zoom, status-line zoom controls
+// ---------------------------------------------------------------------------
+
+/// The RELEASE frame must render the card at the drop position, not flash it
+/// back at the old session position for one frame.
+///
+/// The seam: card_face allocates its response at the exact screen rect the
+/// face is painted in, and that rect IS the card's AccessKit bounding box —
+/// so the a11y tree of a single stepped frame is an honest witness of where
+/// the card was rendered that frame. What this can't see: the actual pixels
+/// (paint ops), but the face is always painted inside its allocated rect.
+#[test]
+fn drag_release_frame_renders_card_at_the_drop_position() {
+    let (_v, mut h, ids) = app_with_cards(1);
+    let rect_before = h.get_by_label_contains("Card: 'Card 1'").rect();
+    let from = rect_before.center();
+    let delta = egui::vec2(200.0, 40.0);
+    let to = from + delta;
+
+    // Press on the card, then move — one frame each so we control the frames.
+    h.event(egui::Event::PointerMoved(from));
+    h.step();
+    h.event(egui::Event::PointerButton {
+        pos: from,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.step();
+    h.event(egui::Event::PointerMoved(to));
+    h.step();
+
+    // Sanity: the live-drag frame renders the card under the pointer.
+    let live_rect = h.get_by_label_contains("Card: 'Card 1'").rect();
+    assert!(
+        (live_rect.min - (rect_before.min + delta)).length() < 2.0,
+        "live drag renders at pointer; expected {:?}, got {:?}",
+        rect_before.min + delta,
+        live_rect.min
+    );
+
+    // RELEASE frame: the Move event only applies after desk_ui returns, so
+    // the regression was a one-frame render at the OLD position.
+    h.event(egui::Event::PointerButton {
+        pos: to,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.step();
+    let release_rect = h.get_by_label_contains("Card: 'Card 1'").rect();
+    assert!(
+        (release_rect.min - live_rect.min).length() < 2.0,
+        "release frame must render at the drop position (no flash at the old \
+         location); expected {:?}, got {:?}",
+        live_rect.min,
+        release_rect.min
+    );
+
+    // The Move applied within that same frame (events-out, applied post-ui)…
+    let placed = h.state().state.session.desks[0]
+        .cards
+        .iter()
+        .find(|c| c.id == ids[0])
+        .expect("still on desk")
+        .pos;
+    assert!(
+        (placed.x - 200.0).abs() < 8.0 && (placed.y - 40.0).abs() < 8.0,
+        "session pos updated by the Move on the release frame, got {placed:?}"
+    );
+
+    // …so the NEXT frame (session pos, no drag) renders at the same spot.
+    h.step();
+    let settled_rect = h.get_by_label_contains("Card: 'Card 1'").rect();
+    assert!(
+        (settled_rect.min - release_rect.min).length() < 2.0,
+        "frame after release stays put; release {:?}, settled {:?}",
+        release_rect.min,
+        settled_rect.min
+    );
+}
+
+/// Trackpad pinch arrives as `egui::Event::Zoom(factor)` — it must zoom the
+/// desk camera (multiplying), keep the world point under the pointer fixed,
+/// and respect the ZOOM_MIN/ZOOM_MAX clamps.
+#[test]
+fn pinch_zoom_zooms_the_desk_anchored_and_clamped() {
+    use jd_app::surfaces::desk::{DeskCamera, ZOOM_MAX, ZOOM_MIN};
+    let (_v, mut h, _ids) = app_with_cards(1);
+    let ptr = egui::pos2(700.0, 400.0);
+    h.event(egui::Event::PointerMoved(ptr));
+    h.run_ok();
+
+    let panel = h.state().last_panel_rect.expect("panel rect captured");
+    let vp = h.state().state.session.desks[0].viewport;
+    let cam_before = DeskCamera {
+        center: egui::vec2(vp.center.x, vp.center.y),
+        zoom: vp.zoom,
+    };
+    let world_before = cam_before.to_world(panel, ptr);
+
+    h.event(egui::Event::Zoom(1.5));
+    h.run_ok();
+
+    let vp = h.state().state.session.desks[0].viewport;
+    assert!(
+        (vp.zoom - cam_before.zoom * 1.5).abs() < 1e-3,
+        "pinch multiplies zoom, got {}",
+        vp.zoom
+    );
+    let cam_after = DeskCamera {
+        center: egui::vec2(vp.center.x, vp.center.y),
+        zoom: vp.zoom,
+    };
+    let world_after = cam_after.to_world(panel, ptr);
+    assert!(
+        (world_after - world_before).length() < 1.0,
+        "world point under pointer must stay fixed; before {world_before:?}, after {world_after:?}"
+    );
+
+    // Clamps hold in both directions.
+    h.event(egui::Event::Zoom(100.0));
+    h.run_ok();
+    let z = h.state().state.session.desks[0].viewport.zoom;
+    assert!(
+        (z - ZOOM_MAX).abs() < 1e-3,
+        "pinch clamps at ZOOM_MAX, got {z}"
+    );
+    h.event(egui::Event::Zoom(1e-4));
+    h.run_ok();
+    let z = h.state().state.session.desks[0].viewport.zoom;
+    assert!(
+        (z - ZOOM_MIN).abs() < 1e-3,
+        "pinch clamps at ZOOM_MIN, got {z}"
+    );
+}
+
+/// Status-line zoom controls on the desk: − and + step by ×/÷1.25 anchored at
+/// the viewport center (center unchanged), 100% resets zoom to 1.0, and the
+/// + button clamps at ZOOM_MAX.
+#[test]
+fn zoom_buttons_step_reset_and_clamp_on_the_desk() {
+    use jd_app::surfaces::desk::ZOOM_MAX;
+    let (_v, mut h, _ids) = app_with_cards(1);
+    let center_before = h.state().state.session.desks[0].viewport.center;
+
+    h.get_by_label("Zoom in").click();
+    h.run_ok();
+    let vp = h.state().state.session.desks[0].viewport;
+    assert!(
+        (vp.zoom - 1.25).abs() < 1e-3,
+        "+ steps ×1.25, got {}",
+        vp.zoom
+    );
+    assert!(
+        (vp.center.x - center_before.x).abs() < 1e-3
+            && (vp.center.y - center_before.y).abs() < 1e-3,
+        "zoom buttons anchor at the viewport center (center unchanged)"
+    );
+
+    h.get_by_label("Zoom in").click();
+    h.run_ok();
+    let z = h.state().state.session.desks[0].viewport.zoom;
+    assert!((z - 1.5625).abs() < 1e-3, "+ again → 1.5625, got {z}");
+
+    h.get_by_label("Zoom out").click();
+    h.run_ok();
+    let z = h.state().state.session.desks[0].viewport.zoom;
+    assert!((z - 1.25).abs() < 1e-3, "− steps ÷1.25, got {z}");
+
+    h.get_by_label("Zoom to 100%").click();
+    h.run_ok();
+    let z = h.state().state.session.desks[0].viewport.zoom;
+    assert!((z - 1.0).abs() < 1e-6, "100% resets zoom, got {z}");
+
+    for _ in 0..5 {
+        h.get_by_label("Zoom in").click();
+        h.run_ok();
+    }
+    let z = h.state().state.session.desks[0].viewport.zoom;
+    assert!((z - ZOOM_MAX).abs() < 1e-3, "+ clamps at ZOOM_MAX, got {z}");
+}
+
+/// Zoom buttons share the mouse-path gate matrix: while the palette overlay
+/// is open, clicking them must not change the zoom.
+#[test]
+fn zoom_buttons_gated_while_palette_open() {
+    let (_v, mut h, _ids) = app_with_cards(1);
+    h.state_mut().state.palette = Some(jd_app::palette::PaletteState::new());
+    h.run_ok();
+
+    h.get_by_label("Zoom in").click();
+    h.run_ok();
+    let z = h.state().state.session.desks[0].viewport.zoom;
+    assert!(
+        (z - 1.0).abs() < 1e-6,
+        "zoom must not change while the palette is open, got {z}"
     );
 }
