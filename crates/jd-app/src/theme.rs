@@ -8,13 +8,89 @@ use jd_core::lexer::SpanStyle;
 
 use crate::editor::{BODY_SIZE, MONO_SIZE, heading_size};
 
-pub const RULE_SPACING: f32 = 22.0;
-/// Natural red header rule, card-local y. The first heading line renders at
-/// 24px from content_top=10, so its bottom edge is ~y=39 — the red rule sits
-/// just below it.
-pub const RED_RULE_Y: f32 = 40.0;
-/// First body rule (blue for Natural, ink for Ink), below the red header rule.
-pub const RULE_TOP_OFFSET: f32 = RED_RULE_Y + 6.0;
+/// Rule pitch = the measured body row height: Inter at BODY_SIZE (15.0)
+/// lays out at exactly 18.0 px/row (pinned by measurement — see WP5x Task 3).
+/// Rules land UNDER text rows, never through them.
+pub const RULE_SPACING: f32 = 18.0;
+/// Natural red header rule, card-local y. The first heading line (H1, 24px)
+/// lays out 29 px tall from content_top=10, so its bottom edge is y=39 — the
+/// red rule sits just below it.
+pub const RED_RULE_Y: f32 = 39.5;
+/// First body rule (blue for Natural, ink for Ink): one body row below the
+/// red header rule, i.e. under the first body text line (39..57).
+pub const RULE_TOP_OFFSET: f32 = RED_RULE_Y + RULE_SPACING;
+
+// ---------------------------------------------------------------------------
+// Polish metrics (WP5x Task 3) — every tuned value is a named constant here
+// so the pass stays reversible.
+// ---------------------------------------------------------------------------
+
+/// Corner radius shared by card faces, their shadows, and the focus ring.
+pub const CARD_CORNER_RADIUS: f32 = 4.0;
+/// Corner radius for overlay chrome (editor modal, palette).
+pub const OVERLAY_CORNER_RADIUS: f32 = 8.0;
+/// Card drop shadow, soft/ambient layer: a slightly larger halo below the card.
+pub const CARD_SHADOW_SOFT_OFFSET: egui::Vec2 = egui::vec2(0.0, 5.0);
+/// How far the soft shadow layer extends past the card edge.
+pub const CARD_SHADOW_SOFT_EXPAND: f32 = 2.0;
+/// Card drop shadow, near/contact layer: tight under the card.
+pub const CARD_SHADOW_NEAR_OFFSET: egui::Vec2 = egui::vec2(0.0, 2.0);
+/// Left rail width (was 160 — too tight for desk names + padding).
+pub const RAIL_WIDTH: f32 = 192.0;
+/// Left rail row height.
+pub const RAIL_ROW_H: f32 = 26.0;
+/// Status line height.
+pub const STATUS_LINE_H: f32 = 28.0;
+/// Inbox pile: outer margin and gutters between scraps (Paper pile layout).
+pub const INBOX_PILE_MARGIN: f32 = 28.0;
+pub const INBOX_PILE_GAP: f32 = 28.0;
+/// Drawer mini grid: outer margin and gutters.
+pub const DRAWER_GRID_MARGIN: f32 = 20.0;
+pub const DRAWER_GRID_GAP: f32 = 20.0;
+
+/// The one drop shadow used by overlay chrome (editor modal, palette):
+/// consistent with the card shadows — soft, low-alpha, cast downward.
+pub fn overlay_shadow() -> egui::Shadow {
+    egui::Shadow {
+        offset: [0, 6],
+        blur: 24,
+        spread: 0,
+        color: Color32::from_black_alpha(56),
+    }
+}
+
+/// Push the theme into egui's own widget styling so stock widgets (buttons,
+/// panels, text inputs, menus) sit on the same warm stationery palette as the
+/// custom-painted surfaces. Called from app.rs whenever the theme flips.
+pub fn apply_visuals(ctx: &egui::Context, th: &Theme) {
+    let mut v = if th.dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    v.panel_fill = th.chrome_bg;
+    v.window_fill = th.card_plain_bg;
+    v.window_stroke = egui::Stroke::new(1.0, th.card_border);
+    v.window_corner_radius = egui::CornerRadius::same(OVERLAY_CORNER_RADIUS as u8);
+    v.window_shadow = overlay_shadow();
+    // Text inputs (palette query, rename field) on plain card stock.
+    v.extreme_bg_color = th.card_plain_bg;
+    // Warm the stock widget fills (buttons on chrome) + one shared radius.
+    v.widgets.inactive.weak_bg_fill = th.rail_hover_bg;
+    v.widgets.hovered.weak_bg_fill = th.separator;
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, th.separator);
+    let r = egui::CornerRadius::same(CARD_CORNER_RADIUS as u8);
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = r;
+    }
+    ctx.set_visuals(v);
+}
 
 pub fn font_definitions() -> FontDefinitions {
     let mut d = FontDefinitions::default();
@@ -77,20 +153,34 @@ pub struct Theme {
     pub error_text: Color32,
     pub divider_tab_bg: Color32,
     pub footer_bg: Color32,
+    /// Rail / status line / menu bar background — the app chrome around the felt.
+    pub chrome_bg: Color32,
+    /// Rail row hover wash.
+    pub rail_hover_bg: Color32,
+    /// Rail active-row fill (paired with an accent edge bar).
+    pub rail_active_bg: Color32,
+    /// Quiet hairline for separators between chrome groups (non-text).
+    pub separator: Color32,
+    /// Soft/ambient card shadow layer (near layer is `card_shadow`).
+    pub card_shadow_soft: Color32,
 }
 
 impl Theme {
     pub fn light() -> Theme {
         Theme {
             dark: false,
-            desk_bg: Color32::from_rgb(0xE8, 0xE4, 0xDC),
+            // Warmer desk felt (was 0xE8,0xE4,0xDC — cooler, flatter beige).
+            desk_bg: Color32::from_rgb(0xE4, 0xDD, 0xCE),
             card_paper_cream: Color32::from_rgb(0xFB, 0xF7, 0xEB),
             card_plain_bg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
             // Darkened from 0x8A,0x84,0x78 to pass card-border UI pair (>= 3.0 on desk_bg)
             card_border: Color32::from_rgb(0x7C, 0x76, 0x6A),
-            card_shadow: Color32::from_black_alpha(40),
+            // Near/contact shadow layer — tight and darker.
+            card_shadow: Color32::from_black_alpha(30),
             text: Color32::from_rgb(0x26, 0x24, 0x20),
-            text_weak: Color32::from_rgb(0x6B, 0x66, 0x5C),
+            // Darkened from 0x6B,0x66,0x5C so weak text clears 4.5 on the
+            // warmer desk felt and rail hover washes too.
+            text_weak: Color32::from_rgb(0x63, 0x5D, 0x52),
             accent: Color32::from_rgb(0x1A, 0x56, 0xA0),
             tag_pill_bg: Color32::from_rgb(0xE4, 0xEC, 0xF6),
             code_bg: Color32::from_rgb(0xEF, 0xEA, 0xDD),
@@ -101,17 +191,23 @@ impl Theme {
             error_text: Color32::from_rgb(0x9E, 0x2A, 0x2A),
             divider_tab_bg: Color32::from_rgb(0xEA, 0xDF, 0xC8),
             footer_bg: Color32::from_rgb(0xF1, 0xEA, 0xD8),
+            chrome_bg: Color32::from_rgb(0xF2, 0xEE, 0xE3),
+            rail_hover_bg: Color32::from_rgb(0xE7, 0xE1, 0xD2),
+            rail_active_bg: Color32::from_rgb(0xDC, 0xE4, 0xEF),
+            separator: Color32::from_rgb(0xD8, 0xD1, 0xC2),
+            card_shadow_soft: Color32::from_black_alpha(14),
         }
     }
 
     pub fn dark() -> Theme {
         Theme {
             dark: true,
-            desk_bg: Color32::from_rgb(0x1E, 0x1F, 0x22),
+            // Warmer near-black felt (was 0x1E,0x1F,0x22 — cool blue-grey).
+            desk_bg: Color32::from_rgb(0x23, 0x22, 0x20),
             card_paper_cream: Color32::from_rgb(0x2A, 0x2C, 0x31),
             card_plain_bg: Color32::from_rgb(0x26, 0x28, 0x2C),
             card_border: Color32::from_rgb(0x8E, 0x93, 0x9E),
-            card_shadow: Color32::from_black_alpha(90),
+            card_shadow: Color32::from_black_alpha(110),
             text: Color32::from_rgb(0xE8, 0xE6, 0xE1),
             text_weak: Color32::from_rgb(0xA6, 0xA4, 0x9C),
             accent: Color32::from_rgb(0x7F, 0xB3, 0xF0),
@@ -124,6 +220,11 @@ impl Theme {
             error_text: Color32::from_rgb(0xF0, 0x9A, 0x9A),
             divider_tab_bg: Color32::from_rgb(0x37, 0x33, 0x28),
             footer_bg: Color32::from_rgb(0x30, 0x2E, 0x28),
+            chrome_bg: Color32::from_rgb(0x2A, 0x28, 0x25),
+            rail_hover_bg: Color32::from_rgb(0x33, 0x31, 0x2C),
+            rail_active_bg: Color32::from_rgb(0x2B, 0x3A, 0x4E),
+            separator: Color32::from_rgb(0x3D, 0x3A, 0x34),
+            card_shadow_soft: Color32::from_black_alpha(60),
         }
     }
 }
@@ -221,6 +322,20 @@ mod tests {
                 ("error on desk", theme.error_text, theme.desk_bg),
                 ("title on divider tab", theme.text, theme.divider_tab_bg),
                 ("source on footer", theme.text_weak, theme.footer_bg),
+                // WP5x Task 3 chrome pairs.
+                (
+                    "weak on desk (empty states)",
+                    theme.text_weak,
+                    theme.desk_bg,
+                ),
+                ("text on chrome", theme.text, theme.chrome_bg),
+                ("weak on chrome", theme.text_weak, theme.chrome_bg),
+                ("accent on chrome", theme.accent, theme.chrome_bg),
+                ("error on chrome", theme.error_text, theme.chrome_bg),
+                ("text on rail hover", theme.text, theme.rail_hover_bg),
+                ("weak on rail hover", theme.text_weak, theme.rail_hover_bg),
+                ("text on rail active", theme.text, theme.rail_active_bg),
+                ("weak on rail active", theme.text_weak, theme.rail_active_bg),
             ];
             for (what, fg, bg) in text_pairs {
                 assert!(

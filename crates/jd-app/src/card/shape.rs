@@ -117,7 +117,9 @@ pub fn outline(
 /// Plain rounded rect — 4 corner points (one per corner, no arc subdivision).
 /// Returns exactly 4 vertices (≤ 8 as required).
 fn plain_rounded_rect(rect: egui::Rect) -> Vec<egui::Pos2> {
-    let r = 4.0_f32.min(rect.width() * 0.05).min(rect.height() * 0.05);
+    let r = crate::theme::CARD_CORNER_RADIUS
+        .min(rect.width() * 0.05)
+        .min(rect.height() * 0.05);
     vec![
         egui::pos2(rect.min.x + r, rect.min.y),
         egui::pos2(rect.max.x - r, rect.min.y),

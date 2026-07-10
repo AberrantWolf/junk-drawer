@@ -214,10 +214,25 @@ pub fn card_face(
     let painter = ui.painter();
 
     // -----------------------------------------------------------------------
-    // 1. Shadow
+    // 1. Shadow — two layers for a softer, more physical read:
+    //    a wider low-alpha ambient halo plus a tight contact shadow, both
+    //    cast downward (paper on felt, light from above).
     // -----------------------------------------------------------------------
-    let shadow_rect = rect.translate(egui::vec2(3.0, 3.0));
-    painter.rect_filled(shadow_rect, 4.0, th.card_shadow);
+    use crate::theme::{
+        CARD_CORNER_RADIUS, CARD_SHADOW_NEAR_OFFSET, CARD_SHADOW_SOFT_EXPAND,
+        CARD_SHADOW_SOFT_OFFSET,
+    };
+    painter.rect_filled(
+        rect.expand(CARD_SHADOW_SOFT_EXPAND)
+            .translate(CARD_SHADOW_SOFT_OFFSET),
+        CARD_CORNER_RADIUS + CARD_SHADOW_SOFT_EXPAND,
+        th.card_shadow_soft,
+    );
+    painter.rect_filled(
+        rect.translate(CARD_SHADOW_NEAR_OFFSET),
+        CARD_CORNER_RADIUS,
+        th.card_shadow,
+    );
 
     // -----------------------------------------------------------------------
     // 2. Outline fill
@@ -368,8 +383,27 @@ pub fn card_face(
         let galley = layout_body(ui, &face_body, wrap_width, cache, &|_| false, th, false);
 
         let galley_pos = egui::pos2(rect.min.x + 10.0, content_top);
+
+        // Whole-row clipping: never cut a text row mid-glyph. The clip bottom
+        // is the bottom of the last row that fits fully in the content area
+        // (falling back to the raw content_bottom when not even one row fits).
+        let avail_h = content_bottom - content_top;
+        let mut whole_rows_h = 0.0_f32;
+        for row in &galley.rows {
+            let bottom = row.pos.y + row.rect().height();
+            if bottom <= avail_h + 0.5 {
+                whole_rows_h = whole_rows_h.max(bottom);
+            } else {
+                break;
+            }
+        }
+        let clip_bottom = if whole_rows_h > 0.0 {
+            content_top + whole_rows_h
+        } else {
+            content_bottom
+        };
         let clip_rect =
-            egui::Rect::from_min_max(galley_pos, egui::pos2(rect.max.x - 10.0, content_bottom));
+            egui::Rect::from_min_max(galley_pos, egui::pos2(rect.max.x - 10.0, clip_bottom));
 
         // Paint with clipping
         let painter_clipped = ui.painter().with_clip_rect(clip_rect);
@@ -409,7 +443,7 @@ pub fn card_face(
     if face.focused {
         painter.rect_stroke(
             sense_rect,
-            4.0,
+            CARD_CORNER_RADIUS,
             egui::Stroke::new(2.0, th.focus_ring),
             egui::StrokeKind::Outside,
         );

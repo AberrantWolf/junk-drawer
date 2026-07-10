@@ -94,6 +94,24 @@ fn rename_state_id() -> egui::Id {
 // ---------------------------------------------------------------------------
 
 /// Render the left rail and return events for app.rs to apply.
+/// Full-width rail row: consistent height, themed hover/active fill, and a
+/// 3px accent bar on the active row. Returns the row's Response (behavioral
+/// drop-in for the old `selectable_label` — click/double-click/rect intact).
+fn rail_row(ui: &mut egui::Ui, selected: bool, text: &str) -> egui::Response {
+    let resp = ui.add_sized(
+        [ui.available_width(), crate::theme::RAIL_ROW_H],
+        egui::Button::selectable(selected, text),
+    );
+    if selected {
+        let r = resp.rect;
+        let bar = egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + 3.0, r.max.y));
+        // Accent edge painted over the row's left margin (theme accent).
+        ui.painter()
+            .rect_filled(bar, 0.0, ui.visuals().hyperlink_color);
+    }
+    resp
+}
+
 /// The rail is always visible regardless of the current surface.
 ///
 /// Row rects are recorded into `deps.row_hits` (cleared first) each frame so
@@ -166,7 +184,7 @@ pub fn rail_ui(ui: &mut egui::Ui, deps: &mut RailUiDeps<'_>) -> Vec<RailEvent> {
             }
         } else {
             let label_text = format!("Desk: {desk_name}");
-            let resp = ui.selectable_label(is_current, desk_name.as_str());
+            let resp = rail_row(ui, is_current, desk_name.as_str());
             // Override AccessKit label to include "Desk: " prefix per spec.
             resp.widget_info(|| {
                 egui::WidgetInfo::labeled(
@@ -241,7 +259,7 @@ pub fn rail_ui(ui: &mut egui::Ui, deps: &mut RailUiDeps<'_>) -> Vec<RailEvent> {
         n => format!("Inbox, {n} scraps"),
     };
     let inbox_selected = current == Some(SurfaceId::Inbox);
-    let inbox_resp = ui.selectable_label(inbox_selected, inbox_label.as_str());
+    let inbox_resp = rail_row(ui, inbox_selected, inbox_label.as_str());
     inbox_resp.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::SelectableLabel,
@@ -261,7 +279,7 @@ pub fn rail_ui(ui: &mut egui::Ui, deps: &mut RailUiDeps<'_>) -> Vec<RailEvent> {
         ("Trash", SurfaceId::Trash),
     ] {
         let is_sel = current == Some(surface);
-        let resp = ui.selectable_label(is_sel, label);
+        let resp = rail_row(ui, is_sel, label);
         resp.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::SelectableLabel, is_sel, label)
         });

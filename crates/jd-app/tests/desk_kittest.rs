@@ -109,12 +109,23 @@ fn card_center_on_screen(h: &Harness<'_, JdUi>, id: NoteId) -> egui::Pos2 {
         center: egui::vec2(vp.center.x, vp.center.y),
         zoom: vp.zoom,
     };
-    // Panel rect: the harness window is 1200×800; the status bar is at the
-    // bottom (~24 px). The central panel fills the remainder.
-    let panel = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0 - 24.0));
+    // Panel rect: use the REAL desk panel captured by the app last frame
+    // (chrome dimensions are theme constants that have changed before and
+    // will change again — a synthetic rect here is a proven fragility).
+    let panel = h
+        .state()
+        .last_panel_rect
+        .expect("panel rect captured (render at least one frame first)");
     let world = egui::pos2(placed.pos.x, placed.pos.y);
-    // Add the card size / 2 to land on the center of the card
-    let card_half = egui::vec2(150.0, 100.0); // approximate half-size
+    // Land on the card's center using its REAL shape size (a hardcoded
+    // index-card half-size missed the shorter scrap once Task 2's per-shape
+    // hit-testing + the WP5x scrap resize landed).
+    let card_half = {
+        use jd_app::card::shape::{card_size, shape_for};
+        let idx = h.state().vault.index.read().unwrap();
+        let m = idx.get(id).expect("note in index");
+        card_size(shape_for(m.status, m.kind)) * 0.5 * cam.zoom
+    };
     let top_left = cam.to_screen(panel, world);
     top_left + card_half
 }

@@ -67,6 +67,8 @@ pub struct JdUi {
     pub state: UiState,
     pub theme: crate::theme::Theme,
     pub fonts_installed: bool,
+    /// Theme visuals pushed into the egui Context once (re-pushed on theme flip).
+    visuals_applied: bool,
     id_gen: IdGen,
     /// Persists across frames for card body layout caching.
     line_cache: crate::editor::LineCache,
@@ -111,6 +113,7 @@ impl JdUi {
             state,
             theme: crate::theme::Theme::light(),
             fonts_installed: false,
+            visuals_applied: false,
             id_gen: IdGen::new(),
             line_cache: crate::editor::LineCache::default(),
             drag: None,
@@ -683,6 +686,11 @@ impl JdUi {
             } else {
                 crate::theme::Theme::light()
             };
+            self.visuals_applied = false;
+        }
+        if !self.visuals_applied {
+            crate::theme::apply_visuals(ui.ctx(), &self.theme);
+            self.visuals_applied = true;
         }
         self.waker.attach(ui.ctx());
 
@@ -973,48 +981,81 @@ impl JdUi {
         let zoom_gated = self.state.editor.is_some()
             || self.state.pending_confirm.is_some()
             || self.state.palette.is_some();
+        // Zoom buttons only act on zoomable surfaces (Desk/Map) — disabled
+        // elsewhere so they never read as live-but-inert (Task 2 review minor).
+        let zoomable_surface = matches!(
+            self.state.session.current_surface,
+            Some(SurfaceId::Desk(_)) | Some(SurfaceId::Map)
+        );
         let zoom_cmd: Option<ZoomCommand> = egui::Panel::bottom("status_line")
+            .exact_size(crate::theme::STATUS_LINE_H)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Junk Drawer");
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Junk Drawer")
+                            .color(self.theme.text_weak)
+                            .size(12.0),
+                    );
                     if let Some((ref echo_text, _)) = self.state.status_echo {
+                        ui.separator();
                         ui.label(echo_text.as_str());
                     }
-                    // [−] [100%] [+] [Fit] — a11y-labeled, gated as above.
-                    let mut cmd: Option<ZoomCommand> = None;
-                    for (text, a11y, c) in [
-                        ("\u{2212}", "Zoom out", ZoomCommand::Out),
-                        ("100%", "Zoom to 100%", ZoomCommand::Reset),
-                        ("+", "Zoom in", ZoomCommand::In),
-                        ("Fit", "Fit", ZoomCommand::Fit),
-                    ] {
-                        let resp = ui.add_enabled(!zoom_gated, egui::Button::new(text));
-                        resp.widget_info(|| {
-                            egui::WidgetInfo::labeled(egui::WidgetType::Button, !zoom_gated, a11y)
-                        });
-                        if resp.clicked() && !zoom_gated {
-                            cmd = Some(c);
-                        }
-                    }
-                    // Zoom % — for the active desk, or the map camera.
-                    match self.state.session.current_surface {
-                        Some(SurfaceId::Desk(desk_id)) => {
-                            if let Some(desk) =
-                                self.state.session.desks.iter().find(|d| d.id == desk_id)
-                            {
-                                ui.label(format!("{:.0}%", desk.viewport.zoom * 100.0));
-                            }
-                        }
-                        Some(SurfaceId::Map) => {
-                            if let Some(map) = self.map.as_ref() {
-                                ui.label(format!("{:.0}%", map.camera.zoom * 100.0));
-                            }
-                        }
-                        _ => {}
-                    }
                     if let Some(err) = &self.state.last_error {
-                        ui.label(err.as_str());
+                        ui.separator();
+                        ui.label(egui::RichText::new(err.as_str()).color(self.theme.error_text));
                     }
+                    // Zoom cluster, right-aligned as one quiet group:
+                    // [−] [1:1] [+] | [Fit] | 125%   (readout hidden at 100%).
+                    let mut cmd: Option<ZoomCommand> = None;
+                    let zoom_enabled = !zoom_gated && zoomable_surface;
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(6.0);
+                        // Zoom % readout (shown only when != 100 to avoid
+                        // confusion with the reset button; Task 2 review nit).
+                        let zoom = match self.state.session.current_surface {
+                            Some(SurfaceId::Desk(desk_id)) => self
+                                .state
+                                .session
+                                .desks
+                                .iter()
+                                .find(|d| d.id == desk_id)
+                                .map(|d| d.viewport.zoom),
+                            Some(SurfaceId::Map) => self.map.as_ref().map(|m| m.camera.zoom),
+                            _ => None,
+                        };
+                        // Always present (fixed layout — a vanishing readout
+                        // shifts the button cluster under the pointer). The
+                        // reset button reads "1:1", so a "100%" readout is no
+                        // longer confusable with it.
+                        if let Some(z) = zoom {
+                            ui.label(
+                                egui::RichText::new(format!("{:.0}%", z * 100.0))
+                                    .color(self.theme.text_weak),
+                            );
+                        }
+                        // Buttons render right-to-left: Fit, then +, 1:1, −.
+                        // Visible text differs from the a11y label where the
+                        // icon form is clearer ("1:1" announces "Zoom to 100%").
+                        for (text, a11y, c) in [
+                            ("Fit", "Fit", ZoomCommand::Fit),
+                            ("+", "Zoom in", ZoomCommand::In),
+                            ("1:1", "Zoom to 100%", ZoomCommand::Reset),
+                            ("\u{2212}", "Zoom out", ZoomCommand::Out),
+                        ] {
+                            let resp = ui.add_enabled(zoom_enabled, egui::Button::new(text));
+                            resp.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    zoom_enabled,
+                                    a11y,
+                                )
+                            });
+                            if resp.clicked() && zoom_enabled {
+                                cmd = Some(c);
+                            }
+                        }
+                    });
                     cmd
                 })
                 .inner
@@ -1032,7 +1073,7 @@ impl JdUi {
         };
         let rail_events = egui::Panel::left("rail")
             .resizable(false)
-            .exact_size(160.0)
+            .exact_size(crate::theme::RAIL_WIDTH)
             .show(ui, |ui| {
                 let mut deps = RailUiDeps {
                     session: &self.state.session,
